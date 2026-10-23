@@ -1,6 +1,6 @@
 {
   "name": "@lprsrts/pi-voice",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Talk to your coding agent: full-duplex, echo-cancelled voice for Pi on macOS (ElevenLabs Realtime or OpenAI GPT-Live) that hands work to your Pi session",
   "keywords": [
     "pi-package",
