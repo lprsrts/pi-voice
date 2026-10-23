@@ -62,7 +62,7 @@ Environment settings:
 
 - `PI_VOICE_PROVIDER`: default provider when `/talk start` names none.
 - `PI_VOICE_AEC=0`: bypass Apple's voice processing (echo cancellation, noise suppression, AGC) for raw mic audio. Only safe with headphones, and the raw built-in mic is quiet (~-34 dBFS peak on loud speech).
-- `PI_VOICE_CAPTIONS=0`: start with the caption line hidden (`/talk captions` toggles it).
+- `PI_VOICE_CAPTIONS=1`: start with the caption line shown (`/talk captions` toggles it).
 - `PI_VOICE_CONFIG_DIR`: where your config overrides live (see below).
 
 ## Configuration
@@ -86,7 +86,7 @@ Each provider's model, voice, turn settings, and prompts ship in `providers/<nam
 - `/talk stop`: ends the voice session and releases audio. A Pi task it started keeps running.
 - `/talk mute`: mutes the microphone inside the voice unit (output/conversation remain active and may still incur charges).
 - `/talk unmute`: resumes capture.
-- `/talk captions [on|off]`: shows or hides the caption line under the bar (no argument toggles). Defaults to on; `PI_VOICE_CAPTIONS=0` starts with captions off.
+- `/talk captions [on|off]`: shows or hides the caption line under the bar (no argument toggles). Defaults to off; `PI_VOICE_CAPTIONS=1` starts with captions on.
 - `/talk-preview [cycle|idle|listening|thinking|speaking|error|off]`: offline, simulated visual design mode. Stop live voice first.
 
 The bar is text-free, foreground-only, and below the editor. Every state is the same centered, stationary Gaussian beam. Thinking runs a fixed carrier with an evolving phase. Listening (mic) and speaking (agent) set the beam's height from the frame's level (adaptive gain, recent-peak normalization) and its carrier density from the frame's dominant frequency: 80 Hz–4 kHz on a log scale maps to 4–20 cycles across the bar. That frequency is found with a Hann-windowed Goertzel scan of each 20 ms frame, and it glides over ~90 ms. Below the bar, one centered line shows the phrase the agent is saying, from the provider's output transcript. Phrases break at commas, semicolons, colons, dashes, and sentence ends; a break inside a sentence shows as "…" ("Twenty pass…", "…two fail."). Each transcript chunk is spread over the voiced audio that follows it, and silence and breaths don't count, so the line moves with the voice rather than with text arrival. A phrase wider than the bar is shown in whole-word chunks, joined by the same ellipses. The last phrase stays for 2.5 s after the agent stops. State/color weights ease over ~750ms. Preview audio is synthetic. Live output samples are measured at the playback pipe, not from a hardware playback clock, so visual/audio alignment is approximate.

@@ -75,8 +75,8 @@ export default function voicePreview(pi: ExtensionAPI) {
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
   let caption: CaptionLine | undefined, captionAt = 0;
-  // Caption row under the bar: /talk captions on|off, default from PI_VOICE_CAPTIONS.
-  let captionsOn = !["0", "false", "off"].includes(process.env.PI_VOICE_CAPTIONS?.trim().toLowerCase() ?? "");
+  // Caption row under the bar: off unless PI_VOICE_CAPTIONS=1 or /talk captions on.
+  let captionsOn = ["1", "true", "on"].includes(process.env.PI_VOICE_CAPTIONS?.trim().toLowerCase() ?? "");
   let muted = false;
 
   function stop() {
