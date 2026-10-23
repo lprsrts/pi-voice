@@ -2,7 +2,7 @@ import type { AudioPipes } from "./audio.ts";
 import { ELEVENLABS_KEY, OPENAI_KEY, type KeySpec } from "./keys.ts";
 import { LiveVoice } from "./live.ts";
 import { RealtimeVoice } from "./realtime.ts";
-import type { VoiceState } from "./protocol.ts";
+import type { CaptionLine, VoiceState } from "./protocol.ts";
 
 // Voice providers. Each has its config under providers/<name>/; the code below
 // only maps a name to its session class, API key, and wording for the TUI.
@@ -12,7 +12,7 @@ export type VoiceHooks = {
   samples: (source: "input" | "output", samples: number[]) => void;
   error: (message: string) => void;
   /** The phrase the agent is saying now and how much of it is spoken, in step with playback ("" clears it). */
-  caption?: (line: string, spoken: number) => void;
+  caption?: (line: CaptionLine) => void;
   closed: () => void;
   tool: (name: string, args: Record<string, unknown>) => object;
   busy: () => boolean;

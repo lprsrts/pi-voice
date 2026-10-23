@@ -86,10 +86,10 @@ export class Captions {
   private playedMs = 0;
   private pending: { at: number; text: string; turn?: boolean }[] = [];
   private shown = "";
-  private readonly onLine: (line: string, spoken: number) => void;
+  private readonly onLine: (line: CaptionLine) => void;
 
-  /** onLine gets the current phrase and how many of its characters have been spoken. */
-  constructor(onLine: (line: string, spoken: number) => void) { this.onLine = onLine; }
+  /** onLine gets the current phrase (empty to clear) and how much of it has been spoken. */
+  constructor(onLine: (line: CaptionLine) => void) { this.onLine = onLine; }
 
   /** Transcript text for audio that is about to be (or already was) queued. */
   text(delta: string) {
@@ -129,41 +129,62 @@ export class Captions {
       }
       text += entry.text;
     }
-    const { phrase, spoken } = phraseAt(text, cursor);
-    const key = `${spoken}:${phrase}`;
-    if (key !== this.shown) { this.shown = key; this.onLine(phrase, spoken); }
+    const line = phraseAt(text, cursor);
+    const key = JSON.stringify(line);
+    if (key !== this.shown) { this.shown = key; this.onLine(line); }
   }
 }
 
 /** Phrase breaks: sentence ends, commas, semicolons, colons, and dashes followed by a space. */
 const PHRASE = /[^,;:.!?…—–]*(?:[,;:.!?…]+["”’)]*|\s[—–])(?=\s|$)\s*|[^,;:.!?…—–]+$|[^\s]+\s*/g;
 
+/** A caption phrase: `continues` an unfinished sentence, and/or leaves it `open` for more. */
+export type CaptionLine = { phrase: string; spoken: number; continues: boolean; open: boolean };
+
+const SENTENCE_END = /[.!?…]+["”’)]*$/;
+
 /** The phrase that contains the character at `cursor` (1-based count of spoken characters), and how much of it is spoken. */
-export function phraseAt(text: string, cursor: number): { phrase: string; spoken: number } {
-  if (cursor <= 0) return { phrase: "", spoken: 0 };
-  let start = 0;
+export function phraseAt(text: string, cursor: number): CaptionLine {
+  const none = { phrase: "", spoken: 0, continues: false, open: false };
+  if (cursor <= 0) return none;
+  let start = 0, previous = "";
   for (const match of text.match(PHRASE) ?? []) {
     const end = start + match.length;
+    const phrase = match.replace(/\s+/g, " ").trim();
     if (cursor <= end || end >= text.length) {
-      const phrase = match.replace(/\s+/g, " ").trim();
-      return { phrase, spoken: Math.min(phrase.length, cursor - start) };
+      return { phrase, spoken: Math.min(phrase.length, cursor - start), continues: previous !== "" && !SENTENCE_END.test(previous), open: !SENTENCE_END.test(phrase) };
     }
+    if (phrase) previous = phrase;
     start = end;
   }
-  return { phrase: "", spoken: 0 };
+  return none;
 }
 
-/** Splits a phrase into word chunks no wider than `width`; returns the chunk holding character `spoken`. */
-export function fitPhrase(phrase: string, spoken: number, width: number, measure: (text: string) => number = text => text.length): string {
-  if (measure(phrase) <= width) return phrase;
-  let chunk = "", start = 0, consumed = 0;
-  for (const word of phrase.split(" ")) {
+/**
+ * The caption text for a bar `width` columns wide. A break inside a sentence
+ * shows as "…" on both sides (the comma, semicolon, colon, or dash it replaces
+ * is dropped). A phrase wider than the bar is split into whole-word chunks, and
+ * the chunk holding the spoken position is shown.
+ */
+export function formatCaption(line: CaptionLine, width: number, measure: (text: string) => number = text => text.length): string {
+  const core = line.phrase.replace(/\s*[,;:—–]+$/, "");
+  if (!core) return "";
+  const decorate = (text: string, lead: boolean, tail: boolean) => `${lead ? "…" : ""}${text}${tail ? "…" : ""}`;
+  const whole = decorate(core, line.continues, line.open);
+  if (measure(whole) <= width) return whole;
+  const budget = Math.max(1, width - 2); // room for both ellipses
+  const chunks: { text: string; end: number }[] = [];
+  let chunk = "", start = 0;
+  for (const word of core.split(" ")) {
     const next = chunk ? `${chunk} ${word}` : word;
-    if (chunk && measure(next) > width) {
-      if (spoken <= consumed) return chunk;
-      chunk = word; start = consumed + 1;
+    if (chunk && measure(next) > budget) {
+      chunks.push({ text: chunk, end: start + chunk.length });
+      start += chunk.length + 1;
+      chunk = word;
     } else chunk = next;
-    consumed = start + chunk.length;
   }
-  return chunk;
+  chunks.push({ text: chunk, end: start + chunk.length });
+  const index = Math.max(0, chunks.findIndex(c => line.spoken <= c.end));
+  const last = chunks.length - 1;
+  return decorate(chunks[index].text, index > 0 || line.continues, index < last || line.open);
 }

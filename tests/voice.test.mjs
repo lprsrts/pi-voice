@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency, phraseAt, fitPhrase, voicedMs } from '../protocol.ts';
+import { PcmFramer, waveform, dominantFrequency, phraseAt, formatCaption, voicedMs } from '../protocol.ts';
 import { RealtimeVoice, sessionConfig } from '../realtime.ts';
 import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
@@ -167,7 +167,7 @@ async function startVoice({ tool = () => ({ ok: true }), busy = () => false } = 
   let mint, audioHooks;
   globalThis.WebSocket = FakeSocket;
   globalThis.fetch = async (url, init) => { mint = { url, init }; return { ok: true, json: async () => ({ value: 'ek_test_secret' }) }; };
-  const voice = new RealtimeVoice({ state: s => states.push(s), samples() {}, error: e => errors.push(e), caption: l => captions.push(l), closed() {}, tool, busy }, hooks => {
+  const voice = new RealtimeVoice({ state: s => states.push(s), samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), closed() {}, tool, busy }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish: () => audio.finishes++,
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -317,7 +317,7 @@ async function startLive({ tool = () => ({ ok: true }) } = {}) {
   const errors = [], captions = [];
   let audioHooks;
   globalThis.WebSocket = FakeSocket;
-  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l), closed() {}, tool, busy: () => false }, hooks => {
+  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), closed() {}, tool, busy: () => false }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish() {},
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -393,16 +393,27 @@ test('captions split at commas, semicolons, colons, dashes, and sentence ends', 
   assert.equal(at(50), 'one fixed —');
   assert.equal(at(70), 'the other needs you.');
   assert.equal(at(text.length), 'Done.');
-  assert.deepEqual(phraseAt('Twenty pass, two', 15), { phrase: 'two', spoken: 2 });
+  assert.deepEqual(phraseAt('Twenty pass, two', 15), { phrase: 'two', spoken: 2, continues: true, open: true });
+  assert.deepEqual(phraseAt('Done. Next one', 8), { phrase: 'Next one', spoken: 2, continues: false, open: true });
 });
 
-test('a phrase wider than the bar shows the word chunk being spoken, without an ellipsis', () => {
-  const phrase = 'the migration touched every handler in the payments service';
-  assert.equal(fitPhrase(phrase, 5, 100), phrase);
-  assert.equal(fitPhrase(phrase, 5, 24), 'the migration touched');
-  assert.equal(fitPhrase(phrase, 30, 24), 'every handler in the');
-  assert.equal(fitPhrase(phrase, phrase.length, 24), 'payments service');
-  for (let spoken = 0; spoken <= phrase.length; spoken++) assert.ok(fitPhrase(phrase, spoken, 24).length <= 24);
+test('mid-sentence breaks show as ellipses on both sides', () => {
+  const line = (phrase, continues, open, spoken = 0) => ({ phrase, spoken, continues, open });
+  assert.equal(formatCaption(line('Twenty pass,', false, true), 80), 'Twenty pass…');
+  assert.equal(formatCaption(line('two fail;', true, true), 80), '…two fail…');
+  assert.equal(formatCaption(line('one fixed —', true, true), 80), '…one fixed…');
+  assert.equal(formatCaption(line('both in the parser.', true, false), 80), '…both in the parser.');
+  assert.equal(formatCaption(line('Done.', false, false), 80), 'Done.');
+  assert.equal(formatCaption(line('', false, false), 80), '');
+});
+
+test('a phrase wider than the bar shows the spoken word chunk, with ellipses where it continues', () => {
+  const phrase = 'The migration touched every handler in the payments service.';
+  const at = spoken => formatCaption({ phrase, spoken, continues: false, open: false }, 24);
+  assert.equal(at(0), 'The migration touched…');
+  assert.equal(at(30), '…every handler in the…');
+  assert.equal(at(phrase.length), '…payments service.');
+  for (let spoken = 0; spoken <= phrase.length; spoken++) assert.ok(at(spoken).length <= 24, at(spoken));
 });
 
 test('voiced time ignores silence and breaths', () => {

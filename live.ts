@@ -1,7 +1,7 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
 import { PI_TOOLS } from "./pi-bridge.ts";
-import { Captions, waveform, type VoiceState } from "./protocol.ts";
+import { Captions, type CaptionLine, waveform, type VoiceState } from "./protocol.ts";
 
 // OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with Responses
 // delegation: the voice model hands work to an OpenAI backend model, which
@@ -58,7 +58,7 @@ type Hooks = {
   /** Whether Pi is working, for the resting waveform state. */
   busy: () => boolean;
   /** The phrase the agent is saying now and how much of it is spoken, in step with playback. */
-  caption?: (line: string, spoken: number) => void;
+  caption?: (line: CaptionLine) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -92,7 +92,7 @@ export class LiveVoice {
   constructor(hooks: Hooks, audioFactory: AudioFactory) {
     this.hooks = hooks;
     this.audioFactory = audioFactory;
-    this.captions = new Captions((line, spoken) => this.hooks.caption?.(line, spoken));
+    this.captions = new Captions(line => this.hooks.caption?.(line));
   }
 
   /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
