@@ -1,0 +1,284 @@
+import type { AudioPipes } from "./audio.ts";
+import { providerFiles, type ProviderFiles } from "./config.ts";
+import { PI_TOOLS } from "./pi-bridge.ts";
+import { waveform, type VoiceState } from "./protocol.ts";
+
+// OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with Responses
+// delegation: the voice model hands work to an OpenAI backend model, which
+// calls the same Pi tools as the ElevenLabs provider (ask_pi, pi_status,
+// cancel_pi). Pi updates go in as commentary (spoken) or thinking (silent).
+// Config lives in providers/openai-live/.
+
+const ENDPOINT = "wss://api.openai.com/v1/live/sessions";
+const RATE = 24000; // PCM16 mono both ways; the native helper runs unresampled at this rate
+const APPEND_LIMIT = 1800; // commentary/thinking accept up to 500 tokens; stay well under
+const SPEECH_PEAK = 600;   // GPT-Live streams continuously, silence included (measured: 44.8 s of audio in a 47 s session)
+
+/** Whether a PCM16 frame carries speech rather than the stream's silence. */
+export function audibleFrame(frame: Buffer): boolean {
+  for (let i = 0; i + 1 < frame.length; i += 2) if (Math.abs(frame.readInt16LE(i)) > SPEECH_PEAK) return true;
+  return false;
+}
+
+/** A built-in voice name, or a custom (prompt-generated) voice by ID with its original description. */
+type LiveVoiceSetting = string | { id: string; name?: string; description?: string };
+type LiveFile = { model: string; voice: LiveVoiceSetting; backend: { model: string; tool_choice?: string; parallel_tool_calls?: boolean; service_tier?: string } };
+
+/** The session.start payload, from providers/openai-live/ or the user override directory. */
+export function liveSessionConfig(files: ProviderFiles = providerFiles("openai-live")) {
+  const file = files.session<LiveFile>();
+  const instructions = files.text("instructions.md");
+  const custom = typeof file.voice === "object" ? file.voice : undefined;
+  return {
+    model: file.model,
+    // Custom voices perform best with their original description in the instructions (OpenAI custom-voices guide).
+    instructions: custom?.description ? `${instructions}\n\nVoice: ${custom.description}` : instructions,
+    audio: { format: { type: "audio/pcm", rate: RATE }, output: { voice: custom ? { id: custom.id } : file.voice } },
+    delegation: {
+      type: "responses",
+      responses: {
+        model: file.backend.model,
+        instructions: files.text("backend.md"),
+        tools: PI_TOOLS,
+        tool_choice: file.backend.tool_choice ?? "auto",
+        parallel_tool_calls: file.backend.parallel_tool_calls ?? false,
+        ...(file.backend.service_tier ? { service_tier: file.backend.service_tier } : {}),
+      },
+    },
+  };
+}
+
+type Hooks = {
+  state: (state: VoiceState) => void;
+  samples: (source: "input" | "output", samples: number[]) => void;
+  error: (message: string) => void;
+  closed: () => void;
+  /** Function calls from the backend model; must return quickly (Pi work continues in the background). */
+  tool: (name: string, args: Record<string, unknown>) => object;
+  /** Whether Pi is working, for the resting waveform state. */
+  busy: () => boolean;
+};
+
+type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
+
+/** Node's WebSocket (undici) accepts headers; the browser typings do not know that. */
+type HeaderSocket = new (url: string, init: { headers: Record<string, string> }) => WebSocket;
+
+export class LiveVoice {
+  private hooks: Hooks;
+  private audioFactory: AudioFactory;
+  private ws?: WebSocket;
+  private audio?: AudioPipes;
+  private abort = new AbortController();
+  private stopped = false;
+  private closing = false;
+  private muted = false;
+  private deadline?: ReturnType<typeof setTimeout>;
+  private resolveStart?: () => void;
+  private rejectStart?: (error: Error) => void;
+  private seq = 0;
+  // Backend function calls awaiting continuation, per delegation.
+  private submitted = new Map<string, number>();
+  private handledCalls = new Set<string>();
+  // Playback bookkeeping for the waveform state.
+  private playing = false;
+  private lastAudible = 0;
+
+  constructor(hooks: Hooks, audioFactory: AudioFactory) {
+    this.hooks = hooks;
+    this.audioFactory = audioFactory;
+  }
+
+  /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
+  async start(getKey: (signal: AbortSignal) => Promise<string> | string, config = liveSessionConfig()) {
+    if (process.platform !== "darwin") throw new Error("This audio backend currently supports macOS only.");
+    this.hooks.state("thinking");
+    let key: string;
+    try {
+      key = String(await getKey(this.abort.signal));
+      if (!key) throw new Error("No OpenAI API key available.");
+    } catch (error) {
+      if (!this.stopped) this.stop();
+      throw error instanceof Error ? error : new Error("Voice failed to start.");
+    }
+    if (this.stopped) return;
+    this.deadline = setTimeout(() => this.fail("Voice startup timed out."), 30000);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.resolveStart = resolve;
+        this.rejectStart = reject;
+        // Server-side connection: the project key goes in the Authorization header, never in the URL.
+        const ws = this.ws = new (WebSocket as unknown as HeaderSocket)(ENDPOINT, { headers: { Authorization: `Bearer ${key}` } });
+        ws.addEventListener("open", () => this.send({ type: "session.start", session: config }));
+        ws.addEventListener("message", event => {
+          if (this.stopped) return;
+          try {
+            if (typeof event.data !== "string" || event.data.length > 8_000_000) throw new Error("Invalid WebSocket frame.");
+            this.handle(JSON.parse(event.data));
+          } catch (error) {
+            this.fail(`Invalid GPT-Live event: ${error instanceof Error ? error.message : "unknown"}. Voice stopped.`);
+          }
+        });
+        ws.addEventListener("error", () => this.fail("OpenAI GPT-Live connection failed (check the API key and project access)."));
+        ws.addEventListener("close", event => {
+          if (this.stopped) return;
+          if (!this.audio) this.fail(`OpenAI closed the connection before the session started (${event.code}${event.reason ? `: ${event.reason}` : ""}).`);
+          else if (this.closing || event.code === 1000) this.stop();
+          else this.fail(`OpenAI GPT-Live connection closed (${event.code}${event.reason ? `: ${event.reason}` : ""}).`);
+        });
+      });
+    } catch (error) {
+      if (this.stopped) return;
+      this.stop();
+      throw error instanceof Error ? error : new Error("Voice startup failed.");
+    }
+  }
+
+  private send(value: Record<string, unknown>) {
+    if (this.stopped || this.ws?.readyState !== WebSocket.OPEN) return;
+    if (this.ws.bufferedAmount > 512_000) { this.fail("Voice network upload stalled."); return; }
+    this.ws.send(JSON.stringify({ event_id: `pi_${++this.seq}`, ...value }));
+  }
+
+  private rest() {
+    if (this.stopped || this.playing) return;
+    this.hooks.state(this.hooks.busy() ? "thinking" : this.muted ? "idle" : "listening");
+  }
+
+  /** A Pi update GPT-Live should say aloud (it paraphrases commentary). */
+  notify(text: string) {
+    this.send({ type: "session.commentary.append", delegation_id: null, content: text.slice(0, APPEND_LIMIT) });
+  }
+
+  /** Silent context GPT-Live can use when asked, without speaking it now. */
+  context(text: string) {
+    this.send({ type: "session.thinking.append", delegation_id: null, content: text.slice(0, APPEND_LIMIT) });
+  }
+
+  private startAudio() {
+    this.audio = this.audioFactory({
+      input: frame => {
+        if (this.stopped || this.muted) return;
+        this.hooks.samples("input", waveform(frame));
+        this.send({ type: "session.input_audio.append", audio: frame.toString("base64") });
+      },
+      output: (frame, queued) => {
+        if (this.stopped) return;
+        if (queued && audibleFrame(frame)) {
+          this.lastAudible = Date.now();
+          if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
+          this.hooks.samples("output", waveform(frame));
+        } else if (this.playing && Date.now() - this.lastAudible > 250) {
+          this.playing = false;
+          this.hooks.samples("output", []);
+          this.rest();
+        }
+      },
+      error: message => this.fail(message),
+    });
+    this.audio.start(RATE, RATE);
+    if (this.muted) this.audio.mute(true);
+  }
+
+  // Server events follow OpenAI's GPT-Live protocol (guides/voice-websockets, live-delegation).
+  private handle(event: any) {
+    switch (event.type) {
+      case "session.started":
+        if (this.audio) return;
+        try { this.startAudio(); }
+        catch (error) { this.fail(`Local audio failed to start: ${error instanceof Error ? error.message : "unknown error"}`); return; }
+        clearTimeout(this.deadline);
+        this.resolveStart?.();
+        this.resolveStart = this.rejectStart = undefined;
+        this.rest();
+        break;
+      case "session.output_audio.delta": {
+        const pcm = Buffer.from(event.delta, "base64");
+        if (pcm.length) this.audio?.enqueue(pcm);
+        break;
+      }
+      case "session.input_transcript.delta":
+        // GPT-Live decides when to yield; while the user talks over playback, drop the
+        // locally queued audio so the model's own stop is not delayed by our buffer.
+        if (this.playing) { this.audio?.interrupt(); this.playing = false; this.hooks.samples("output", []); }
+        this.hooks.state("listening");
+        break;
+      case "session.delegation.created":
+        this.hooks.state("thinking");
+        break;
+      case "response.event":
+        this.backendEvent(String(event.delegation_id ?? ""), event.event ?? {});
+        break;
+      case "session.closed":
+        this.stop();
+        break;
+      case "error": {
+        const error = event.error ?? {};
+        const message = String(error.message ?? error.code ?? "error").slice(0, 300);
+        // Configuration problems are nonfatal on the live side; surface them, keep talking.
+        this.hooks.error(`OpenAI GPT-Live: ${message}`);
+        break;
+      }
+    }
+  }
+
+  /** Nested Responses events of a delegation: run Pi tools and continue the backend. */
+  private backendEvent(delegation: string, inner: any) {
+    if (inner.type === "response.output_item.done" && inner.item?.type === "function_call") {
+      const item = inner.item as { call_id?: string; name?: string; arguments?: string };
+      if (typeof item.call_id !== "string" || typeof item.name !== "string" || this.handledCalls.has(item.call_id)) return;
+      this.handledCalls.add(item.call_id);
+      let output: object;
+      try {
+        const args = item.arguments ? JSON.parse(item.arguments) : {};
+        output = this.hooks.tool(item.name, args && typeof args === "object" ? args : {});
+      } catch (error) {
+        output = { error: error instanceof Error ? error.message : "Tool failed." };
+      }
+      this.send({ type: "response.item.create", item: { type: "function_call_output", call_id: item.call_id, output: JSON.stringify(output) } });
+      this.submitted.set(delegation, (this.submitted.get(delegation) ?? 0) + 1);
+      return;
+    }
+    // Results for every call of the response are in: continue it exactly once.
+    if (/^response\.(completed|incomplete|failed)$/.test(inner.type) && this.submitted.get(delegation)) {
+      this.submitted.delete(delegation);
+      this.send({ type: "response.create" });
+    }
+  }
+
+  mute(value: boolean) {
+    this.muted = value;
+    this.audio?.mute(value);
+    this.send({ type: value ? "session.input_audio.mute" : "session.input_audio.unmute" });
+    this.hooks.samples("input", []);
+    this.rest();
+  }
+
+  private fail(message: string) {
+    if (this.stopped) return;
+    this.stop();
+    this.hooks.state("error");
+    this.hooks.error(message);
+  }
+
+  /** Graceful close finalizes billing (session.closed); the socket is torn down after 3 s regardless. */
+  stop() {
+    if (this.stopped) return;
+    if (!this.closing && this.ws?.readyState === WebSocket.OPEN && this.audio) {
+      this.closing = true;
+      this.send({ type: "session.close" });
+      this.audio.stop();
+      this.audio = undefined;
+      const ws = this.ws;
+      setTimeout(() => ws.close(), 3000).unref();
+    }
+    this.stopped = true;
+    this.abort.abort();
+    clearTimeout(this.deadline);
+    this.audio?.stop();
+    this.rejectStart?.(new Error("Voice stopped."));
+    this.resolveStart = this.rejectStart = undefined;
+    if (!this.closing) this.ws?.close();
+    this.hooks.closed();
+  }
+}
