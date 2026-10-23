@@ -11,8 +11,8 @@ export type VoiceHooks = {
   state: (state: VoiceState) => void;
   samples: (source: "input" | "output", samples: number[]) => void;
   error: (message: string) => void;
-  /** The phrase the agent is saying now, in step with playback ("" clears it). */
-  caption?: (line: string) => void;
+  /** The phrase the agent is saying now and how much of it is spoken, in step with playback ("" clears it). */
+  caption?: (line: string, spoken: number) => void;
   closed: () => void;
   tool: (name: string, args: Record<string, unknown>) => object;
   busy: () => boolean;

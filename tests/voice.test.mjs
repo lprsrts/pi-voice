@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency, Captions, currentPhrase } from '../protocol.ts';
+import { PcmFramer, waveform, dominantFrequency, phraseAt, fitPhrase, voicedMs } from '../protocol.ts';
 import { RealtimeVoice, sessionConfig } from '../realtime.ts';
 import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
@@ -331,57 +331,84 @@ async function startLive({ tool = () => ({ ok: true }) } = {}) {
   return { voice, socket, audio, errors, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
 }
 
-test('GPT-Live captions follow playback and restart after the user speaks', async () => {
+// Voiced PCM16 (a square wave well above the voice threshold), `frames` x 20 ms at 24 kHz.
+const voiced = frames => { const b = Buffer.alloc(960 * frames); for (let i = 0; i < b.length; i += 2) b.writeInt16LE(i % 96 < 48 ? 4000 : -4000, i); return b; };
+
+test('GPT-Live captions follow voiced playback and restart after the user speaks', async () => {
   const originalWS = globalThis.WebSocket;
   try {
     const { voice, socket, captions, output } = await startLive();
-    const frame = Buffer.alloc(960); // 20 ms at 24 kHz
-    socket.event({ type: 'session.output_transcript.delta', delta: 'All tests pass. ' });
-    socket.event({ type: 'session.output_audio.delta', delta: Buffer.alloc(960 * 10).toString('base64') });
-    socket.event({ type: 'session.output_transcript.delta', delta: 'Nothing else changed.' });
-    assert.deepEqual(captions, ['All tests pass.']);
-    for (let i = 0; i < 9; i++) output(frame, true);
-    assert.deepEqual(captions, ['All tests pass.']); // second phrase waits for its audio
-    output(frame, true);
-    assert.deepEqual(captions, ['All tests pass.', 'Nothing else changed.']);
+    socket.event({ type: 'session.output_transcript.delta', delta: 'All tests pass, ' });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(10).toString('base64') });
+    socket.event({ type: 'session.output_audio.delta', delta: Buffer.alloc(960 * 10).toString('base64') }); // a breath
+    socket.event({ type: 'session.output_transcript.delta', delta: 'nothing else changed.' });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(10).toString('base64') });
+    output(voiced(1), true);
+    assert.deepEqual(captions.at(-1), 'All tests pass,');
+    for (let i = 0; i < 9; i++) output(voiced(1), true);
+    for (let i = 0; i < 10; i++) output(Buffer.alloc(960), true); // the breath does not advance the caption
+    assert.deepEqual(captions.at(-1), 'All tests pass,');
+    output(voiced(1), true);
+    assert.deepEqual(captions.at(-1), 'nothing else changed.');
     socket.event({ type: 'session.input_transcript.delta', delta: 'and' });
     socket.event({ type: 'session.output_transcript.delta', delta: 'Stopping.' });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+    output(voiced(1), true);
     assert.deepEqual(captions.at(-1), 'Stopping.');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
 
-test('ElevenLabs captions drop tags, follow playback, and skip barged-in text', async () => {
+test('ElevenLabs captions drop tags, split a sentence chunk into phrases, and skip barged-in text', async () => {
   const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
   try {
     const { voice, socket, captions, output } = await startVoice();
-    const frame = Buffer.alloc(960);
-    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: '[Tone] Twenty tests pass.' });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: Buffer.alloc(960 * 5).toString('base64') });
-    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: ' Two fail.' });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: Buffer.alloc(960 * 5).toString('base64') });
-    assert.deepEqual(captions, ['Twenty tests pass.']);
-    output(frame, true); output(frame, true);
-    socket.event({ type: 'input_audio_buffer.speech_started' }); // barge-in before "Two fail." plays
-    for (let i = 0; i < 10; i++) output(frame, true);
-    assert.deepEqual(captions, ['Twenty tests pass.']);
+    // Eleven sends a whole sentence ahead of its audio; its phrases are spread over that audio.
+    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: '[Tone] Twenty pass, two fail.' });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: voiced(20).toString('base64') });
+    output(voiced(1), true);
+    assert.deepEqual(captions.at(-1), 'Twenty pass,');
+    for (let i = 0; i < 12; i++) output(voiced(1), true);
+    assert.deepEqual(captions.at(-1), 'two fail.');
+    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: ' Never said.' });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: voiced(10).toString('base64') });
+    socket.event({ type: 'input_audio_buffer.speech_started' }); // barge-in before "Never said." plays
+    for (let i = 0; i < 10; i++) output(voiced(1), true);
+    assert.ok(!captions.includes('Never said.'));
     socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i2', response_id: 'r2', delta: 'Stopped.' });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'i2', response_id: 'r2', delta: voiced(5).toString('base64') });
+    output(voiced(1), true);
     assert.deepEqual(captions.at(-1), 'Stopped.');
     voice.stop();
   } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
 });
 
-test('caption phrases: the sentence in progress, else the last finished one', () => {
-  assert.equal(currentPhrase('Twenty tests pass. Two fa'), 'Two fa');
-  assert.equal(currentPhrase('Twenty tests pass. '), 'Twenty tests pass.');
-  assert.equal(currentPhrase('Done! Really? "Yes." '), '"Yes."');
-  assert.equal(currentPhrase(''), '');
-  const lines = [];
-  const c = new Captions(l => lines.push(l));
-  c.text('Ready.');
-  c.turn();
-  c.text('Next.'); // a new turn with no audio queued yet replaces the line at once
-  assert.deepEqual(lines, ['Ready.', 'Next.']);
+test('captions split at commas, semicolons, colons, dashes, and sentence ends', () => {
+  const text = 'Twenty pass, two fail; both in the parser: one fixed — the other needs you. Done.';
+  const at = cursor => phraseAt(text, cursor).phrase;
+  assert.equal(at(0), '');
+  assert.equal(at(1), 'Twenty pass,');
+  assert.equal(at(20), 'two fail;');
+  assert.equal(at(30), 'both in the parser:');
+  assert.equal(at(50), 'one fixed —');
+  assert.equal(at(70), 'the other needs you.');
+  assert.equal(at(text.length), 'Done.');
+  assert.deepEqual(phraseAt('Twenty pass, two', 15), { phrase: 'two', spoken: 2 });
+});
+
+test('a phrase wider than the bar shows the word chunk being spoken, without an ellipsis', () => {
+  const phrase = 'the migration touched every handler in the payments service';
+  assert.equal(fitPhrase(phrase, 5, 100), phrase);
+  assert.equal(fitPhrase(phrase, 5, 24), 'the migration touched');
+  assert.equal(fitPhrase(phrase, 30, 24), 'every handler in the');
+  assert.equal(fitPhrase(phrase, phrase.length, 24), 'payments service');
+  for (let spoken = 0; spoken <= phrase.length; spoken++) assert.ok(fitPhrase(phrase, spoken, 24).length <= 24);
+});
+
+test('voiced time ignores silence and breaths', () => {
+  assert.equal(voicedMs(voiced(5), 24000), 100);
+  assert.equal(voicedMs(Buffer.alloc(960 * 5), 24000), 0);
+  assert.equal(voicedMs(Buffer.concat([voiced(2), Buffer.alloc(960 * 3)]), 24000), 40);
 });
 
 test('GPT-Live config comes from providers/openai-live/ with Responses delegation to the Pi tools', () => {

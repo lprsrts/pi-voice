@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { mixColors, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { mixColors, visibleWidth } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
@@ -8,7 +8,7 @@ import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
 import { PiBridge } from "./pi-bridge.ts";
 import { PROVIDERS, selectProvider, type VoiceSession } from "./providers.ts";
-import { dominantFrequency } from "./protocol.ts";
+import { dominantFrequency, fitPhrase } from "./protocol.ts";
 
 const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
 // The caption keeps the last phrase on screen this long after the agent stops talking.
@@ -51,16 +51,11 @@ function measureBeam(beam: Beam, samples: number[], fresh: boolean, dt: number) 
   if (hz) beam.targetLogHz = Math.log(hz);
 }
 
-/** One line, centered; long phrases keep their end (the words being spoken) behind an ellipsis. */
-function centered(text: string, width: number, style: (text: string) => string): string {
+/** One centered line; a phrase wider than the bar shows the word chunk being spoken. */
+function centered(text: string, spoken: number, width: number, style: (text: string) => string): string {
   if (!text || width < 4) return "";
-  let line = text;
-  if (visibleWidth(line) > width) {
-    const words = line.split(" ");
-    while (words.length > 1 && visibleWidth("… " + words.join(" ")) > width) words.shift();
-    line = truncateToWidth("… " + words.join(" "), width, "");
-  }
-  return " ".repeat(Math.floor((width - visibleWidth(line)) / 2)) + style(line);
+  const line = fitPhrase(text, spoken, width, visibleWidth);
+  return " ".repeat(Math.max(0, Math.floor((width - visibleWidth(line)) / 2))) + style(line);
 }
 
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
@@ -74,7 +69,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   let liveState: State = "idle";
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
-  let caption = "", captionAt = 0;
+  let caption = "", captionSpoken = 0, captionAt = 0;
   let muted = false;
 
   function stop() {
@@ -177,7 +172,7 @@ export default function voicePreview(pi: ExtensionAPI) {
             const line = choice === "live"
               ? (now - Math.max(captionAt, lastSpoke) < CAPTION_HOLD_MS ? caption : "")
               : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 2.2) % PREVIEW_CAPTIONS.length] : "";
-            return [...bar, centered(line, columns, text => theme.style(text, { fg: theme.colors.muted }))];
+            return [...bar, centered(line, choice === "live" ? captionSpoken : line.length, columns, text => theme.style(text, { fg: theme.colors.muted }))];
           },
           dispose() {
             if (timer) clearInterval(timer);
@@ -298,7 +293,7 @@ export default function voicePreview(pi: ExtensionAPI) {
           else { outputSamples = samples; outputTime = Date.now(); }
         },
         error: message => ctx.ui.notify(message, "error"),
-        caption: line => { caption = line; captionAt = Date.now(); },
+        caption: (line, spoken) => { caption = line; captionSpoken = spoken; captionAt = Date.now(); },
         closed: () => {
           currentBridge.detach();
           if (conversation === current) { conversation = undefined; bridge = undefined; }

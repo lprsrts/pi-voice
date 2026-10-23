@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Live captions: the agent's current phrase is shown centered below the bar, in step with playback (both providers; ElevenLabs delivery tags such as `[Tone]` are removed).
+- Live captions: the agent's current phrase is shown centered below the bar, split at commas, semicolons, colons, dashes, and sentence ends, and paced by voiced audio so breaths keep the current phrase up (both providers; ElevenLabs delivery tags such as `[Tone]` are removed).
 
 ## 0.1.2 (2026-10-23)
 

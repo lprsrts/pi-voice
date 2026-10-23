@@ -58,64 +58,112 @@ export function dominantFrequency(samples: number[], rate: number, low = 80, hig
   return low * Math.exp(ratio * (best + offset));
 }
 
+/** Peak above which a PCM16 block counts as voice rather than silence or breath. */
+const VOICE_PEAK = 600;
+
+/** Milliseconds of voiced audio in a PCM16 buffer, judged per 20 ms block. */
+export function voicedMs(pcm: Buffer, rate: number): number {
+  const block = Math.max(2, Math.floor(rate * 0.02) * 2);
+  let ms = 0;
+  for (let start = 0; start + 1 < pcm.length; start += block) {
+    const end = Math.min(pcm.length, start + block);
+    for (let i = start; i + 1 < end; i += 2) {
+      if (Math.abs(pcm.readInt16LE(i)) > VOICE_PEAK) { ms += (end - start) / 2 / rate * 1000; break; }
+    }
+  }
+  return ms;
+}
+
 /**
  * Live captions for the agent's speech, one phrase at a time. Transcript text
  * usually arrives ahead of its audio, so each delta is stamped with the amount
- * of audio queued when it arrived and shown once playback reaches that point.
+ * of audio queued when it arrived, and its characters are spread over the audio
+ * that follows, up to the next delta. Time is counted in voiced audio only, so
+ * pauses and breaths do not advance the caption; they fall on phrase breaks.
  */
 export class Captions {
   private queuedMs = 0;
   private playedMs = 0;
   private pending: { at: number; text: string; turn?: boolean }[] = [];
-  private spoken = "";
   private shown = "";
+  private readonly onLine: (line: string, spoken: number) => void;
 
-  private readonly onLine: (line: string) => void;
-
-  constructor(onLine: (line: string) => void) { this.onLine = onLine; }
+  /** onLine gets the current phrase and how many of its characters have been spoken. */
+  constructor(onLine: (line: string, spoken: number) => void) { this.onLine = onLine; }
 
   /** Transcript text for audio that is about to be (or already was) queued. */
   text(delta: string) {
     // Eleven v3 voices put delivery tags such as "[Tone]" into the transcript.
     const clean = delta.replace(/\[[^\]]*\]\s*/g, "");
-    if (clean) { this.pending.push({ at: this.queuedMs, text: clean }); this.flush(); }
+    if (clean) { this.pending.push({ at: this.queuedMs, text: clean }); this.emit(); }
   }
 
-  queued(bytes: number, rate: number) { this.queuedMs += bytes / 2 / rate * 1000; }
+  queued(pcm: Buffer, rate: number) { this.queuedMs += voicedMs(pcm, rate); this.emit(); }
 
-  played(ms: number) { this.playedMs += ms; this.flush(); }
+  played(frame: Buffer, rate: number) { this.playedMs += voicedMs(frame, rate); this.emit(); }
 
   /** Queued audio was dropped (barge-in): unplayed text never gets said. */
   interrupt() {
-    this.pending = [];
+    this.pending = this.pending.filter(entry => entry.at < this.playedMs);
     this.queuedMs = this.playedMs;
+    this.emit();
   }
 
   /** A new turn starts with the audio queued from now on: its first phrase replaces the line. */
   turn() { this.pending.push({ at: this.queuedMs, text: "", turn: true }); }
 
-  private flush() {
-    let changed = false;
-    while (this.pending.length && this.pending[0].at <= this.playedMs) {
-      const next = this.pending.shift()!;
-      this.spoken = next.turn ? "" : this.spoken + next.text;
-      changed = true;
-    }
-    if (changed) this.emit();
-  }
-
   private emit() {
-    const line = currentPhrase(this.spoken);
-    if (line !== this.shown) { this.shown = line; this.onLine(line); }
+    // The current turn is everything after the last turn marker that has started playing.
+    let first = 0;
+    for (let i = 0; i < this.pending.length; i++) if (this.pending[i].turn && this.pending[i].at < this.playedMs) first = i;
+    this.pending.splice(0, first);
+    let text = "", cursor = 0;
+    for (let i = 0; i < this.pending.length; i++) {
+      const entry = this.pending[i];
+      if (entry.turn && i > 0) break; // the next turn has not started yet
+      const end = this.pending[i + 1]?.at ?? this.queuedMs;
+      // Strictly after its mark: a pause before a delta keeps the previous phrase up.
+      if (entry.text && this.playedMs > entry.at) {
+        const share = end > entry.at ? Math.min(1, (this.playedMs - entry.at) / (end - entry.at)) : 0;
+        cursor = text.length + Math.max(1, Math.round(share * entry.text.length));
+      }
+      text += entry.text;
+    }
+    const { phrase, spoken } = phraseAt(text, cursor);
+    const key = `${spoken}:${phrase}`;
+    if (key !== this.shown) { this.shown = key; this.onLine(phrase, spoken); }
   }
 }
 
-/** The phrase being spoken: text after the last finished sentence, or that sentence if nothing follows it yet. */
-export function currentPhrase(text: string): string {
-  const sentences = text.match(/[^.!?…]*[.!?…]+["”’)]*\s*|[^.!?…]+$/g) ?? [];
-  for (let i = sentences.length - 1; i >= 0; i--) {
-    const phrase = sentences[i].replace(/\s+/g, " ").trim();
-    if (phrase) return phrase;
+/** Phrase breaks: sentence ends, commas, semicolons, colons, and dashes followed by a space. */
+const PHRASE = /[^,;:.!?…—–]*(?:[,;:.!?…]+["”’)]*|\s[—–])(?=\s|$)\s*|[^,;:.!?…—–]+$|[^\s]+\s*/g;
+
+/** The phrase that contains the character at `cursor` (1-based count of spoken characters), and how much of it is spoken. */
+export function phraseAt(text: string, cursor: number): { phrase: string; spoken: number } {
+  if (cursor <= 0) return { phrase: "", spoken: 0 };
+  let start = 0;
+  for (const match of text.match(PHRASE) ?? []) {
+    const end = start + match.length;
+    if (cursor <= end || end >= text.length) {
+      const phrase = match.replace(/\s+/g, " ").trim();
+      return { phrase, spoken: Math.min(phrase.length, cursor - start) };
+    }
+    start = end;
   }
-  return "";
+  return { phrase: "", spoken: 0 };
+}
+
+/** Splits a phrase into word chunks no wider than `width`; returns the chunk holding character `spoken`. */
+export function fitPhrase(phrase: string, spoken: number, width: number, measure: (text: string) => number = text => text.length): string {
+  if (measure(phrase) <= width) return phrase;
+  let chunk = "", start = 0, consumed = 0;
+  for (const word of phrase.split(" ")) {
+    const next = chunk ? `${chunk} ${word}` : word;
+    if (chunk && measure(next) > width) {
+      if (spoken <= consumed) return chunk;
+      chunk = word; start = consumed + 1;
+    } else chunk = next;
+    consumed = start + chunk.length;
+  }
+  return chunk;
 }

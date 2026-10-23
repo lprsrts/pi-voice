@@ -47,8 +47,8 @@ type Hooks = {
   tool: (name: string, args: Record<string, unknown>) => object;
   /** Whether Pi is working, for the resting waveform state. */
   busy: () => boolean;
-  /** The phrase the agent is saying now, in step with playback. */
-  caption?: (line: string) => void;
+  /** The phrase the agent is saying now and how much of it is spoken, in step with playback. */
+  caption?: (line: string, spoken: number) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -86,7 +86,7 @@ export class RealtimeVoice {
   constructor(hooks: Hooks, audioFactory: AudioFactory) {
     this.hooks = hooks;
     this.audioFactory = audioFactory;
-    this.captions = new Captions(line => this.hooks.caption?.(line));
+    this.captions = new Captions((line, spoken) => this.hooks.caption?.(line, spoken));
   }
 
   /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
@@ -189,7 +189,7 @@ export class RealtimeVoice {
         if (this.stopped) return;
         if (audible) {
           this.playedMs += 20;
-          this.captions.played(20);
+          this.captions.played(frame, RATE);
           this.lastAudible = Date.now();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
           this.hooks.samples("output", waveform(frame));
@@ -246,7 +246,7 @@ export class RealtimeVoice {
         this.spokeThisTurn = true;
         if (event.item_id !== this.playingItem) { this.playingItem = event.item_id; this.playedMs = 0; }
         const pcm = Buffer.from(event.delta, "base64");
-        if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm.length, RATE); }
+        if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm, RATE); }
         break;
       }
       case "response.output_audio_transcript.delta":
