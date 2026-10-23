@@ -301,3 +301,21 @@ export function formatCaption(line: CaptionLine, width: number, measure: (text: 
   const last = chunks.length - 1;
   return decorate(chunks[index].text, index > 0 || line.continues, index < last || line.open);
 }
+
+/**
+ * Cuts text to at most `max` tokens by a deliberately pessimistic estimate, at a
+ * piece boundary, marking the cut with "…". Code, paths, numbers, and non-Latin
+ * text tokenize far denser than prose, so each letter run counts one token per
+ * four letters, and every digit, symbol, and non-ASCII character counts one.
+ */
+export function clipTokens(text: string, max: number): string {
+  let tokens = 0, end = 0;
+  for (const piece of text.matchAll(/[A-Za-z]+|\s+|[\s\S]/g)) {
+    const value = piece[0];
+    const cost = /^[A-Za-z]/.test(value) ? Math.ceil(value.length / 4) : /^\s+$/.test(value) ? (value.includes("\n") ? 1 : 0) : 1;
+    if (tokens + cost > max - 1) return `${text.slice(0, end).trimEnd()} …`; // one token left for the ellipsis
+    tokens += cost;
+    end = piece.index! + value.length;
+  }
+  return text;
+}

@@ -1,7 +1,7 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
 import { PI_TOOLS } from "./pi-bridge.ts";
-import { Captions, type CaptionLine, waveform, type VoiceState } from "./protocol.ts";
+import { Captions, clipTokens, type CaptionLine, waveform, type VoiceState } from "./protocol.ts";
 
 // OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with Responses
 // delegation: the voice model hands work to an OpenAI backend model, which
@@ -11,7 +11,7 @@ import { Captions, type CaptionLine, waveform, type VoiceState } from "./protoco
 
 const ENDPOINT = "wss://api.openai.com/v1/live/sessions";
 const RATE = 24000; // PCM16 mono both ways; the native helper runs unresampled at this rate
-const APPEND_LIMIT = 1800; // commentary/thinking accept up to 500 tokens; stay well under
+const APPEND_TOKENS = 400; // commentary/thinking accept at most 500 tokens; the estimate is pessimistic, and this leaves margin
 const SPEECH_PEAK = 600;   // GPT-Live streams continuously, silence included (measured: 44.8 s of audio in a 47 s session)
 
 /** Whether a PCM16 frame carries speech rather than the stream's silence. */
@@ -153,12 +153,12 @@ export class LiveVoice {
 
   /** A Pi update GPT-Live should say aloud (it paraphrases commentary). */
   notify(text: string) {
-    this.send({ type: "session.commentary.append", delegation_id: null, content: text.slice(0, APPEND_LIMIT) });
+    this.send({ type: "session.commentary.append", delegation_id: null, content: clipTokens(text, APPEND_TOKENS) });
   }
 
   /** Silent context GPT-Live can use when asked, without speaking it now. */
   context(text: string) {
-    this.send({ type: "session.thinking.append", delegation_id: null, content: text.slice(0, APPEND_LIMIT) });
+    this.send({ type: "session.thinking.append", delegation_id: null, content: clipTokens(text, APPEND_TOKENS) });
   }
 
   private startAudio() {

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
+import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
 import { RealtimeVoice, sessionConfig } from '../realtime.ts';
 import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
@@ -554,6 +554,18 @@ test('GPT-Live anchoring ignores onsets from before the user spoke', () => {
   assert.equal(shown.at(-1), 'First.');
   captions.played(voiced(1), 24000);
   assert.equal(shown.at(-1), 'Second.');
+});
+
+test('GPT-Live appends are clipped by a pessimistic token estimate, not characters', () => {
+  assert.equal(clipTokens('Published 0.1.3.', 400), 'Published 0.1.3.');
+  // 1800 characters of a publish log is ~800 real tokens: well over the 500-token limit.
+  const log = 'npm notice 13.3kB README.md sha512-XosJ7wfxiYZWi9a3 /Users/alper/dev/pi-voice/audio.ts:384 '.repeat(40);
+  const clipped = clipTokens(log, 400);
+  assert.ok(clipped.endsWith(' …'));
+  assert.ok(clipped.length < 900, `kept ${clipped.length} chars`);
+  assert.ok(log.startsWith(clipped.slice(0, -2)));
+  // Every digit and symbol counts as a token: dense text keeps proportionally less.
+  assert.ok(clipTokens('1234567890'.repeat(100), 400).length <= 401);
 });
 
 test('GPT-Live config comes from providers/openai-live/ with Responses delegation to the Pi tools', () => {
