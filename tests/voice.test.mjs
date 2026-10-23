@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform } from '../protocol.ts';
+import { PcmFramer, waveform, dominantFrequency } from '../protocol.ts';
 import { RealtimeVoice, sessionConfig } from '../realtime.ts';
 import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
@@ -37,6 +37,18 @@ test('PCM chunks preserve split sample bytes and pad final frame', () => {
   assert.equal(tail[639], 0);
   assert.equal(f.flush(), undefined);
 });
+test('dominant frequency finds the strongest tone in a 20 ms frame', () => {
+  const tone = (hz, n = 480, rate = 24000) => Array.from({ length: n }, (_, i) => Math.sin(2 * Math.PI * hz * i / rate));
+  for (const hz of [150, 440, 1200, 3000]) {
+    const found = dominantFrequency(tone(hz), 24000);
+    assert.ok(Math.abs(Math.log2(found / hz)) < 0.15, `${hz} Hz -> ${found}`);
+  }
+  const mixed = tone(220).map((v, i) => 0.3 * v + tone(900)[i]);
+  assert.ok(Math.abs(dominantFrequency(mixed, 24000) - 900) < 90);
+  assert.equal(dominantFrequency(new Array(480).fill(0), 24000), undefined);
+  assert.equal(dominantFrequency([0.1, 0.2], 24000), undefined);
+});
+
 test('waveform samples are signed and bounded', () => {
   const b = Buffer.alloc(4); b.writeInt16LE(-32768, 0); b.writeInt16LE(32767, 2);
   assert.deepEqual(waveform(b), [-1, 32767 / 32768]);

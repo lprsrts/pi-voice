@@ -8,9 +8,45 @@ import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
 import { PiBridge } from "./pi-bridge.ts";
 import { PROVIDERS, selectProvider, type VoiceSession } from "./providers.ts";
+import { dominantFrequency } from "./protocol.ts";
 
 const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
 type State = (typeof states)[number];
+
+// Listening and speaking draw the same Gaussian beam as thinking. Loudness sets
+// the beam height; the frame's dominant frequency (80 Hz-4 kHz, log scale) sets
+// the carrier from 4 to 20 cycles across the bar. Thinking sits at 8 cycles.
+const RATE = 24000;
+const LOW_HZ = 80, HIGH_HZ = 4000;
+const BEAM_WAIST = 0.16;
+const THINKING_CYCLES = 8, THINKING_SPEED = 3.5; // rad/s of carrier phase at 8 cycles
+
+type Beam = { level: number; logHz: number; phase: number; peak: number; frame?: number[]; target: number; targetLogHz: number };
+const newBeam = (hz: number): Beam => ({ level: 0, logHz: Math.log(hz), phase: 0, peak: 0, target: 0, targetLogHz: Math.log(hz) });
+const beamCycles = (beam: Beam) => 4 + 16 * Math.max(0, Math.min(1, Math.log(Math.exp(beam.logHz) / LOW_HZ) / Math.log(HIGH_HZ / LOW_HZ)));
+
+/** Eases a beam toward its targets: fast attack, slower release, ~90 ms frequency glide. */
+function advanceBeam(beam: Beam, dt: number) {
+  beam.level += (beam.target - beam.level) * (1 - Math.exp(-dt / (beam.target > beam.level ? 0.04 : 0.18)));
+  beam.logHz += (beam.targetLogHz - beam.logHz) * (1 - Math.exp(-dt / 0.09));
+  beam.phase += dt * THINKING_SPEED * beamCycles(beam) / THINKING_CYCLES;
+}
+
+/** Sets a beam's targets from the newest live frame (analysed once per frame). */
+function measureBeam(beam: Beam, samples: number[], fresh: boolean, dt: number) {
+  // Adaptive gain: normalize by the recent peak so quiet microphones still
+  // deflect; the floor keeps silence from amplifying noise.
+  beam.peak *= Math.pow(0.985, dt * 30);
+  if (!fresh || !samples.length) { beam.target = 0; return; }
+  if (samples === beam.frame) return;
+  beam.frame = samples;
+  let peak = 0;
+  for (const value of samples) peak = Math.max(peak, Math.abs(value));
+  beam.peak = Math.max(beam.peak, peak);
+  beam.target = Math.min(1, peak / Math.max(beam.peak, 0.06));
+  const hz = beam.target > 0.15 ? dominantFrequency(samples, RATE, LOW_HZ, HIGH_HZ) : undefined;
+  if (hz) beam.targetLogHz = Math.log(hz);
+}
 
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
 export default function voicePreview(pi: ExtensionAPI) {
@@ -48,7 +84,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       ctx.ui.setWidget("voice-preview", (tui, theme) => {
         let lastFrame = Date.now();
         let weights = states.map(state => state === "idle" ? 1 : 0);
-        let peakInput = 0, peakOutput = 0;
+        const input = newBeam(200), output = newBeam(200);
         timer = setInterval(() => tui.requestRender(), 33);
         timer.unref();
         return {
@@ -59,16 +95,28 @@ export default function voicePreview(pi: ExtensionAPI) {
             const state = choice === "live" ? liveState : choice === "cycle" ? states[Math.floor((now - cycleStarted) / 4000) % states.length] : choice as State;
             // Time-based easing: ~95% settled after 0.75s. Preserves continuity
             // even when a new state arrives before the previous blend finishes.
-            const blend = 1 - Math.exp(-Math.max(0, now - lastFrame) / 250);
+            const dt = Math.min(0.25, Math.max(0, now - lastFrame) / 1000);
+            const blend = 1 - Math.exp(-dt / 0.25);
             lastFrame = now;
             weights = weights.map((weight, i) => weight + ((states[i] === state ? 1 : 0) - weight) * blend);
             const color = { idle: "dim", listening: "accent", thinking: "warning", speaking: "success", error: "error" } as const;
             const columns = Math.max(0, Math.floor(width));
             const time = seconds;
-            // Three braille rows give a 12-pixel-high oscilloscope trace: live PCM
-            // samples in voice mode, synthetic animation in preview mode.
-            const envelope = (0.12 + 0.88 * Math.pow(0.5 + 0.5 * Math.sin(time * 4.3 + Math.sin(time * 1.7)), 2))
-              * (weights[1] * 0.7 + weights[3]);
+            // Three braille rows give a 12-pixel-high trace: live frames in voice
+            // mode, a synthetic voice (syllable envelope, gliding pitch) in preview.
+            if (choice === "live") {
+              measureBeam(input, inputSamples, now - inputTime <= 200, dt);
+              measureBeam(output, outputSamples, now - outputTime <= 200, dt);
+            } else {
+              const syllables = 0.12 + 0.88 * Math.pow(0.5 + 0.5 * Math.sin(time * 4.3 + Math.sin(time * 1.7)), 2);
+              input.target = 0.7 * syllables;
+              output.target = syllables;
+              input.targetLogHz = Math.log(260 * Math.pow(2, 1.2 * Math.sin(time * 1.3) + 0.6 * Math.sin(time * 3.1)));
+              output.targetLogHz = Math.log(180 * Math.pow(2, 1.0 * Math.sin(time * 0.9 + 1) + 0.8 * Math.sin(time * 2.3)));
+            }
+            advanceBeam(input, dt);
+            advanceBeam(output, dt);
+            const inputCycles = beamCycles(input), outputCycles = beamCycles(output);
             let tint = theme.colors[color.idle];
             let accumulated = weights[0];
             for (let i = 1; i < states.length; i++) {
@@ -84,46 +132,19 @@ export default function voicePreview(pi: ExtensionAPI) {
               const col = Math.floor(sample / 2);
               dots[Math.floor(row / 4)][col] |= (sample % 2 ? rightBits : leftBits)[row % 4];
             }
-            const sampleMax = (samples: number[]) => {
-              let peak = 0;
-              for (const value of samples) {
-                const magnitude = Math.abs(value);
-                if (magnitude > peak) peak = magnitude;
-              }
-              return peak;
-            };
-            // Adaptive gain for live audio: normalize by the recent peak so quiet
-            // microphones still deflect; the floor keeps silence from amplifying noise.
-            if (choice === "live") {
-              peakInput = Math.max(peakInput * 0.985, sampleMax(inputSamples));
-              peakOutput = Math.max(peakOutput * 0.985, sampleMax(outputSamples));
-            }
             let previousY: number | undefined;
             for (let sample = 0; sample < columns * 2; sample++) {
               const x = sample / Math.max(1, columns * 2 - 1);
-              // A phase-anchored fundamental avoids a scrolling appearance. Harmonic
-              // weights and phase change over time, like successive audio snapshots.
-              const phase = x * Math.PI * 2 * (5 + 0.7 * Math.sin(time * 0.8));
-              const signal = (
-                Math.sin(phase) +
-                0.36 * Math.sin(phase * 2.1 + Math.sin(time * 2)) +
-                0.18 * Math.sin(phase * 3.7 + Math.sin(time * 3.1))
-              ) / 1.54;
-              const localEnvelope = 0.65 + 0.35 * Math.sin(x * 9 + time * 1.2) ** 2;
-              // Fixed Gaussian beam waist: its envelope never travels or widens.
-              // Only the carrier phase evolves inside the stationary envelope.
+              // Fixed Gaussian beam waist: the envelope never travels or widens;
+              // only the carrier inside it changes (phase, and for audio, density).
               const centered = x - 0.5;
-              const gaussian = Math.exp(-0.5 * (centered / 0.16) ** 2);
-              const thinking = 0.85 * gaussian * Math.cos(centered * Math.PI * 16 - time * 3.5);
-              const readSample = (samples: number[], timestamp: number, peak: number) => {
-                if (!samples.length || now - timestamp > 200) return 0;
-                const raw = samples[Math.min(samples.length - 1, Math.floor(x * samples.length))];
-                return Math.max(-1, Math.min(1, raw / Math.max(peak, 0.06)));
-              };
-              const audio = choice === "live"
-                ? readSample(inputSamples, inputTime, peakInput) * weights[1] + readSample(outputSamples, outputTime, peakOutput) * weights[3]
-                : signal * envelope * localEnvelope;
-              const amplitude = audio + weights[2] * thinking;
+              const gaussian = Math.exp(-0.5 * (centered / BEAM_WAIST) ** 2);
+              const carrier = (cycles: number, phase: number) => Math.cos(centered * Math.PI * 2 * cycles - phase);
+              const amplitude = 0.85 * gaussian * (
+                weights[1] * input.level * carrier(inputCycles, input.phase) +
+                weights[2] * carrier(THINKING_CYCLES, time * THINKING_SPEED) +
+                weights[3] * output.level * carrier(outputCycles, output.phase)
+              );
               const y = Math.round(5.5 - amplitude * 5.4);
               // Join neighboring samples so steep peaks remain a continuous trace.
               const from = previousY === undefined ? y : previousY;

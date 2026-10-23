@@ -98,7 +98,7 @@ noise floor. Apple's AGC also brings normal speech on the built-in mic to a heal
 - `/talk unmute`: resumes capture.
 - `/talk-preview [cycle|idle|listening|thinking|speaking|error|off]`: offline, simulated visual design mode. Stop live voice first.
 
-The bar is text-free, foreground-only, and below the editor. Live listening/speaking use PCM samples with adaptive gain (recent-peak normalization); thinking uses a centered Gaussian envelope with an evolving carrier phase. State/color weights ease over ~750ms. Preview audio is synthetic. Live output samples are measured at the playback pipe, not from a hardware playback clock, so visual/audio alignment is approximate.
+The bar is text-free, foreground-only, and below the editor. Every state is the same centered, stationary Gaussian beam. Thinking runs a fixed carrier with an evolving phase. Listening (mic) and speaking (agent) set the beam's height from the frame's level (adaptive gain, recent-peak normalization) and its carrier density from the frame's dominant frequency: 80 Hz–4 kHz on a log scale maps to 4–20 cycles across the bar. That frequency is found with a Hann-windowed Goertzel scan of each 20 ms frame, and it glides over ~90 ms. State/color weights ease over ~750ms. Preview audio is synthetic. Live output samples are measured at the playback pipe, not from a hardware playback clock, so visual/audio alignment is approximate.
 
 ## Providers
 
