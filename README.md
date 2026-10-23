@@ -1,23 +1,40 @@
 # pi-voice
 
-Full-duplex, speech-to-speech voice for [Pi](https://pi.dev) on macOS. You talk to a realtime voice model (**ElevenLabs Eleven Realtime v1 Max** or **OpenAI GPT-Live**); it hands real work to the Pi session in your terminal through three tools (`ask_pi`, `pi_status`, `cancel_pi`) and tells you the outcome. Barge-in works, and Apple's echo canceller lets you use speakers instead of headphones.
+![pi-voice: the voice bar listening, thinking, and speaking](https://raw.githubusercontent.com/lprsrts/pi-voice/main/assets/cover.png)
 
-This is not dictation: for local speech-to-text into the editor, see the official `@earendil-works/pi-voice`. The two packages can be installed together (this one uses `/talk`).
+**Talk to your coding agent.** Full-duplex, speech-to-speech voice for [Pi](https://pi.dev) on macOS. Say what you want; a realtime voice model hands the work to the Pi session in your terminal and tells you the outcome when it is done.
 
-## Install
+- **Not dictation.** You talk to a voice model (ElevenLabs Eleven Realtime or OpenAI GPT-Live) that delegates to Pi through three tools: `ask_pi`, `pi_status`, `cancel_pi`. Pi's own tools, permission prompts, and transcript work exactly as in the TUI.
+- **Use your speakers.** Audio runs through Apple's VoiceProcessingIO, the echo canceller FaceTime uses, so the agent doesn't hear itself. Headphones are optional.
+- **Interrupt any time.** Barge-in cuts the agent off mid-sentence, and the session follows device switches such as AirPods connecting.
+- **Nothing to install but Pi.** No npm dependencies and no ffmpeg; a small Swift audio helper is compiled from source on first use.
 
-```sh
-pi install npm:@lprsrts/pi-voice
-```
+For local speech-to-text into the editor, use the official `@earendil-works/pi-voice` instead. The two install side by side; this package's command is `/talk`.
 
-Then, inside Pi:
+## Quick start
 
-```text
-/talk check          # helper, devices, API-key status
-/talk start          # ElevenLabs (default)
-/talk start openai-live
-/talk stop
-```
+1. Install:
+   ```sh
+   pi install npm:@lprsrts/pi-voice
+   ```
+2. Add an API key for one provider (see [Requirements](#requirements)), e.g. `export ELEVENLABS_API_KEY=…` or store it in the login keychain.
+3. In Pi:
+   ```text
+   /talk check             # helper, devices, API-key status: no network, no microphone
+   /talk start             # ElevenLabs (default); /talk start openai-live for GPT-Live
+   /talk stop
+   ```
+
+The first `/talk` command that needs audio builds the native helper (a few seconds, up to ~40 s). macOS asks once for microphone permission for your terminal.
+
+## What it costs
+
+The package is free (MIT). Voice sessions are billed by the provider to your own API key:
+
+- **ElevenLabs:** Eleven Realtime per-minute pricing plus Realtime tokens, on your ElevenLabs plan.
+- **OpenAI GPT-Live:** $0.05 per minute of voice, plus tokens for the backend model that calls Pi. Needs API billing; a ChatGPT plan does not cover it.
+
+Sessions end after 60 minutes (`max_duration_seconds`). `/talk mute` stops the microphone but keeps the session open (and billable); `/talk stop` ends it.
 
 ## Requirements
 
@@ -41,8 +58,6 @@ security add-generic-password -U -s "openai-api-key" -a "$USER" -l "OpenAI API k
 
 The key is read only during `/talk start` and is never logged; `/talk check` reports where it would come from without reading it. GPT-Live needs API billing (a ChatGPT plan does not cover it).
 
-No npm runtime dependencies or ffmpeg are required.
-
 Environment settings:
 
 - `PI_VOICE_PROVIDER`: default provider when `/talk start` names none.
@@ -60,7 +75,71 @@ Each provider's model, voice, turn settings, and prompts ship in `providers/<nam
 
 `/talk check` prints the override directory in use.
 
-## Native audio (`native/VoiceIO.swift`)
+## Commands
+
+- `/talk check`: echo-cancellation mode, helper/swiftc status, current default devices, and the API-key source (keychain item present, or env override) without reading the secret; no network or microphone access.
+- `/talk devices`: shows the macOS default input and output that sessions use.
+- `/talk tone [hz]`: plays a local 2-second test tone on the default output — no microphone, no network.
+- `/talk mic-test [seconds]`: records a short local clip through the session's voice-processing path, reports peak/RMS level in dBFS, and plays it back; nothing leaves this Mac.
+- `/talk start`: asks for consent, mints a short-lived client secret for the session config, connects, then starts audio.
+- `/talk stop`: ends the voice session and releases audio. A Pi task it started keeps running.
+- `/talk mute`: mutes the microphone inside the voice unit (output/conversation remain active and may still incur charges).
+- `/talk unmute`: resumes capture.
+- `/talk-preview [cycle|idle|listening|thinking|speaking|error|off]`: offline, simulated visual design mode. Stop live voice first.
+
+The bar is text-free, foreground-only, and below the editor. Every state is the same centered, stationary Gaussian beam. Thinking runs a fixed carrier with an evolving phase. Listening (mic) and speaking (agent) set the beam's height from the frame's level (adaptive gain, recent-peak normalization) and its carrier density from the frame's dominant frequency: 80 Hz–4 kHz on a log scale maps to 4–20 cycles across the bar. That frequency is found with a Hann-windowed Goertzel scan of each 20 ms frame, and it glides over ~90 ms. State/color weights ease over ~750ms. Preview audio is synthetic. Live output samples are measured at the playback pipe, not from a hardware playback clock, so visual/audio alignment is approximate.
+
+## Troubleshooting audio
+
+1. **Agent loops with speakers (speaks, hears itself, answers, repeats)?** That is acoustic echo. Check that `PI_VOICE_AEC` is not set to `0` (`/talk check`); with echo cancellation on, speakers should be safe.
+2. **No sound from the agent?** Run `/talk tone`, and check the default output in Sound settings (`/talk devices`).
+3. **Agent never "hears" you (stuck listening, flat waveform)?** Run `/talk mic-test` and read the levels:
+   - below about -40 dBFS: wrong input device or missing macOS microphone permission;
+   - -25 to -6 dBFS: healthy; near 0: clipping.
+   Another app holding the mic (e.g. a muted WhatsApp call) can also starve it.
+4. **Bluetooth quality:** activating an AirPods microphone can force the whole headset into a low-quality bidirectional profile. Prefer Mac microphone for input and AirPods for output.
+5. **Agent cuts in too early or waits too long?** Tune `turn_detection.eagerness` (`low`/`medium`/`high`) in `providers/elevenlabs/session.json`.
+
+Startup, microphone stalls, socket inactivity, and playback queue sizes are bounded. No automatic reconnect or microphone startup on extension load. Audio/transcripts/credentials are not logged or persisted locally by this extension. ElevenLabs' own retention and billing settings still apply.
+
+## How it works
+
+### Providers
+
+Pick one per session: `/talk start [elevenlabs|openai-live]`, else `PI_VOICE_PROVIDER`, else `elevenlabs`.
+Each provider's defaults live in `providers/<name>/`, overridable as described under Configuration.
+
+| | `elevenlabs` (default) | `openai-live` |
+|---|---|---|
+| Model | Eleven Realtime v1 Max, speech-to-speech | OpenAI GPT-Live-1, full duplex |
+| Protocol | OpenAI-compatible Realtime (`realtime.ts`) | GPT-Live (`live.ts`), `wss://api.openai.com/v1/live/sessions` |
+| Pi tools | Called by the voice model | Called by a backend Responses model (`backend.md`, `session.json` `backend.model`) that GPT-Live delegates to via `<|SpawnThinking|>` |
+| Pi updates | Labelled user item + `response.create` | `session.commentary.append` (spoken), `session.thinking.append` (silent progress) |
+| Key | `ELEVENLABS_API_KEY` / `elevenlabs-api-key` | `OPENAI_API_KEY` / `openai-api-key` |
+| Cost | per minute + Realtime tokens | $0.05/min voice + backend model tokens |
+
+GPT-Live notes: there is no interruption event; the model yields by itself, and the client drops its
+locally queued audio when the user's transcript shows speech over playback. `/talk stop` sends
+`session.close` so usage is finalized.
+
+### Talking to Pi (`pi-bridge.ts`)
+
+| Tool | What happens |
+|---|---|
+| `ask_pi(request, when?)` | Returns at once. Pi idle: the request becomes a normal user message in this Pi session. Pi busy: `when: "now"` steers the running task, `"after"` (default) queues it as a follow-up. |
+| `pi_status()` | Current request, last tool Pi ran, elapsed time, latest text, queued requests, pending terminal prompt; answered from Pi's events without disturbing it. |
+| `cancel_pi()` | Aborts Pi's running task and reports whether queued messages remain. |
+
+- When a run that voice asked for settles, its final answer is sent to the model, which speaks it at
+  the next moment nobody is talking (never over you). Pi waiting on a terminal prompt is announced
+  the same way; the voice model cannot answer Pi's prompts.
+- Pi's tools, permission prompts, and transcript are exactly as in the TUI: every voice request is
+  visible in the session.
+- Eleven Realtime ignores `system` conversation items (measured: the model stalled or invented a
+  result). Pi updates are therefore `user` items prefixed "(Automatic update from Pi, not spoken by
+  the user.)", which the instructions explain.
+
+### Native audio (`native/VoiceIO.swift`)
 
 All audio goes through one small Swift program built on Apple's VoiceProcessingIO audio
 unit, the echo canceller FaceTime uses. It always uses the **macOS default input and
@@ -86,56 +165,7 @@ the agent at -32.6 dBFS (hence the loops); voice processing leaves -108 dBFS, be
 noise floor. Apple's AGC also brings normal speech on the built-in mic to a healthy level
 (`/talk mic-test`: peak -10.5 dBFS), so the extension applies no gain of its own.
 
-## Commands
-
-- `/talk check`: echo-cancellation mode, helper/swiftc status, current default devices, and the API-key source (keychain item present, or env override) without reading the secret; no network or microphone access.
-- `/talk devices`: shows the macOS default input and output that sessions use.
-- `/talk tone [hz]`: plays a local 2-second test tone on the default output — no microphone, no network.
-- `/talk mic-test [seconds]`: records a short local clip through the session's voice-processing path, reports peak/RMS level in dBFS, and plays it back; nothing leaves this Mac.
-- `/talk start`: asks for consent, mints a short-lived client secret for the session config, connects, then starts audio.
-- `/talk stop`: ends the voice session and releases audio. A Pi task it started keeps running.
-- `/talk mute`: mutes the microphone inside the voice unit (output/conversation remain active and may still incur charges).
-- `/talk unmute`: resumes capture.
-- `/talk-preview [cycle|idle|listening|thinking|speaking|error|off]`: offline, simulated visual design mode. Stop live voice first.
-
-The bar is text-free, foreground-only, and below the editor. Every state is the same centered, stationary Gaussian beam. Thinking runs a fixed carrier with an evolving phase. Listening (mic) and speaking (agent) set the beam's height from the frame's level (adaptive gain, recent-peak normalization) and its carrier density from the frame's dominant frequency: 80 Hz–4 kHz on a log scale maps to 4–20 cycles across the bar. That frequency is found with a Hann-windowed Goertzel scan of each 20 ms frame, and it glides over ~90 ms. State/color weights ease over ~750ms. Preview audio is synthetic. Live output samples are measured at the playback pipe, not from a hardware playback clock, so visual/audio alignment is approximate.
-
-## Providers
-
-Pick one per session: `/talk start [elevenlabs|openai-live]`, else `PI_VOICE_PROVIDER`, else `elevenlabs`.
-Each provider's defaults live in `providers/<name>/`, overridable as described under Configuration.
-
-| | `elevenlabs` (default) | `openai-live` |
-|---|---|---|
-| Model | Eleven Realtime v1 Max, speech-to-speech | OpenAI GPT-Live-1, full duplex |
-| Protocol | OpenAI-compatible Realtime (`realtime.ts`) | GPT-Live (`live.ts`), `wss://api.openai.com/v1/live/sessions` |
-| Pi tools | Called by the voice model | Called by a backend Responses model (`backend.md`, `session.json` `backend.model`) that GPT-Live delegates to via `<|SpawnThinking|>` |
-| Pi updates | Labelled user item + `response.create` | `session.commentary.append` (spoken), `session.thinking.append` (silent progress) |
-| Key | `ELEVENLABS_API_KEY` / `elevenlabs-api-key` | `OPENAI_API_KEY` / `openai-api-key` |
-| Cost | per minute + Realtime tokens | $0.05/min voice + backend model tokens |
-
-GPT-Live notes: there is no interruption event; the model yields by itself, and the client drops its
-locally queued audio when the user's transcript shows speech over playback. `/talk stop` sends
-`session.close` so usage is finalized.
-
-## Talking to Pi (`pi-bridge.ts`)
-
-| Tool | What happens |
-|---|---|
-| `ask_pi(request, when?)` | Returns at once. Pi idle: the request becomes a normal user message in this Pi session. Pi busy: `when: "now"` steers the running task, `"after"` (default) queues it as a follow-up. |
-| `pi_status()` | Current request, last tool Pi ran, elapsed time, latest text, queued requests, pending terminal prompt; answered from Pi's events without disturbing it. |
-| `cancel_pi()` | Aborts Pi's running task and reports whether queued messages remain. |
-
-- When a run that voice asked for settles, its final answer is sent to the model, which speaks it at
-  the next moment nobody is talking (never over you). Pi waiting on a terminal prompt is announced
-  the same way; the voice model cannot answer Pi's prompts.
-- Pi's tools, permission prompts, and transcript are exactly as in the TUI: every voice request is
-  visible in the session.
-- Eleven Realtime ignores `system` conversation items (measured: the model stalled or invented a
-  result). Pi updates are therefore `user` items prefixed "(Automatic update from Pi, not spoken by
-  the user.)", which the instructions explain.
-
-## Realtime protocol (`realtime.ts`)
+### Realtime protocol (`realtime.ts`)
 
 1. `POST /v1/convai/realtime/client_secrets` with the `xi-api-key` and the session config
    (`session.json` + `instructions.md` from the provider config + the Pi tools); the secret expires in 60 s.
@@ -155,25 +185,12 @@ locally queued audio when the user's transcript shows speech over playback. `/ta
    task gets one acknowledgement.
 7. The session ends at `max_duration_seconds` (3600; the API allows up to 7200). No auto-reconnect.
 
-## Troubleshooting audio
-
-1. **Agent loops with speakers (speaks, hears itself, answers, repeats)?** That is acoustic echo. Check that `PI_VOICE_AEC` is not set to `0` (`/talk check`); with echo cancellation on, speakers should be safe.
-2. **No sound from the agent?** Run `/talk tone`, and check the default output in Sound settings (`/talk devices`).
-3. **Agent never "hears" you (stuck listening, flat waveform)?** Run `/talk mic-test` and read the levels:
-   - below about -40 dBFS: wrong input device or missing macOS microphone permission;
-   - -25 to -6 dBFS: healthy; near 0: clipping.
-   Another app holding the mic (e.g. a muted WhatsApp call) can also starve it.
-4. **Bluetooth quality:** activating an AirPods microphone can force the whole headset into a low-quality bidirectional profile. Prefer Mac microphone for input and AirPods for output.
-5. **Agent cuts in too early or waits too long?** Tune `turn_detection.eagerness` (`low`/`medium`/`high`) in `providers/elevenlabs/session.json`.
-
-Startup, microphone stalls, socket inactivity, and playback queue sizes are bounded. No automatic reconnect or microphone startup on extension load. Audio/transcripts/credentials are not logged or persisted locally by this extension. ElevenLabs' own retention and billing settings still apply.
-
-## Tests / validation
+## Development
 
 ```sh
 git clone https://github.com/lprsrts/pi-voice && cd pi-voice
 npm test
-pi -e .   # try a local checkout without installing
+pi -e .   # try a local checkout (pi remove the npm package first, or /talk registers twice)
 ```
 
 Tests cover framing, keychain resolution (incl. truncated long keys), provider selection, the GPT-Live session (header auth, session.start, audio, delegated function calls and continuation, commentary/thinking updates, graceful close), device-route parsing, level math, the native helper session protocol (with a stand-in helper), the Realtime session (secret minting, socket auth, audio, barge-in truncation, function calls, response gating) against a fake socket, and the Pi bridge (start/steer/queue, status, cancel, announcements) against a fake Pi. No live credentials or audio devices are used. The Swift helper and the live Realtime protocol were exercised by hand.
@@ -182,6 +199,8 @@ References:
 - https://elevenlabs.io/docs/eleven-agents/customization/realtime-models
 - https://elevenlabs.io/docs/eleven-agents/guides/openai-realtime-compatibility
 - https://developer.apple.com/documentation/audiotoolbox/kaudiounitsubtype_voiceprocessingio
+
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Releases are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

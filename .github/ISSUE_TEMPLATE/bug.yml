@@ -1,0 +1,35 @@
+name: Bug report
+description: Something doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options: [elevenlabs, openai-live, not session-related]
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of /talk check
+      description: It reports the key source without reading the key. Remove device names if you prefer.
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      placeholder: "pi-voice 0.1.1, Pi 1.4.0, macOS 15.4, Apple Silicon"
+    validations:
+      required: true
+  - type: textarea
+    id: audio
+    attributes:
+      label: Audio setup
+      description: Speakers or headphones, input device, and /talk mic-test levels if the agent can't hear you.

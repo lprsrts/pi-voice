@@ -1,0 +1,10 @@
+name: Feature request
+description: Suggest a change or a new provider
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What would you like, and why?
+    validations:
+      required: true
