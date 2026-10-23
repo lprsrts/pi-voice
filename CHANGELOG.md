@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 (2026-10-24)
 
 - Live captions: the agent's current phrase is shown centered below the bar, split at commas, semicolons, colons, dashes, and sentence ends ("…" marks where a sentence continues), and paced by voiced audio so breaths keep the current phrase up (both providers; ElevenLabs delivery tags such as `[Tone]` are removed).
 - Captions are paced by the speaker, not the write queue: the audio helper reports its playout position over fd 4, so helper buffering, event-loop stalls, and device latency no longer make captions run ahead of the audio — when the device stalls, the caption holds with the sound instead of racing on (both providers).
