@@ -1,18 +1,50 @@
 {
   "name": "@lprsrts/pi-voice",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Full-duplex realtime voice for Pi on macOS: talk to a speech-to-speech model (ElevenLabs Realtime or OpenAI GPT-Live) that hands work to your Pi session",
-  "keywords": ["pi-package", "pi", "pi-extension", "voice", "realtime", "speech-to-speech", "elevenlabs", "openai", "macos"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "voice",
+    "realtime",
+    "speech-to-speech",
+    "elevenlabs",
+    "openai",
+    "macos"
+  ],
   "license": "MIT",
   "author": "Alper Sarıtaş",
   "homepage": "https://github.com/lprsrts/pi-voice#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/lprsrts/pi-voice.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lprsrts/pi-voice.git"
+  },
   "bugs": "https://github.com/lprsrts/pi-voice/issues",
   "type": "module",
-  "os": ["darwin"],
-  "engines": { "node": ">=24" },
-  "files": ["*.ts", "native/", "providers/", "README.md", "LICENSE"],
-  "scripts": { "test": "node --test tests/*.test.mjs" },
-  "pi": { "extensions": ["./index.ts"] },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*" }
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "files": [
+    "*.ts",
+    "native/",
+    "providers/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
 }
