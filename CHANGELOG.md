@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Live captions: the agent's current phrase is shown centered below the bar, split at commas, semicolons, colons, dashes, and sentence ends ("…" marks where a sentence continues), and paced by voiced audio so breaths keep the current phrase up (both providers; ElevenLabs delivery tags such as `[Tone]` are removed).
+- `/talk captions [on|off]` toggles the caption line; `PI_VOICE_CAPTIONS=0` starts with it off.
 
 ## 0.1.2 (2026-10-23)
 

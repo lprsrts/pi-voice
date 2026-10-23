@@ -75,6 +75,8 @@ export default function voicePreview(pi: ExtensionAPI) {
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
   let caption: CaptionLine | undefined, captionAt = 0;
+  // Caption row under the bar: /talk captions on|off, default from PI_VOICE_CAPTIONS.
+  let captionsOn = !["0", "false", "off"].includes(process.env.PI_VOICE_CAPTIONS?.trim().toLowerCase() ?? "");
   let muted = false;
 
   function stop() {
@@ -177,6 +179,7 @@ export default function voicePreview(pi: ExtensionAPI) {
             const line = choice === "live"
               ? (now - Math.max(captionAt, lastSpoke) < CAPTION_HOLD_MS ? caption : undefined)
               : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 1.6) % PREVIEW_CAPTIONS.length] : undefined;
+            if (!captionsOn) return bar;
             return [...bar, centered(line, columns, text => theme.style(text, { fg: theme.colors.muted }))];
           },
           dispose() {
@@ -203,7 +206,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   const aecLine = () => aecEnabled() ? "echo cancellation: on (PI_VOICE_AEC=0 bypasses it)" : "echo cancellation: off (PI_VOICE_AEC=0; headphones only)";
 
   pi.registerCommand("talk", {
-    description: "Realtime voice for Pi: start, stop, mute, unmute, check, devices, tone, mic-test",
+    description: "Realtime voice for Pi: start, stop, mute, unmute, captions, check, devices, tone, mic-test",
     handler: async (args, ctx) => {
       if (ctx.mode !== "tui") return;
       const command = args.trim();
@@ -221,7 +224,7 @@ export default function voicePreview(pi: ExtensionAPI) {
           try { const route = await currentRoute(await ensureHelper()); lines.push(`input: ${route.input}`, `output: ${route.output}`); }
           catch { lines.push("devices: query failed"); }
         }
-        ctx.ui.notify([...lines, `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`, `provider: ${(() => { try { return selectProvider().name; } catch (error) { return error instanceof Error ? error.message : "invalid"; } })()} (PI_VOICE_PROVIDER or /talk start <name>; available: ${Object.keys(PROVIDERS).join(", ")})`, ...(await Promise.all(Object.values(PROVIDERS).map(async p => `${p.name} api key: ${await apiKeyStatus(p.key)}`))), `config overrides: ${userConfigDir()}`, `platform: ${process.platform}`, `session: ${conversation ? (muted ? "muted" : "active/connecting") : "off"}`].join("\n"), "info");
+        ctx.ui.notify([...lines, `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`, `provider: ${(() => { try { return selectProvider().name; } catch (error) { return error instanceof Error ? error.message : "invalid"; } })()} (PI_VOICE_PROVIDER or /talk start <name>; available: ${Object.keys(PROVIDERS).join(", ")})`, ...(await Promise.all(Object.values(PROVIDERS).map(async p => `${p.name} api key: ${await apiKeyStatus(p.key)}`))), `captions: ${captionsOn ? "on" : "off"} (/talk captions on|off)`, `config overrides: ${userConfigDir()}`, `platform: ${process.platform}`, `session: ${conversation ? (muted ? "muted" : "active/connecting") : "off"}`].join("\n"), "info");
         return;
       }
       if (command === "devices") {
@@ -272,6 +275,13 @@ export default function voicePreview(pi: ExtensionAPI) {
         }
         return;
       }
+      if (command === "captions" || command.startsWith("captions ")) {
+        const value = command.slice(8).trim();
+        if (value && value !== "on" && value !== "off") { ctx.ui.notify("Use /talk captions [on|off]", "warning"); return; }
+        captionsOn = value ? value === "on" : !captionsOn;
+        ctx.ui.notify(`Captions ${captionsOn ? "on" : "off"}.`, "info");
+        return;
+      }
       if (command === "mute" || command === "unmute") {
         if (!conversation) { ctx.ui.notify("Voice is not running.", "warning"); return; }
         muted = command === "mute";
@@ -280,7 +290,7 @@ export default function voicePreview(pi: ExtensionAPI) {
         return;
       }
       const [verb, providerArg] = command.split(/\s+/);
-      if (verb !== "start") { ctx.ui.notify(`Use /talk start [${Object.keys(PROVIDERS).join("|")}]|stop|mute|unmute|check|devices|tone|mic-test`, "info"); return; }
+      if (verb !== "start") { ctx.ui.notify(`Use /talk start [${Object.keys(PROVIDERS).join("|")}]|stop|mute|unmute|captions|check|devices|tone|mic-test`, "info"); return; }
       if (conversation) { ctx.ui.notify("Voice is already running or connecting.", "info"); return; }
       let provider: ReturnType<typeof selectProvider>;
       try { provider = selectProvider(providerArg); }
