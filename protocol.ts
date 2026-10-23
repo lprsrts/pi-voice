@@ -57,3 +57,65 @@ export function dominantFrequency(samples: number[], rate: number, low = 80, hig
   }
   return low * Math.exp(ratio * (best + offset));
 }
+
+/**
+ * Live captions for the agent's speech, one phrase at a time. Transcript text
+ * usually arrives ahead of its audio, so each delta is stamped with the amount
+ * of audio queued when it arrived and shown once playback reaches that point.
+ */
+export class Captions {
+  private queuedMs = 0;
+  private playedMs = 0;
+  private pending: { at: number; text: string; turn?: boolean }[] = [];
+  private spoken = "";
+  private shown = "";
+
+  private readonly onLine: (line: string) => void;
+
+  constructor(onLine: (line: string) => void) { this.onLine = onLine; }
+
+  /** Transcript text for audio that is about to be (or already was) queued. */
+  text(delta: string) {
+    // Eleven v3 voices put delivery tags such as "[Tone]" into the transcript.
+    const clean = delta.replace(/\[[^\]]*\]\s*/g, "");
+    if (clean) { this.pending.push({ at: this.queuedMs, text: clean }); this.flush(); }
+  }
+
+  queued(bytes: number, rate: number) { this.queuedMs += bytes / 2 / rate * 1000; }
+
+  played(ms: number) { this.playedMs += ms; this.flush(); }
+
+  /** Queued audio was dropped (barge-in): unplayed text never gets said. */
+  interrupt() {
+    this.pending = [];
+    this.queuedMs = this.playedMs;
+  }
+
+  /** A new turn starts with the audio queued from now on: its first phrase replaces the line. */
+  turn() { this.pending.push({ at: this.queuedMs, text: "", turn: true }); }
+
+  private flush() {
+    let changed = false;
+    while (this.pending.length && this.pending[0].at <= this.playedMs) {
+      const next = this.pending.shift()!;
+      this.spoken = next.turn ? "" : this.spoken + next.text;
+      changed = true;
+    }
+    if (changed) this.emit();
+  }
+
+  private emit() {
+    const line = currentPhrase(this.spoken);
+    if (line !== this.shown) { this.shown = line; this.onLine(line); }
+  }
+}
+
+/** The phrase being spoken: text after the last finished sentence, or that sentence if nothing follows it yet. */
+export function currentPhrase(text: string): string {
+  const sentences = text.match(/[^.!?…]*[.!?…]+["”’)]*\s*|[^.!?…]+$/g) ?? [];
+  for (let i = sentences.length - 1; i >= 0; i--) {
+    const phrase = sentences[i].replace(/\s+/g, " ").trim();
+    if (phrase) return phrase;
+  }
+  return "";
+}

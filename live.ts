@@ -1,7 +1,7 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
 import { PI_TOOLS } from "./pi-bridge.ts";
-import { waveform, type VoiceState } from "./protocol.ts";
+import { Captions, waveform, type VoiceState } from "./protocol.ts";
 
 // OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with Responses
 // delegation: the voice model hands work to an OpenAI backend model, which
@@ -57,6 +57,8 @@ type Hooks = {
   tool: (name: string, args: Record<string, unknown>) => object;
   /** Whether Pi is working, for the resting waveform state. */
   busy: () => boolean;
+  /** The phrase the agent is saying now, in step with playback. */
+  caption?: (line: string) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -84,9 +86,13 @@ export class LiveVoice {
   private playing = false;
   private lastAudible = 0;
 
+  private captions: Captions;
+  private userTurn = true; // the next output transcript starts a new caption line
+
   constructor(hooks: Hooks, audioFactory: AudioFactory) {
     this.hooks = hooks;
     this.audioFactory = audioFactory;
+    this.captions = new Captions(line => this.hooks.caption?.(line));
   }
 
   /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
@@ -164,6 +170,7 @@ export class LiveVoice {
       },
       output: (frame, queued) => {
         if (this.stopped) return;
+        if (queued) this.captions.played(20);
         if (queued && audibleFrame(frame)) {
           this.lastAudible = Date.now();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
@@ -194,13 +201,18 @@ export class LiveVoice {
         break;
       case "session.output_audio.delta": {
         const pcm = Buffer.from(event.delta, "base64");
-        if (pcm.length) this.audio?.enqueue(pcm);
+        if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm.length, RATE); }
         break;
       }
+      case "session.output_transcript.delta":
+        if (this.userTurn) { this.userTurn = false; this.captions.turn(); }
+        this.captions.text(String(event.delta ?? ""));
+        break;
       case "session.input_transcript.delta":
         // GPT-Live decides when to yield; while the user talks over playback, drop the
         // locally queued audio so the model's own stop is not delayed by our buffer.
-        if (this.playing) { this.audio?.interrupt(); this.playing = false; this.hooks.samples("output", []); }
+        if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); }
+        this.userTurn = true;
         this.hooks.state("listening");
         break;
       case "session.delegation.created":

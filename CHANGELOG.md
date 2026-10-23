@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Live captions: the agent's current phrase is shown centered below the bar, in step with playback (both providers; ElevenLabs delivery tags such as `[Tone]` are removed).
+
 ## 0.1.2 (2026-10-23)
 
 - Docs only: README leads with a cover image, quick start, and costs; gallery preview image; CHANGELOG, CONTRIBUTING, and issue templates.

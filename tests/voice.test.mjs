@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency } from '../protocol.ts';
+import { PcmFramer, waveform, dominantFrequency, Captions, currentPhrase } from '../protocol.ts';
 import { RealtimeVoice, sessionConfig } from '../realtime.ts';
 import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
@@ -163,11 +163,11 @@ class FakeSocket extends EventTarget {
 
 async function startVoice({ tool = () => ({ ok: true }), busy = () => false } = {}) {
   const audio = { enqueued: [], finishes: 0, interrupts: 0, muted: [], stopped: 0 };
-  const errors = [], states = [];
+  const errors = [], states = [], captions = [];
   let mint, audioHooks;
   globalThis.WebSocket = FakeSocket;
   globalThis.fetch = async (url, init) => { mint = { url, init }; return { ok: true, json: async () => ({ value: 'ek_test_secret' }) }; };
-  const voice = new RealtimeVoice({ state: s => states.push(s), samples() {}, error: e => errors.push(e), closed() {}, tool, busy }, hooks => {
+  const voice = new RealtimeVoice({ state: s => states.push(s), samples() {}, error: e => errors.push(e), caption: l => captions.push(l), closed() {}, tool, busy }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish: () => audio.finishes++,
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -177,7 +177,7 @@ async function startVoice({ tool = () => ({ ok: true }), busy = () => false } = 
   const socket = FakeSocket.last;
   socket.event({ type: 'session.created', session: {} });
   await started;
-  return { voice, socket, audio, errors, states, mint, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
+  return { voice, socket, audio, errors, states, mint, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
 }
 
 test('ElevenLabs session config comes from providers/elevenlabs/ with the Pi tools', () => {
@@ -314,10 +314,10 @@ test('start surfaces key-resolution failures and cleans up exactly once', async 
 
 async function startLive({ tool = () => ({ ok: true }) } = {}) {
   const audio = { enqueued: [], interrupts: 0, muted: [], stopped: 0 };
-  const errors = [];
+  const errors = [], captions = [];
   let audioHooks;
   globalThis.WebSocket = FakeSocket;
-  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), closed() {}, tool, busy: () => false }, hooks => {
+  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l), closed() {}, tool, busy: () => false }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish() {},
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -328,8 +328,61 @@ async function startLive({ tool = () => ({ ok: true }) } = {}) {
   socket.dispatchEvent(new Event('open'));
   socket.event({ type: 'session.started', session: { id: 'sess_1' } });
   await started;
-  return { voice, socket, audio, errors, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
+  return { voice, socket, audio, errors, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
 }
+
+test('GPT-Live captions follow playback and restart after the user speaks', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const { voice, socket, captions, output } = await startLive();
+    const frame = Buffer.alloc(960); // 20 ms at 24 kHz
+    socket.event({ type: 'session.output_transcript.delta', delta: 'All tests pass. ' });
+    socket.event({ type: 'session.output_audio.delta', delta: Buffer.alloc(960 * 10).toString('base64') });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Nothing else changed.' });
+    assert.deepEqual(captions, ['All tests pass.']);
+    for (let i = 0; i < 9; i++) output(frame, true);
+    assert.deepEqual(captions, ['All tests pass.']); // second phrase waits for its audio
+    output(frame, true);
+    assert.deepEqual(captions, ['All tests pass.', 'Nothing else changed.']);
+    socket.event({ type: 'session.input_transcript.delta', delta: 'and' });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Stopping.' });
+    assert.deepEqual(captions.at(-1), 'Stopping.');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('ElevenLabs captions drop tags, follow playback, and skip barged-in text', async () => {
+  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
+  try {
+    const { voice, socket, captions, output } = await startVoice();
+    const frame = Buffer.alloc(960);
+    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: '[Tone] Twenty tests pass.' });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: Buffer.alloc(960 * 5).toString('base64') });
+    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: ' Two fail.' });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: Buffer.alloc(960 * 5).toString('base64') });
+    assert.deepEqual(captions, ['Twenty tests pass.']);
+    output(frame, true); output(frame, true);
+    socket.event({ type: 'input_audio_buffer.speech_started' }); // barge-in before "Two fail." plays
+    for (let i = 0; i < 10; i++) output(frame, true);
+    assert.deepEqual(captions, ['Twenty tests pass.']);
+    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i2', response_id: 'r2', delta: 'Stopped.' });
+    assert.deepEqual(captions.at(-1), 'Stopped.');
+    voice.stop();
+  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
+});
+
+test('caption phrases: the sentence in progress, else the last finished one', () => {
+  assert.equal(currentPhrase('Twenty tests pass. Two fa'), 'Two fa');
+  assert.equal(currentPhrase('Twenty tests pass. '), 'Twenty tests pass.');
+  assert.equal(currentPhrase('Done! Really? "Yes." '), '"Yes."');
+  assert.equal(currentPhrase(''), '');
+  const lines = [];
+  const c = new Captions(l => lines.push(l));
+  c.text('Ready.');
+  c.turn();
+  c.text('Next.'); // a new turn with no audio queued yet replaces the line at once
+  assert.deepEqual(lines, ['Ready.', 'Next.']);
+});
 
 test('GPT-Live config comes from providers/openai-live/ with Responses delegation to the Pi tools', () => {
   const config = liveSessionConfig();

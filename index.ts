@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { mixColors } from "@earendil-works/pi-tui";
+import { mixColors, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
@@ -11,6 +11,9 @@ import { PROVIDERS, selectProvider, type VoiceSession } from "./providers.ts";
 import { dominantFrequency } from "./protocol.ts";
 
 const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
+// The caption keeps the last phrase on screen this long after the agent stops talking.
+const CAPTION_HOLD_MS = 2500;
+const PREVIEW_CAPTIONS = ["Twenty-two pass, none fail.", "The build is green.", "Pi is still on the migration.", "Done. Three files changed."];
 type State = (typeof states)[number];
 
 // Listening and speaking draw the same Gaussian beam as thinking. Loudness sets
@@ -48,6 +51,18 @@ function measureBeam(beam: Beam, samples: number[], fresh: boolean, dt: number) 
   if (hz) beam.targetLogHz = Math.log(hz);
 }
 
+/** One line, centered; long phrases keep their end (the words being spoken) behind an ellipsis. */
+function centered(text: string, width: number, style: (text: string) => string): string {
+  if (!text || width < 4) return "";
+  let line = text;
+  if (visibleWidth(line) > width) {
+    const words = line.split(" ");
+    while (words.length > 1 && visibleWidth("… " + words.join(" ")) > width) words.shift();
+    line = truncateToWidth("… " + words.join(" "), width, "");
+  }
+  return " ".repeat(Math.floor((width - visibleWidth(line)) / 2)) + style(line);
+}
+
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
 export default function voicePreview(pi: ExtensionAPI) {
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -59,6 +74,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   let liveState: State = "idle";
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
+  let caption = "", captionAt = 0;
   let muted = false;
 
   function stop() {
@@ -83,6 +99,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       const started = Date.now();
       ctx.ui.setWidget("voice-preview", (tui, theme) => {
         let lastFrame = Date.now();
+        let lastSpoke = 0;
         let weights = states.map(state => state === "idle" ? 1 : 0);
         const input = newBeam(200), output = newBeam(200);
         timer = setInterval(() => tui.requestRender(), 33);
@@ -153,8 +170,14 @@ export default function voicePreview(pi: ExtensionAPI) {
               }
               previousY = y;
             }
-            // Foreground only: no background fill or textual state labels.
-            return dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
+            // Foreground only: no background fill or textual state labels. Below the
+            // bar, the agent's current phrase, centered; the row stays to avoid layout jumps.
+            const bar = dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
+            if (state === "speaking") lastSpoke = now;
+            const line = choice === "live"
+              ? (now - Math.max(captionAt, lastSpoke) < CAPTION_HOLD_MS ? caption : "")
+              : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 2.2) % PREVIEW_CAPTIONS.length] : "";
+            return [...bar, centered(line, columns, text => theme.style(text, { fg: theme.colors.muted }))];
           },
           dispose() {
             if (timer) clearInterval(timer);
@@ -187,7 +210,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       if (command === "stop") {
         conversation?.stop(); conversation = undefined;
         bridge?.detach(); bridge = undefined;
-        liveState = "idle"; inputSamples = []; outputSamples = [];
+        liveState = "idle"; inputSamples = []; outputSamples = []; caption = "";
         stop(); return;
       }
       if (command === "check") {
@@ -264,7 +287,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Unknown provider.", "error"); return; }
       const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). The voice model hands real work to Pi in this session; Pi's own permission prompts still apply here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (PI_VOICE_AEC=0): use headphones, or the agent may hear itself and loop."} The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
       if (!consent || conversation) return;
-      muted = false; liveState = "thinking"; inputSamples = []; outputSamples = [];
+      muted = false; liveState = "thinking"; inputSamples = []; outputSamples = []; caption = "";
       show(ctx, "live");
       let helper: string | undefined;
       const currentBridge = new PiBridge(pi, ctx, text => current.notify(text), undefined, text => current.context?.(text));
@@ -275,10 +298,11 @@ export default function voicePreview(pi: ExtensionAPI) {
           else { outputSamples = samples; outputTime = Date.now(); }
         },
         error: message => ctx.ui.notify(message, "error"),
+        caption: line => { caption = line; captionAt = Date.now(); },
         closed: () => {
           currentBridge.detach();
           if (conversation === current) { conversation = undefined; bridge = undefined; }
-          liveState = "idle"; inputSamples = []; outputSamples = [];
+          liveState = "idle"; inputSamples = []; outputSamples = []; caption = "";
         },
         tool: (name, args) => currentBridge.call(name, args),
         busy: () => !ctx.isIdle(),

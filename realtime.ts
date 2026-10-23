@@ -1,7 +1,7 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
 import { PI_TOOLS } from "./pi-bridge.ts";
-import { waveform, type VoiceState } from "./protocol.ts";
+import { Captions, waveform, type VoiceState } from "./protocol.ts";
 
 // Eleven Realtime over its OpenAI-compatible WebSocket protocol. Instructions,
 // voice, and tools come from providers/elevenlabs/ (or the user override directory)
@@ -47,6 +47,8 @@ type Hooks = {
   tool: (name: string, args: Record<string, unknown>) => object;
   /** Whether Pi is working, for the resting waveform state. */
   busy: () => boolean;
+  /** The phrase the agent is saying now, in step with playback. */
+  caption?: (line: string) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -78,9 +80,13 @@ export class RealtimeVoice {
   private cancelAutoUntil = 0;    // cancel a server-created response arriving before this time
   private dropped = new Set<string>(); // responses whose audio is discarded
 
+  private captions: Captions;
+  private captionItem?: string;
+
   constructor(hooks: Hooks, audioFactory: AudioFactory) {
     this.hooks = hooks;
     this.audioFactory = audioFactory;
+    this.captions = new Captions(line => this.hooks.caption?.(line));
   }
 
   /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
@@ -183,6 +189,7 @@ export class RealtimeVoice {
         if (this.stopped) return;
         if (audible) {
           this.playedMs += 20;
+          this.captions.played(20);
           this.lastAudible = Date.now();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
           this.hooks.samples("output", waveform(frame));
@@ -239,9 +246,14 @@ export class RealtimeVoice {
         this.spokeThisTurn = true;
         if (event.item_id !== this.playingItem) { this.playingItem = event.item_id; this.playedMs = 0; }
         const pcm = Buffer.from(event.delta, "base64");
-        if (pcm.length) this.audio?.enqueue(pcm);
+        if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm.length, RATE); }
         break;
       }
+      case "response.output_audio_transcript.delta":
+        if (this.interrupted.has(event.item_id) || this.dropped.has(event.response_id)) break;
+        if (event.item_id !== this.captionItem) { this.captionItem = event.item_id; this.captions.turn(); }
+        this.captions.text(String(event.delta ?? ""));
+        break;
       case "response.output_audio.done":
         this.audio?.finish();
         break;
@@ -272,6 +284,7 @@ export class RealtimeVoice {
   /** User barge-in: drop queued audio and tell the server how much was actually heard. */
   private interrupt() {
     this.audio?.interrupt();
+    this.captions.interrupt();
     if (this.playingItem) {
       this.interrupted.add(this.playingItem);
       this.send({ type: "conversation.item.truncate", item_id: this.playingItem, content_index: 0, audio_end_ms: this.playedMs });
