@@ -208,14 +208,15 @@ test('start mints a scoped client secret and authenticates the socket with it, n
 test('audio flows both ways; barge-in drops queued audio, truncates, and ignores late deltas', async () => {
   const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
   try {
-    const { voice, socket, audio, input, output } = await startVoice();
+    const { voice, socket, audio, input, output, played } = await startVoice();
     const frame = Buffer.alloc(960, 3);
     input(frame);
     assert.deepEqual(socket.sent.at(-1), { type: 'input_audio_buffer.append', audio: frame.toString('base64') });
     socket.event({ type: 'response.created', response: { id: 'r1' } });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', delta: Buffer.alloc(960).toString('base64') });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', delta: Buffer.alloc(960 * 3).toString('base64') });
     assert.equal(audio.enqueued.length, 1);
-    output(Buffer.alloc(960), true); output(Buffer.alloc(960), true); // 40 ms actually played
+    for (let i = 0; i < 3; i++) output(Buffer.alloc(960), true); // 60 ms written to the helper,
+    played(Buffer.alloc(960)); played(Buffer.alloc(960));          // of which the speaker played 40 ms
     socket.event({ type: 'input_audio_buffer.speech_started' });
     assert.equal(audio.interrupts, 1);
     assert.deepEqual(socket.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'i1', content_index: 0, audio_end_ms: 40 });
@@ -227,6 +228,24 @@ test('audio flows both ways; barge-in drops queued audio, truncates, and ignores
     assert.equal(socket.sent.length, n, 'muted mic sends nothing');
     voice.stop(); voice.stop();
     assert.equal(audio.stopped, 1);
+  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
+});
+
+test("truncation counts only the interrupted item's own heard audio, not the previous item's tail", async () => {
+  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
+  try {
+    const { voice, socket, played } = await startVoice();
+    socket.event({ type: 'response.output_audio.delta', item_id: 'a', response_id: 'r1', delta: Buffer.alloc(960 * 2).toString('base64') });
+    socket.event({ type: 'response.output_audio.delta', item_id: 'b', response_id: 'r2', delta: Buffer.alloc(960 * 4).toString('base64') });
+    for (let i = 0; i < 3; i++) played(Buffer.alloc(960)); // a's 40 ms, then 20 ms of b
+    socket.event({ type: 'input_audio_buffer.speech_started' });
+    assert.deepEqual(socket.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'b', content_index: 0, audio_end_ms: 20 });
+    // After the flush the count restarts: the next item's heard audio is measured from zero.
+    socket.event({ type: 'response.output_audio.delta', item_id: 'c', response_id: 'r3', delta: Buffer.alloc(960 * 2).toString('base64') });
+    played(Buffer.alloc(960));
+    socket.event({ type: 'input_audio_buffer.speech_started' });
+    assert.deepEqual(socket.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'c', content_index: 0, audio_end_ms: 20 });
+    voice.stop();
   } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
 });
 

@@ -72,7 +72,12 @@ export class RealtimeVoice {
   // Playback bookkeeping for interruption truncation.
   private playingItem?: string;
   private interrupted = new Set<string>(); // late audio deltas of barged-in items are dropped
-  private playedMs = 0;
+  // Truncation clock, in bytes since the last flush: real audio queued, the part of it
+  // the device reported playing, and where the playing item's audio began. Heard
+  // audio settles in write order, so the item's heard length is the difference.
+  private queuedBytes = 0;
+  private heardBytes = 0;
+  private itemStartBytes = 0;
   private playing = false;
   private lastAudible = 0;
   private handledCalls = new Set<string>();
@@ -188,7 +193,6 @@ export class RealtimeVoice {
       output: (frame, audible) => {
         if (this.stopped) return;
         if (audible) {
-          this.playedMs += 20; // truncation clock: counts what was sent, not what was heard
           this.lastAudible = Date.now();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
           this.hooks.samples("output", waveform(frame));
@@ -199,7 +203,11 @@ export class RealtimeVoice {
         }
       },
       // Captions advance on the device clock: the helper reports each frame as the speaker plays it.
-      played: frame => { if (!this.stopped) this.captions.played(frame, RATE); },
+      played: frame => {
+        if (this.stopped) return;
+        this.heardBytes += frame.length;
+        this.captions.played(frame, RATE);
+      },
       error: message => this.fail(message),
     });
     this.audio.start(RATE, RATE);
@@ -245,9 +253,9 @@ export class RealtimeVoice {
       case "response.output_audio.delta": {
         if (this.interrupted.has(event.item_id) || this.dropped.has(event.response_id)) break;
         this.spokeThisTurn = true;
-        if (event.item_id !== this.playingItem) { this.playingItem = event.item_id; this.playedMs = 0; }
+        if (event.item_id !== this.playingItem) { this.playingItem = event.item_id; this.itemStartBytes = this.queuedBytes; }
         const pcm = Buffer.from(event.delta, "base64");
-        if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm, RATE); }
+        if (pcm.length) { this.audio?.enqueue(pcm); this.queuedBytes += pcm.length; this.captions.queued(pcm, RATE); }
         break;
       }
       case "response.output_audio_transcript.delta":
@@ -284,14 +292,16 @@ export class RealtimeVoice {
     }
   }
 
-  /** User barge-in: drop queued audio and tell the server how much was actually heard. */
+  /** User barge-in: drop queued audio and tell the server how much the speaker actually played. */
   private interrupt() {
     this.audio?.interrupt();
     this.captions.interrupt();
     if (this.playingItem) {
       this.interrupted.add(this.playingItem);
-      this.send({ type: "conversation.item.truncate", item_id: this.playingItem, content_index: 0, audio_end_ms: this.playedMs });
+      const heard = Math.max(0, this.heardBytes - this.itemStartBytes);
+      this.send({ type: "conversation.item.truncate", item_id: this.playingItem, content_index: 0, audio_end_ms: Math.round(heard / 2 / RATE * 1000) });
     }
+    this.queuedBytes = this.heardBytes = this.itemStartBytes = 0; // the helper's flush restarts its count too
     this.playingItem = undefined;
     this.playing = false;
     this.hooks.samples("output", []);
