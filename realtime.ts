@@ -188,8 +188,7 @@ export class RealtimeVoice {
       output: (frame, audible) => {
         if (this.stopped) return;
         if (audible) {
-          this.playedMs += 20;
-          this.captions.played(frame, RATE);
+          this.playedMs += 20; // truncation clock: counts what was sent, not what was heard
           this.lastAudible = Date.now();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
           this.hooks.samples("output", waveform(frame));
@@ -199,6 +198,8 @@ export class RealtimeVoice {
           this.rest();
         }
       },
+      // Captions advance on the device clock: the helper reports each frame as the speaker plays it.
+      played: frame => { if (!this.stopped) this.captions.played(frame, RATE); },
       error: message => this.fail(message),
     });
     this.audio.start(RATE, RATE);
@@ -256,6 +257,8 @@ export class RealtimeVoice {
         break;
       case "response.output_audio.done":
         this.audio?.finish();
+        // The item's audio is fully queued: its caption span is now known exactly.
+        if (event.item_id === this.captionItem && !this.interrupted.has(event.item_id) && !this.dropped.has(event.response_id)) this.captions.done();
         break;
       case "response.done":
         this.responding = false;

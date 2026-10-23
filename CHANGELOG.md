@@ -3,6 +3,8 @@
 ## Unreleased
 
 - Live captions: the agent's current phrase is shown centered below the bar, split at commas, semicolons, colons, dashes, and sentence ends ("…" marks where a sentence continues), and paced by voiced audio so breaths keep the current phrase up (both providers; ElevenLabs delivery tags such as `[Tone]` are removed).
+- Captions are paced by the speaker, not the write queue: the audio helper reports its playout position over fd 4, so helper buffering, event-loop stalls, and device latency no longer make captions run ahead of the audio — when the device stalls, the caption holds with the sound instead of racing on (both providers).
+- A transcript burst ahead of its audio no longer collapses onto its last delta, and a streaming response no longer races its caption to the end: deltas sharing an audio stamp pace together, spans close on the next stamp or the item's audio-done and then pace exactly, and a still-open span advances by the session's calibrated speaking rate — the audio queued so far tracks delivery pace, not sentence length. GPT-Live fragments pace by their server-provided `start_ms`/`end_ms` ranges against played output audio, as the API documents. Within a turn the cursor never moves backward.
 - `/talk captions [on|off]` toggles the caption line; captions are off by default, and `PI_VOICE_CAPTIONS=1` starts with them on.
 
 ## 0.1.2 (2026-10-23)

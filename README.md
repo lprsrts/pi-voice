@@ -47,7 +47,7 @@ ElevenLabs sessions end after 60 minutes. `/talk mute` keeps the session open (a
 | `/talk start [elevenlabs\|openai-live]` | Start a voice session (default: ElevenLabs). |
 | `/talk stop` | End the session. A Pi task it started keeps running. |
 | `/talk mute` / `/talk unmute` | Stop or resume the microphone. |
-| `/talk captions [on\|off]` | Show what the agent is saying, phrase by phrase, under the bar. Off by default; no argument toggles. |
+| `/talk captions [on\|off]` | Show what the agent is saying, phrase by phrase, timed to the audio the speaker actually plays. Off by default; no argument toggles. |
 | `/talk check` | Show setup status: audio helper, devices, API keys, settings. No network or microphone use. |
 | `/talk devices` | Show the input and output in use (the macOS defaults). |
 | `/talk tone [hz]` | Play a test tone. |

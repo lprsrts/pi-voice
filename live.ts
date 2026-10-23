@@ -170,7 +170,6 @@ export class LiveVoice {
       },
       output: (frame, queued) => {
         if (this.stopped) return;
-        if (queued) this.captions.played(frame, RATE);
         if (queued && audibleFrame(frame)) {
           this.lastAudible = Date.now();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
@@ -181,6 +180,8 @@ export class LiveVoice {
           this.rest();
         }
       },
+      // Captions advance on the device clock: the helper reports each frame as the speaker plays it.
+      played: frame => { if (!this.stopped) this.captions.played(frame, RATE); },
       error: message => this.fail(message),
     });
     this.audio.start(RATE, RATE);
@@ -204,10 +205,14 @@ export class LiveVoice {
         if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm, RATE); }
         break;
       }
-      case "session.output_transcript.delta":
-        if (this.userTurn) { this.userTurn = false; this.captions.turn(); }
-        this.captions.text(String(event.delta ?? ""));
+      case "session.output_transcript.delta": {
+        // GPT-Live times every fragment on its session clock (start_ms/end_ms);
+        // per the API docs these ranges replace packet arrival times for pacing.
+        const timed = typeof event.start_ms === "number" && typeof event.end_ms === "number";
+        if (this.userTurn) { this.userTurn = false; this.captions.turn(timed ? event.start_ms : undefined); }
+        this.captions.text(String(event.delta ?? ""), timed ? event.start_ms : undefined, timed ? event.end_ms : undefined);
         break;
+      }
       case "session.input_transcript.delta":
         // GPT-Live decides when to yield; while the user talks over playback, drop the
         // locally queued audio so the model's own stop is not delayed by our buffer.

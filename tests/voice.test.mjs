@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency, phraseAt, formatCaption, voicedMs } from '../protocol.ts';
+import { PcmFramer, waveform, dominantFrequency, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
 import { RealtimeVoice, sessionConfig } from '../realtime.ts';
 import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
@@ -177,7 +177,7 @@ async function startVoice({ tool = () => ({ ok: true }), busy = () => false } = 
   const socket = FakeSocket.last;
   socket.event({ type: 'session.created', session: {} });
   await started;
-  return { voice, socket, audio, errors, states, mint, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
+  return { voice, socket, audio, errors, states, mint, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a), played: f => audioHooks.played(f) };
 }
 
 test('ElevenLabs session config comes from providers/elevenlabs/ with the Pi tools', () => {
@@ -328,32 +328,36 @@ async function startLive({ tool = () => ({ ok: true }) } = {}) {
   socket.dispatchEvent(new Event('open'));
   socket.event({ type: 'session.started', session: { id: 'sess_1' } });
   await started;
-  return { voice, socket, audio, errors, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a) };
+  return { voice, socket, audio, errors, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a), played: f => audioHooks.played(f) };
 }
 
 // Voiced PCM16 (a square wave well above the voice threshold), `frames` x 20 ms at 24 kHz.
 const voiced = frames => { const b = Buffer.alloc(960 * frames); for (let i = 0; i < b.length; i += 2) b.writeInt16LE(i % 96 < 48 ? 4000 : -4000, i); return b; };
 
-test('GPT-Live captions follow voiced playback and restart after the user speaks', async () => {
+test('GPT-Live captions follow the session clock and restart after the user speaks', async () => {
   const originalWS = globalThis.WebSocket;
   try {
-    const { voice, socket, captions, output } = await startLive();
-    socket.event({ type: 'session.output_transcript.delta', delta: 'All tests pass, ' });
+    const { voice, socket, captions, output, played } = await startLive();
+    // Fragments arrive with their start_ms/end_ms range on the session timeline.
+    socket.event({ type: 'session.output_transcript.delta', delta: 'All tests pass, ', start_ms: 0, end_ms: 200 });
     socket.event({ type: 'session.output_audio.delta', delta: voiced(10).toString('base64') });
     socket.event({ type: 'session.output_audio.delta', delta: Buffer.alloc(960 * 10).toString('base64') }); // a breath
-    socket.event({ type: 'session.output_transcript.delta', delta: 'nothing else changed.' });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'nothing else changed.', start_ms: 400, end_ms: 600 });
     socket.event({ type: 'session.output_audio.delta', delta: voiced(10).toString('base64') });
-    output(voiced(1), true);
+    // Each frame is written to the speaker (output: waveform state), then the device reports it played (played: captions).
+    const frame = (pcm = voiced(1)) => { output(pcm, true); played(pcm); };
+    frame();
     assert.deepEqual(captions.at(-1), 'All tests pass,');
-    for (let i = 0; i < 9; i++) output(voiced(1), true);
-    for (let i = 0; i < 10; i++) output(Buffer.alloc(960), true); // the breath does not advance the caption
+    for (let i = 0; i < 9; i++) frame();
+    assert.deepEqual(captions.at(-1), 'All tests pass,', 'the fragment completes as its range is played');
+    for (let i = 0; i < 10; i++) frame(Buffer.alloc(960)); // the breath: the next range has not started
     assert.deepEqual(captions.at(-1), 'All tests pass,');
-    output(voiced(1), true);
+    frame();
     assert.deepEqual(captions.at(-1), 'nothing else changed.');
-    socket.event({ type: 'session.input_transcript.delta', delta: 'and' });
-    socket.event({ type: 'session.output_transcript.delta', delta: 'Stopping.' });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'and', start_ms: 420, end_ms: 440 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Stopping.', start_ms: 500, end_ms: 600 });
     socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
-    output(voiced(1), true);
+    for (let i = 0; i < 5; i++) frame();
     assert.deepEqual(captions.at(-1), 'Stopping.');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
@@ -362,22 +366,25 @@ test('GPT-Live captions follow voiced playback and restart after the user speaks
 test('ElevenLabs captions drop tags, split a sentence chunk into phrases, and skip barged-in text', async () => {
   const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
   try {
-    const { voice, socket, captions, output } = await startVoice();
+    const { voice, socket, captions, played } = await startVoice();
     // Eleven sends a whole sentence ahead of its audio; its phrases are spread over that audio.
     socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: '[Tone] Twenty pass, two fail.' });
     socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: voiced(20).toString('base64') });
-    output(voiced(1), true);
+    socket.event({ type: 'response.output_audio.done', item_id: 'i1', response_id: 'r1' }); // the span is now known
+    played(voiced(1)); // the device reports finishing a frame; write time alone would not move the caption
     assert.deepEqual(captions.at(-1), 'Twenty pass,');
-    for (let i = 0; i < 12; i++) output(voiced(1), true);
+    for (let i = 0; i < 12; i++) played(voiced(1));
     assert.deepEqual(captions.at(-1), 'two fail.');
     socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: ' Never said.' });
     socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: voiced(10).toString('base64') });
+    socket.event({ type: 'response.output_audio.done', item_id: 'i1', response_id: 'r1' });
     socket.event({ type: 'input_audio_buffer.speech_started' }); // barge-in before "Never said." plays
-    for (let i = 0; i < 10; i++) output(voiced(1), true);
+    for (let i = 0; i < 10; i++) played(voiced(1));
     assert.ok(!captions.includes('Never said.'));
     socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i2', response_id: 'r2', delta: 'Stopped.' });
     socket.event({ type: 'response.output_audio.delta', item_id: 'i2', response_id: 'r2', delta: voiced(5).toString('base64') });
-    output(voiced(1), true);
+    socket.event({ type: 'response.output_audio.done', item_id: 'i2', response_id: 'r2' });
+    played(voiced(1));
     assert.deepEqual(captions.at(-1), 'Stopped.');
     voice.stop();
   } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
@@ -420,6 +427,73 @@ test('voiced time ignores silence and breaths', () => {
   assert.equal(voicedMs(voiced(5), 24000), 100);
   assert.equal(voicedMs(Buffer.alloc(960 * 5), 24000), 0);
   assert.equal(voicedMs(Buffer.concat([voiced(2), Buffer.alloc(960 * 3)]), 24000), 40);
+});
+
+test('a transcript burst ahead of its audio paces every sentence in order', () => {
+  const shown = [];
+  const captions = new Captions(line => shown.push(line.phrase));
+  // The whole paragraph arrives as several deltas before any audio: every stamp ties,
+  // and the old pacing jumped straight into the last delta's text.
+  captions.text('Twenty pass, ');
+  captions.text('two fail; ');
+  captions.text('one is flaky.');
+  captions.queued(voiced(20), 24000); // 400 ms of the paragraph's audio, all at once
+  captions.done();                     // the item's audio is fully queued: the span is known
+  const hear = frames => { for (let i = 0; i < frames; i++) captions.played(voiced(1), 24000); };
+  hear(1);
+  assert.equal(shown.at(-1), 'Twenty pass,');
+  hear(9); // 200 ms heard: halfway through the queued span
+  assert.equal(shown.at(-1), 'two fail;');
+  hear(8); // 360 ms heard
+  assert.equal(shown.at(-1), 'one is flaky.');
+  assert.ok(!shown.slice(0, 2).includes('one is flaky.'), 'the last sentence never jumps the queue');
+});
+
+test('a streaming response keeps the caption with the voice, not the delivery', () => {
+  const shown = [];
+  const captions = new Captions(line => shown.push(line.phrase));
+  // The whole sentence arrives ahead of its audio, and the audio streams in about
+  // as fast as it plays: how much is queued says nothing about the sentence's length.
+  captions.text('Twenty pass, ');
+  captions.text('two fail; ');
+  captions.text('one is flaky.');
+  const step = () => { captions.queued(voiced(10), 24000); for (let i = 0; i < 10; i++) captions.played(voiced(1), 24000); };
+  step();
+  assert.equal(shown.at(-1), 'Twenty pass,');
+  for (let i = 0; i < 4; i++) step(); // 1000 ms heard
+  assert.equal(shown.at(-1), 'two fail;');
+  for (let i = 0; i < 4; i++) step(); // 1800 ms heard
+  assert.equal(shown.at(-1), 'one is flaky.');
+  assert.ok(!shown.slice(0, 5).includes('one is flaky.'), 'the last sentence never jumps ahead of the voice');
+});
+
+test('closing a span never pulls the caption back', () => {
+  const shown = [];
+  const captions = new Captions(line => shown.push(line.phrase));
+  captions.text('Twenty pass, two fail.');           // 22 chars
+  captions.queued(voiced(154), 24000);               // 3080 ms: a slow voice, longer than the prior rate expects
+  for (let i = 0; i < 50; i++) captions.played(voiced(1), 24000); // 1000 ms heard
+  assert.equal(shown.at(-1), 'two fail.');           // the prior rate places the cursor ~14 chars in
+  captions.done();                                    // the real span turns out much longer
+  assert.equal(shown.at(-1), 'two fail.', 'the caption never snaps back');
+});
+
+test('GPT-Live fragments pace by their server ranges against played output audio', () => {
+  const shown = [];
+  const captions = new Captions(line => shown.push(line.phrase));
+  // Every played frame advances the session clock, silence or not.
+  captions.text('All tests pass, ', 0, 200);
+  captions.text('nothing else changed.', 400, 600);
+  captions.played(Buffer.concat([voiced(10), Buffer.alloc(960 * 10)]), 24000); // 400 ms played, breath included
+  assert.equal(shown.at(-1), 'All tests pass,');
+  captions.played(voiced(1), 24000); // 20 ms into the second range
+  assert.equal(shown.at(-1), 'nothing else changed.');
+  captions.turn(800);                 // the user spoke; the next turn starts at session 800
+  captions.text('Stopping.', 800, 900);
+  captions.played(Buffer.alloc(960 * 19), 24000); // the clock runs through silence to exactly 800
+  assert.equal(shown.at(-1), 'nothing else changed.', 'the next turn waits for its session position');
+  captions.played(voiced(2), 24000);   // 840 ms: inside "Stopping."
+  assert.equal(shown.at(-1), 'Stopping.');
 });
 
 test('GPT-Live config comes from providers/openai-live/ with Responses delegation to the Pi tools', () => {
@@ -611,30 +685,57 @@ test('echo cancellation defaults on and the helper binary is cached by source ha
   assert.match(helperPath('/cache'), /^\/cache\/pi-voice\/voice-io-[0-9a-f]{12}$/);
 });
 
-test('session runs one helper: args, mic from stdout, route notices, flush/mute over fd 3', async () => {
+test('session runs one helper: args, mic from stdout, route notices, flush/mute over fd 3, playout reports on fd 4', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-voice-io-'));
   const log = join(root, 'control.log');
   const helper = join(root, 'fake-voice-io');
-  // Stand-in for VoiceIO: logs args, emits one 20ms 16 kHz frame and a route switch, logs control lines.
+  // Stand-in for VoiceIO: logs args, emits one 20ms 16 kHz frame and a route switch,
+  // echoes its playout position on fd 4 (generation bumps on flush), logs control lines.
   await writeFile(helper, `#!/usr/bin/env node
 const fs = require('node:fs');
-fs.appendFileSync(${JSON.stringify(log)}, 'args ' + process.argv.slice(2).join(' ') + '\\n');
+const log = ${JSON.stringify(log)};
+fs.appendFileSync(log, 'args ' + process.argv.slice(2).join(' ') + '\\n');
 process.stderr.write('ready\\nroute {"input":"MacBook Pro Microphone","output":"AirPods"}\\n');
 process.stdout.write(Buffer.alloc(640, 1));
-fs.createReadStream(null, { fd: 3 }).on('data', d => fs.appendFileSync(${JSON.stringify(log)}, d));
-process.stdin.resume();
+let gen = 0, played = 0;
+process.stdin.on('data', d => { played += d.length; fs.writeSync(4, 'played ' + gen + ' ' + played + '\\n'); });
+fs.createReadStream(null, { fd: 3 }).on('data', d => {
+  fs.appendFileSync(log, d);
+  if (d.toString().includes('flush')) { gen += 1; played = 0; }
+});
 `);
   await chmod(helper, 0o755);
   delete process.env.PI_VOICE_AEC;
-  const inputs = [], routes = [];
-  const pipes = new AudioPipes({ input: f => inputs.push(f), output: () => {}, error: m => assert.fail(m), route: r => routes.push(r) }, helper);
+  const inputs = [], routes = [], settled = [];
+  const pipes = new AudioPipes({
+    input: f => inputs.push(f), output: () => {}, error: m => assert.fail(m), route: r => routes.push(r),
+    played: f => settled.push(f),
+  }, helper);
+  // Synchronize on what the helper reports, not on wall-clock beats: under load its
+  // startup can outlast any fixed timeout.
+  const waitFor = async (check, what, ms = 5000) => {
+    const end = Date.now() + ms;
+    while (!check()) {
+      if (Date.now() > end) assert.fail(`timed out waiting for ${what}`);
+      await new Promise(r => setTimeout(r, 20));
+    }
+  };
   try {
     pipes.start(16000, 24000);
-    await new Promise(r => setTimeout(r, 400));
+    await waitFor(() => routes.length === 1 && inputs.length === 1, 'the helper to come up');
+    await new Promise(r => setTimeout(r, 60)); // silence padding flows the whole session
+    assert.equal(settled.length, 0, 'padding keeps the device fed but never settles');
+    pipes.enqueue(Buffer.alloc(1920, 7)); // two real 20 ms frames
+    assert.equal(settled.length, 0, 'nothing settles at write time');
+    await waitFor(() => settled.length === 2, 'the device to report playing both frames');
+    assert.ok(settled.every(f => f.length === 960));
     pipes.mute(true);
-    pipes.interrupt();
+    pipes.interrupt(); // flush: audio dropped in the helper never settles
     pipes.mute(false);
-    await new Promise(r => setTimeout(r, 300));
+    assert.equal(settled.length, 2, 'the flush settles nothing');
+    pipes.enqueue(Buffer.alloc(960, 7));
+    assert.equal(settled.length, 2, 'write time still settles nothing');
+    await waitFor(() => settled.length === 3, 'the post-flush frame to settle against the new generation');
     assert.equal(inputs.length, 1);
     assert.equal(inputs[0].length, 640);
     assert.deepEqual(routes, [{ input: 'MacBook Pro Microphone', output: 'AirPods' }]);

@@ -5,6 +5,10 @@
 //     stdin  : PCM s16le mono at out-rate -> speaker
 //     stdout : PCM s16le mono at in-rate  <- mic (echo-cancelled unless --aec off)
 //     fd 3   : control lines: "flush" (drop queued playback), "mute 0|1"
+//     fd 4   : "played <gen> <bytes>" as the speaker renders sent audio; bytes
+//             count real pops since the last flush (underrun zero-fill does not
+//             count) and gen bumps on each flush, so stale in-flight reports
+//             from before a flush stay distinguishable from fresh ones
 //     stderr : "ready", "route {json}" after a default-device switch, or "error: ..."
 //   voice-io play --rate R              stdin PCM -> speaker, exits when played
 //   voice-io record --rate R --seconds S [--aec on|off]   mic PCM -> stdout
@@ -111,6 +115,13 @@ final class Fifo {
   var count: Int { lock.lock(); defer { lock.unlock() }; return data.count - head }
 }
 
+// Playout position of the audio the speaker actually rendered, so the parent can
+// time captions to what is heard rather than to what it wrote down the pipe.
+var playedGen = 0
+var playedBytes = 0
+let playedLock = NSLock()
+let playedReady = DispatchSemaphore(value: 0)
+
 func pcm16(_ rate: Double) -> AudioStreamBasicDescription {
   AudioStreamBasicDescription(
     mSampleRate: rate, mFormatID: kAudioFormatLinearPCM,
@@ -125,6 +136,18 @@ func writeAll(_ bytes: UnsafeRawPointer, _ count: Int) {
     let written = write(1, bytes + offset, count - offset)
     if written <= 0 { exit(0) } // parent closed the pipe
     offset += written
+  }
+}
+
+func writeLine(_ fd: Int32, _ line: String) {
+  var text = line
+  text.withUTF8 { buffer in
+    var offset = 0
+    while offset < buffer.count {
+      let n = write(fd, buffer.baseAddress! + offset, buffer.count - offset)
+      if n <= 0 { exit(0) } // parent closed the pipe
+      offset += n
+    }
   }
 }
 
@@ -158,7 +181,13 @@ func setRenderSource(_ fifo: Fifo) {
   var render = AURenderCallbackStruct(inputProc: { refCon, _, _, _, frames, ioData in
     let fifo = Unmanaged<Fifo>.fromOpaque(refCon).takeUnretainedValue()
     guard let buffers = UnsafeMutableAudioBufferListPointer(ioData) else { return noErr }
-    for buffer in buffers where buffer.mData != nil { fifo.pop(into: buffer.mData!, count: Int(frames) * 2) }
+    for buffer in buffers where buffer.mData != nil {
+      playedLock.lock()
+      let n = fifo.pop(into: buffer.mData!, count: Int(frames) * 2)
+      if n > 0 { playedBytes += n }
+      playedLock.unlock()
+      if n > 0 { playedReady.signal() } // the zero-filled shortfall of an underrun never counts
+    }
     return noErr
   }, inputProcRefCon: box)
   check(AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, busOutput,
@@ -320,6 +349,24 @@ Thread.detachNewThread {
 if mode == "session" {
   pumpStdin(into: playback) { stopVoiceUnit(); exit(0) }
 
+  // Playout reports on fd 4 (optional; absent when run by hand): the device's
+  // own position in the audio sent down stdin, generation-scoped per flush.
+  if fcntl(4, F_GETFD) != -1 {
+    Thread.detachNewThread {
+      var lastGen = -1, lastBytes = -1
+      while true {
+        playedReady.wait()
+        playedLock.lock()
+        let gen = playedGen, bytes = playedBytes
+        playedLock.unlock()
+        if gen == lastGen && bytes == lastBytes { continue } // coalesce extra signals
+        lastGen = gen
+        lastBytes = bytes
+        writeLine(4, "played \(gen) \(bytes)\n")
+      }
+    }
+  }
+
   // Control lines on fd 3 (optional; absent when run by hand).
   if fcntl(3, F_GETFD) != -1 {
     Thread.detachNewThread {
@@ -332,7 +379,13 @@ if mode == "session" {
         while let newline = pending.firstIndex(of: "\n") {
           let line = pending[..<newline].trimmingCharacters(in: .whitespaces)
           pending = String(pending[pending.index(after: newline)...])
-          if line == "flush" { playback.clear() }
+          if line == "flush" {
+            playedLock.lock()
+            playback.clear()
+            playedGen += 1
+            playedBytes = 0
+            playedLock.unlock()
+          }
           else if line.hasPrefix("mute ") {
             let value: UInt32 = line.hasSuffix("1") ? 1 : 0
             audioQueue.async {

@@ -143,7 +143,7 @@ export async function playTone(helper: string, freq = 440, seconds = 2, rate = 2
 
 // ---------- session audio (live conversation) ----------
 
-/** One helper process: paced stdin -> speaker, mic -> stdout, flush/mute over fd 3. */
+/** One helper process: paced stdin -> speaker, mic -> stdout, flush/mute over fd 3, playout reports on fd 4. */
 export class AudioPipes {
   private helper?: ChildProcess;
   private tick?: ReturnType<typeof setInterval>;
@@ -161,6 +161,12 @@ export class AudioPipes {
   private onOutput: (frame: Buffer, audible: boolean) => void;
   private onError: (message: string) => void;
   private onRoute?: (route: Route) => void;
+  private onPlayed?: (frame: Buffer) => void;
+  // Real frames awaiting the device's playout report: entries carry their byte
+  // offset within everything written since the last flush, and settle in order.
+  private pendingPlayed: { end: number; frame: Buffer; at: number }[] = [];
+  private writtenBytes = 0; // bytes sent to the helper since the last flush, padding included
+  private playedGen = 0;    // flush generation; playout reports carry the helper's own
 
   /** helperPath: compiled VoiceIO binary (see native.ts). */
   constructor(callbacks: {
@@ -168,11 +174,14 @@ export class AudioPipes {
     output: (frame: Buffer, audible: boolean) => void;
     error: (message: string) => void;
     route?: (route: Route) => void;
+    /** A real frame the speaker finished rendering (the device clock, not write time). */
+    played?: (frame: Buffer) => void;
   }, helperPath: string) {
     this.onInput = callbacks.input;
     this.onOutput = callbacks.output;
     this.onError = callbacks.error;
     this.onRoute = callbacks.route;
+    this.onPlayed = callbacks.played;
     this.helperPath = helperPath;
   }
 
@@ -185,6 +194,7 @@ export class AudioPipes {
     // event-loop jitter does not punch audible gaps into the stream.
     this.tick = setInterval(() => {
       const sink = this.helper?.stdin;
+      this.sweepStale();
       if (!sink || sink.destroyed) return;
       const now = Date.now();
       const elapsed = this.lastTickAt ? Math.min(250, now - this.lastTickAt) : 20;
@@ -202,6 +212,10 @@ export class AudioPipes {
         this.blockedSince = 0;
         const frame = this.queue.shift();
         const data = frame ?? Buffer.alloc(this.framer!.bytes); // keep the device fed during silence
+        if (this.onPlayed) {
+          this.writtenBytes += data.length; // silence padding advances the device position too
+          if (frame) this.pendingPlayed.push({ end: this.writtenBytes, frame, at: Date.now() });
+        }
         sink.write(data);
         this.onOutput(data, !!frame);
       }
@@ -212,7 +226,7 @@ export class AudioPipes {
   private startHelper() {
     const child = spawn(this.helperPath, [
       "session", "--in-rate", String(this.inputRate), "--out-rate", String(this.outputRate), ...aecArgs(),
-    ], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
+    ], { stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] });
     this.helper = child;
     const tail = watchStderr(child, line => {
       if (line === "ready") return true;
@@ -229,6 +243,7 @@ export class AudioPipes {
     child.on("exit", failed);
     child.stdin?.on("error", failed);
     (child.stdio[3] as NodeJS.WritableStream | null)?.on("error", failed);
+    (child.stdio[4] as NodeJS.ReadableStream | null)?.on("error", failed);
 
     const framer = new PcmFramer(this.inputRate);
     const watchdog = () => {
@@ -244,6 +259,23 @@ export class AudioPipes {
       if (this.helper !== child || this.stopped) return;
       watchdog();
       for (const frame of framer.push(chunk)) this.onInput(frame);
+    });
+
+    // Playout reports on fd 4: the device's own position in what was written, so
+    // captions can advance on the speaker's clock. Reports lag writes by whatever
+    // the helper still has buffered, which is exactly the lag captions must have.
+    const reports = child.stdio[4] as NodeJS.ReadableStream | null;
+    let reportLine = "";
+    reports?.setEncoding("utf8");
+    reports?.on("data", (chunk: string) => {
+      if (this.helper !== child || this.stopped) return;
+      reportLine += chunk;
+      let index: number;
+      while ((index = reportLine.indexOf("\n")) !== -1) {
+        const match = /^played (\d+) (\d+)$/.exec(reportLine.slice(0, index));
+        reportLine = reportLine.slice(index + 1);
+        if (match) this.settle(Number(match[1]), Number(match[2]));
+      }
     });
   }
 
@@ -276,7 +308,29 @@ export class AudioPipes {
     this.carryMs = 0;
     this.lastTickAt = 0;
     this.framer = new PcmFramer(this.outputRate);
+    // Frames flushed from the helper never play, so they never settle: renumber
+    // offsets from zero and let reports of the old generation fall on deaf ears.
+    this.pendingPlayed = [];
+    this.writtenBytes = 0;
+    this.playedGen += 1;
     this.control("flush");
+  }
+
+  /** Settles every real frame the device reported finishing, in write order. */
+  private settle(gen: number, bytes: number) {
+    if (gen !== this.playedGen) return; // a report from before our last flush
+    while (this.pendingPlayed.length && this.pendingPlayed[0].end <= bytes) {
+      const entry = this.pendingPlayed.shift()!;
+      this.onPlayed?.(entry.frame);
+    }
+  }
+
+  /** Drops frames the device can no longer confirm: audio lost without our flush, or a helper that never reports. */
+  private sweepStale() {
+    if (!this.pendingPlayed.length) return;
+    const now = Date.now();
+    // Real settles arrive within the helper's ~2.4 s of combined buffering; anything older is lost.
+    while (this.pendingPlayed.length && now - this.pendingPlayed[0].at > 4000) this.pendingPlayed.shift();
   }
 
   stop() {
@@ -287,6 +341,7 @@ export class AudioPipes {
     const helper = this.helper;
     this.helper = undefined;
     this.queue = [];
+    this.pendingPlayed = [];
     terminate(helper);
   }
 }

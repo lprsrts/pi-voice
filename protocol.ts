@@ -75,61 +75,151 @@ export function voicedMs(pcm: Buffer, rate: number): number {
 }
 
 /**
- * Live captions for the agent's speech, one phrase at a time. Transcript text
- * usually arrives ahead of its audio, so each delta is stamped with the amount
- * of audio queued when it arrived, and its characters are spread over the audio
- * that follows, up to the next delta. Time is counted in voiced audio only, so
- * pauses and breaths do not advance the caption; they fall on phrase breaks.
+ * Live captions for the agent's speech, one phrase at a time. Providers time
+ * their text in one of two ways, and both are handled:
+ *
+ * - GPT-Live stamps every transcript fragment with a range on its session clock
+ *   (start_ms/end_ms); fragments are paced against all played output audio,
+ *   which is that clock locally, so delivery order and pace do not matter.
+ *
+ * - ElevenLabs sends no timing. Each delta is stamped with the voiced audio
+ *   queued when it arrived; deltas sharing a stamp arrived in one burst and
+ *   pace together. A span closes when the next delta's stamp or the item's
+ *   audio-done fixes its length, and is then paced exactly by its share of the
+ *   played audio; while it is open, the audio queued so far only tracks the
+ *   delivery pace, so the cursor advances by the session's calibrated speaking
+ *   rate instead.
+ *
+ * Time is counted in voiced audio only, so pauses and breaths do not advance
+ * the caption; they fall on phrase breaks. Within a turn the cursor never
+ * moves backward: later knowledge refines what is left to say, not what was
+ * already spoken.
  */
 export class Captions {
   private queuedMs = 0;
   private playedMs = 0;
-  private pending: { at: number; text: string; turn?: boolean }[] = [];
+  private sessionMs = 0; // all played output audio: the GPT-Live session clock
+  private pending: { at: number; text: string; turn?: boolean; end?: number; from?: number; to?: number; sat?: number }[] = [];
   private shown = "";
+  private spoken = 0; // high-water mark of spoken characters in the current turn
+  private charsPerMs = 1 / 70; // speaking-rate prior (~14 chars/s), calibrated from closed spans
   private readonly onLine: (line: CaptionLine) => void;
 
   /** onLine gets the current phrase (empty to clear) and how much of it has been spoken. */
   constructor(onLine: (line: CaptionLine) => void) { this.onLine = onLine; }
 
-  /** Transcript text for audio that is about to be (or already was) queued. */
-  text(delta: string) {
+  /** Transcript text; GPT-Live fragments carry their range on the session clock. */
+  text(delta: string, from?: number, to?: number) {
     // Eleven v3 voices put delivery tags such as "[Tone]" into the transcript.
     const clean = delta.replace(/\[[^\]]*\]\s*/g, "");
-    if (clean) { this.pending.push({ at: this.queuedMs, text: clean }); this.emit(); }
+    if (!clean) return;
+    const at = this.queuedMs;
+    const last = this.pending.at(-1);
+    if (last && !last.turn && last.end === undefined && last.to === undefined && last.at !== at) this.close(at);
+    this.pending.push(from !== undefined && to !== undefined ? { at, text: clean, from, to } : { at, text: clean });
+    this.emit();
   }
 
   queued(pcm: Buffer, rate: number) { this.queuedMs += voicedMs(pcm, rate); this.emit(); }
 
-  played(frame: Buffer, rate: number) { this.playedMs += voicedMs(frame, rate); this.emit(); }
+  played(frame: Buffer, rate: number) {
+    this.playedMs += voicedMs(frame, rate);
+    this.sessionMs += frame.length / 2 / rate * 1000;
+    this.emit();
+  }
 
   /** Queued audio was dropped (barge-in): unplayed text never gets said. */
   interrupt() {
-    this.pending = this.pending.filter(entry => entry.at < this.playedMs);
+    const heard = (entry: { at: number; from?: number; sat?: number }) =>
+      (entry.sat ?? entry.from) !== undefined
+        ? (entry.sat ?? entry.from)! < this.sessionMs
+        : entry.at < this.playedMs;
+    this.pending = this.pending.filter(entry => entry.turn || entry.to === undefined ? heard(entry) : entry.from! < this.sessionMs);
     this.queuedMs = this.playedMs;
     this.emit();
   }
 
-  /** A new turn starts with the audio queued from now on: its first phrase replaces the line. */
-  turn() { this.pending.push({ at: this.queuedMs, text: "", turn: true }); }
+  /** A new turn starts: its first phrase replaces the line. GPT-Live markers carry the new speech's session position. */
+  turn(from?: number) {
+    const at = this.queuedMs;
+    const last = this.pending.at(-1);
+    if (last && !last.turn && last.end === undefined && last.to === undefined) this.close(at);
+    this.pending.push({ at, text: "", turn: true, ...(from !== undefined ? { sat: from } : {}) });
+    this.emit();
+  }
+
+  /** The item's audio is fully queued (ElevenLabs response.output_audio.done): its open span is now known exactly. */
+  done() { this.close(this.queuedMs); }
+
+  /** Fixes the open group's span at `end` and calibrates the speaking rate from it. */
+  private close(end: number) {
+    let start = this.pending.length;
+    while (start > 0 && !this.pending[start - 1].turn && this.pending[start - 1].end === undefined && this.pending[start - 1].to === undefined) start--;
+    const at = this.pending[start]?.at;
+    if (at === undefined) return;
+    let len = 0;
+    for (let i = start; i < this.pending.length; i++) { this.pending[i].end = end; len += this.pending[i].text.length; }
+    // Only human-plausible rates calibrate the prior (chars per voiced ms).
+    if (len >= 8 && end - at >= 100) {
+      const sample = len / (end - at);
+      if (sample > 0.005 && sample < 0.05) this.charsPerMs = this.charsPerMs * 0.6 + sample * 0.4;
+    }
+    this.emit();
+  }
 
   private emit() {
     // The current turn is everything after the last turn marker that has started playing.
     let first = 0;
-    for (let i = 0; i < this.pending.length; i++) if (this.pending[i].turn && this.pending[i].at < this.playedMs) first = i;
+    for (let i = 0; i < this.pending.length; i++) {
+      const marker = this.pending[i];
+      if (!marker.turn) continue;
+      if (marker.sat !== undefined ? marker.sat < this.sessionMs : marker.at < this.playedMs) first = i;
+    }
+    if (first > 0) this.spoken = 0; // a new turn counts its spoken characters from zero
     this.pending.splice(0, first);
     let text = "", cursor = 0;
-    for (let i = 0; i < this.pending.length; i++) {
+    for (let i = 0; i < this.pending.length;) {
       const entry = this.pending[i];
-      if (entry.turn && i > 0) break; // the next turn has not started yet
-      const end = this.pending[i + 1]?.at ?? this.queuedMs;
-      // Strictly after its mark: a pause before a delta keeps the previous phrase up.
-      if (entry.text && this.playedMs > entry.at) {
-        const share = end > entry.at ? Math.min(1, (this.playedMs - entry.at) / (end - entry.at)) : 0;
-        cursor = text.length + Math.max(1, Math.round(share * entry.text.length));
+      if (entry.turn) { if (i > 0) break; i++; continue; } // the next turn has not started; the marker adds no text
+      if (entry.to !== undefined) {
+        // A timed fragment (GPT-Live): pace it against all played output audio.
+        // Server-omitted silence leaves the local clock behind the session
+        // timeline, but the drift lands in pauses, where the caption holds anyway.
+        const from = entry.from!, to = entry.to;
+        if (this.sessionMs > from) {
+          const share = to > from ? Math.min(1, (this.sessionMs - from) / (to - from)) : 1;
+          cursor = text.length + Math.max(1, Math.round(share * entry.text.length));
+        }
+        text += entry.text;
+        i++;
+        continue;
       }
-      text += entry.text;
+      // Deltas sharing a stamp arrived in one burst ahead of their audio: their
+      // combined text paces together over the span up to the next stamp.
+      const at = entry.at;
+      let j = i, len = 0;
+      while (j < this.pending.length && !this.pending[j].turn && this.pending[j].to === undefined && this.pending[j].at === at) {
+        len += this.pending[j].text.length;
+        j++;
+      }
+      const end = this.pending[j]?.at ?? entry.end;
+      // Strictly after its mark: a pause before a delta keeps the previous phrase up.
+      if (this.playedMs > at) {
+        if (end !== undefined && end > at) {
+          const share = Math.min(1, (this.playedMs - at) / (end - at));
+          cursor = text.length + Math.max(1, Math.round(share * len));
+        } else {
+          // The span is still open: the audio queued so far tracks the delivery
+          // pace, not the sentence's length, so pace by the speaking rate the
+          // session has calibrated from closed spans instead.
+          cursor = text.length + Math.min(len, Math.max(1, Math.round((this.playedMs - at) * this.charsPerMs)));
+        }
+      }
+      for (let k = i; k < j; k++) text += this.pending[k].text;
+      i = j;
     }
-    const line = phraseAt(text, cursor);
+    this.spoken = Math.max(this.spoken, cursor); // audio cannot unplay: what was spoken stays spoken
+    const line = phraseAt(text, this.spoken);
     const key = JSON.stringify(line);
     if (key !== this.shown) { this.shown = key; this.onLine(line); }
   }
