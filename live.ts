@@ -217,6 +217,7 @@ export class LiveVoice {
         // GPT-Live decides when to yield; while the user talks over playback, drop the
         // locally queued audio so the model's own stop is not delayed by our buffer.
         if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); }
+        if (!this.userTurn) this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
         this.userTurn = true;
         this.hooks.state("listening");
         break;

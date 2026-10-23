@@ -60,6 +60,8 @@ export function dominantFrequency(samples: number[], rate: number, low = 80, hig
 
 /** Peak above which a PCM16 block counts as voice rather than silence or breath. */
 const VOICE_PEAK = 600;
+/** Unvoiced audio before a voiced frame that makes it a speech onset (a turn's first word). */
+const ONSET_QUIET_MS = 250;
 
 /** Milliseconds of voiced audio in a PCM16 buffer, judged per 20 ms block. */
 export function voicedMs(pcm: Buffer, rate: number): number {
@@ -79,8 +81,11 @@ export function voicedMs(pcm: Buffer, rate: number): number {
  * their text in one of two ways, and both are handled:
  *
  * - GPT-Live stamps every transcript fragment with a range on its session clock
- *   (start_ms/end_ms); fragments are paced against all played output audio,
- *   which is that clock locally, so delivery order and pace do not matter.
+ *   (start_ms/end_ms). Output audio on the primary socket carries no timing, and
+ *   the local count of played audio drifts from that clock (a late first frame,
+ *   dropped frames, audio flushed on barge-in), so each turn re-anchors it: the
+ *   turn's first voiced onset after the user spoke is where its first fragment
+ *   starts. Fragments then pace against played audio plus that offset.
  *
  * - ElevenLabs sends no timing. Each delta is stamped with the voiced audio
  *   queued when it arrived; deltas sharing a stamp arrived in one burst and
@@ -98,8 +103,12 @@ export function voicedMs(pcm: Buffer, rate: number): number {
 export class Captions {
   private queuedMs = 0;
   private playedMs = 0;
-  private sessionMs = 0; // all played output audio: the GPT-Live session clock
-  private pending: { at: number; text: string; turn?: boolean; end?: number; from?: number; to?: number; sat?: number }[] = [];
+  private sessionMs = 0; // all played output audio, silence included
+  private offset = 0;    // GPT-Live session timeline minus sessionMs, anchored per turn
+  private quietMs = Infinity; // unvoiced audio played since the last voiced frame
+  private onsets: number[] = []; // sessionMs of recent speech onsets (voice after a pause)
+  private userAt = 0;    // sessionMs when the user last started speaking
+  private pending: { at: number; text: string; turn?: boolean; end?: number; from?: number; to?: number; sat?: number; after?: number; anchored?: boolean }[] = [];
   private shown = "";
   private spoken = 0; // high-water mark of spoken characters in the current turn
   private charsPerMs = 1 / 70; // speaking-rate prior (~14 chars/s), calibrated from closed spans
@@ -123,18 +132,27 @@ export class Captions {
   queued(pcm: Buffer, rate: number) { this.queuedMs += voicedMs(pcm, rate); this.emit(); }
 
   played(frame: Buffer, rate: number) {
-    this.playedMs += voicedMs(frame, rate);
-    this.sessionMs += frame.length / 2 / rate * 1000;
+    const voiced = voicedMs(frame, rate), ms = frame.length / 2 / rate * 1000;
+    if (voiced > 0 && this.quietMs >= ONSET_QUIET_MS) this.onsets = [...this.onsets.slice(-7), this.sessionMs];
+    this.quietMs = voiced > 0 ? 0 : this.quietMs + ms;
+    this.playedMs += voiced;
+    this.sessionMs += ms;
     this.emit();
   }
+
+  /** The user started speaking (GPT-Live): the next turn's speech begins after this point. */
+  userSpeech() { this.userAt = this.sessionMs; }
+
+  /** Local estimate of the GPT-Live session timeline. */
+  private get timeline() { return this.sessionMs + this.offset; }
 
   /** Queued audio was dropped (barge-in): unplayed text never gets said. */
   interrupt() {
     const heard = (entry: { at: number; from?: number; sat?: number }) =>
       (entry.sat ?? entry.from) !== undefined
-        ? (entry.sat ?? entry.from)! < this.sessionMs
+        ? (entry.sat ?? entry.from)! < this.timeline
         : entry.at < this.playedMs;
-    this.pending = this.pending.filter(entry => entry.turn || entry.to === undefined ? heard(entry) : entry.from! < this.sessionMs);
+    this.pending = this.pending.filter(entry => entry.turn || entry.to === undefined ? heard(entry) : entry.from! < this.timeline);
     this.queuedMs = this.playedMs;
     this.emit();
   }
@@ -144,7 +162,7 @@ export class Captions {
     const at = this.queuedMs;
     const last = this.pending.at(-1);
     if (last && !last.turn && last.end === undefined && last.to === undefined) this.close(at);
-    this.pending.push({ at, text: "", turn: true, ...(from !== undefined ? { sat: from } : {}) });
+    this.pending.push({ at, text: "", turn: true, ...(from !== undefined ? { sat: from, after: this.userAt } : {}) });
     this.emit();
   }
 
@@ -168,12 +186,19 @@ export class Captions {
   }
 
   private emit() {
+    // Anchor each timed turn to its speech onset: the first onset after the user
+    // spoke is where the turn's first fragment starts on the session timeline.
+    for (const marker of this.pending) {
+      if (!marker.turn || marker.sat === undefined || marker.anchored) continue;
+      const onset = this.onsets.find(at => at >= marker.after!);
+      if (onset !== undefined) { this.offset = marker.sat - onset; marker.anchored = true; }
+    }
     // The current turn is everything after the last turn marker that has started playing.
     let first = 0;
     for (let i = 0; i < this.pending.length; i++) {
       const marker = this.pending[i];
       if (!marker.turn) continue;
-      if (marker.sat !== undefined ? marker.sat < this.sessionMs : marker.at < this.playedMs) first = i;
+      if (marker.sat !== undefined ? marker.sat < this.timeline : marker.at < this.playedMs) first = i;
     }
     if (first > 0) this.spoken = 0; // a new turn counts its spoken characters from zero
     this.pending.splice(0, first);
@@ -182,12 +207,10 @@ export class Captions {
       const entry = this.pending[i];
       if (entry.turn) { if (i > 0) break; i++; continue; } // the next turn has not started; the marker adds no text
       if (entry.to !== undefined) {
-        // A timed fragment (GPT-Live): pace it against all played output audio.
-        // Server-omitted silence leaves the local clock behind the session
-        // timeline, but the drift lands in pauses, where the caption holds anyway.
-        const from = entry.from!, to = entry.to;
-        if (this.sessionMs > from) {
-          const share = to > from ? Math.min(1, (this.sessionMs - from) / (to - from)) : 1;
+        // A timed fragment (GPT-Live): pace it against the anchored timeline.
+        const from = entry.from!, to = entry.to, now = this.timeline;
+        if (now > from) {
+          const share = to > from ? Math.min(1, (now - from) / (to - from)) : 1;
           cursor = text.length + Math.max(1, Math.round(share * entry.text.length));
         }
         text += entry.text;

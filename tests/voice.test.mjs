@@ -507,12 +507,53 @@ test('GPT-Live fragments pace by their server ranges against played output audio
   assert.equal(shown.at(-1), 'All tests pass,');
   captions.played(voiced(1), 24000); // 20 ms into the second range
   assert.equal(shown.at(-1), 'nothing else changed.');
+  captions.userSpeech();
   captions.turn(800);                 // the user spoke; the next turn starts at session 800
   captions.text('Stopping.', 800, 900);
   captions.played(Buffer.alloc(960 * 19), 24000); // the clock runs through silence to exactly 800
   assert.equal(shown.at(-1), 'nothing else changed.', 'the next turn waits for its session position');
   captions.played(voiced(2), 24000);   // 840 ms: inside "Stopping."
   assert.equal(shown.at(-1), 'Stopping.');
+});
+
+test('GPT-Live captions anchor to speech onset when the session clock is ahead of played audio', () => {
+  const shown = [];
+  const captions = new Captions(line => shown.push(line.phrase));
+  // The first output audio sits 1500 ms into the session timeline; locally it starts at 0.
+  captions.turn(1500);
+  captions.text('Here.', 1500, 1700);
+  captions.played(voiced(1), 24000); // the greeting's first voiced frame
+  assert.equal(shown.at(-1), 'Here.', 'shown at its onset, not 1.5 s later');
+  captions.played(Buffer.alloc(960 * 40), 24000);
+  // Frames dropped or flushed on barge-in: the timeline moves on by 2000 ms that never play.
+  captions.userSpeech();
+  captions.turn(5000);
+  captions.text('Checking, ', 5000, 5400);
+  captions.text('one moment.', 5400, 5800);
+  captions.played(Buffer.alloc(960 * 10), 24000);
+  assert.equal(shown.at(-1), 'Here.', 'the new turn waits for its own onset');
+  captions.played(voiced(1), 24000);
+  assert.equal(shown.at(-1), 'Checking,');
+  for (let i = 0; i < 20; i++) captions.played(voiced(1), 24000); // 420 ms into the turn
+  assert.equal(shown.at(-1), 'one moment.');
+});
+
+test('GPT-Live anchoring ignores onsets from before the user spoke', () => {
+  const shown = [];
+  const captions = new Captions(line => shown.push(line.phrase));
+  captions.turn(0);
+  captions.text('First.', 0, 200);
+  // Frames arrive from the device one 20 ms frame at a time.
+  for (let i = 0; i < 10; i++) captions.played(voiced(1), 24000);
+  for (let i = 0; i < 20; i++) captions.played(Buffer.alloc(960), 24000);
+  captions.userSpeech();
+  // The reply's text arrives before its audio; the old onset at 0 must not anchor it.
+  captions.turn(3000);
+  captions.text('Second.', 3000, 3200);
+  captions.played(Buffer.alloc(960 * 5), 24000);
+  assert.equal(shown.at(-1), 'First.');
+  captions.played(voiced(1), 24000);
+  assert.equal(shown.at(-1), 'Second.');
 });
 
 test('GPT-Live config comes from providers/openai-live/ with Responses delegation to the Pi tools', () => {
