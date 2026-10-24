@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 (2026-10-24)
+
 - **Settings.** `autoPause`, `idlePause`, `captions`, and `echoCancellation` can be set in a `"pi-voice"` object in Pi's `settings.json` (global or per project), each overridable by its environment variable (`PI_VOICE_AUTOPAUSE`, `PI_VOICE_IDLE_PAUSE`, `PI_VOICE_CAPTIONS`, `PI_VOICE_AEC`). `/talk check` shows every value, its source, and any value it ignored as invalid.
 - **Auto-pause.** GPT-Live bills per second while connected, so voice closes its connection after 15 s of silence while Pi works (`PI_VOICE_AUTOPAUSE`) and comes back by itself to say the result; after 60 s of silence with nothing running (`PI_VOICE_IDLE_PAUSE`) it pauses until `/talk start`. Measured live: a 56 s wait billed 31 s instead of 56 s.
 - **Results are never lost.** A talk session (`talk.ts`) owns the Pi bridge across voice connections: a result that arrives while voice is paused, connecting, or stopped by the user is said as soon as a connection is open. The consent prompt is shown once per Pi session.
