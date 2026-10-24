@@ -87,13 +87,11 @@ export function voicedMs(pcm: Buffer, rate: number): number {
  *   turn's first voiced onset after the user spoke is where its first fragment
  *   starts. Fragments then pace against played audio plus that offset.
  *
- * - ElevenLabs sends no timing. Each delta is stamped with the voiced audio
- *   queued when it arrived; deltas sharing a stamp arrived in one burst and
- *   pace together. A span closes when the next delta's stamp or the item's
- *   audio-done fixes its length, and is then paced exactly by its share of the
- *   played audio; while it is open, the audio queued so far only tracks the
- *   delivery pace, so the cursor advances by the session's calibrated speaking
- *   rate instead.
+ * - Fragments without timing (a fallback) are stamped with the voiced audio
+ *   queued when they arrived; fragments sharing a stamp arrived in one burst
+ *   and pace together. A span closes when the next stamp fixes its length and
+ *   is then paced by its share of the played audio; while it is open, the
+ *   cursor advances by the session's calibrated speaking rate.
  *
  * Time is counted in voiced audio only, so pauses and breaths do not advance
  * the caption; they fall on phrase breaks. Within a turn the cursor never
@@ -119,7 +117,7 @@ export class Captions {
 
   /** Transcript text; GPT-Live fragments carry their range on the session clock. */
   text(delta: string, from?: number, to?: number) {
-    // Eleven v3 voices put delivery tags such as "[Tone]" into the transcript.
+    // Bracketed delivery tags such as "[Tone]" are not speech.
     const clean = delta.replace(/\[[^\]]*\]\s*/g, "");
     if (!clean) return;
     const at = this.queuedMs;
@@ -166,8 +164,6 @@ export class Captions {
     this.emit();
   }
 
-  /** The item's audio is fully queued (ElevenLabs response.output_audio.done): its open span is now known exactly. */
-  done() { this.close(this.queuedMs); }
 
   /** Fixes the open group's span at `end` and calibrates the speaking rate from it. */
   private close(end: number) {

@@ -14,7 +14,6 @@ export type KeySpec = {
   long?: boolean;
 };
 
-export const ELEVENLABS_KEY: KeySpec = { service: "elevenlabs-api-key", env: "ELEVENLABS_API_KEY", label: "ElevenLabs API key" };
 export const OPENAI_KEY: KeySpec = { service: "openai-api-key", env: "OPENAI_API_KEY", label: "OpenAI API key", long: true };
 
 /** The interactive prompt truncates at 128 characters, so long keys go through the clipboard. */

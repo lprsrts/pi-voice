@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Pi is the backend.** GPT-Live now hands work to the Pi session itself (client delegation): what you said goes to Pi as a message, Pi works with its own model (`/model`), tools, and environment, its progress reaches the voice silently, and its result is spoken on the same delegation. No separate backend model runs in between, so the backend model is whatever Pi uses.
+- While Pi works, "stop"/"cancel" aborts it and "what's Pi doing?" is answered from Pi's state without interrupting it; anything else is added to the running task. Short replies ("yes, do that") carry what the voice had just said.
+- While a voice session runs, Pi's system prompt gets a voice section: requests are speech transcripts, and answers should end with a short, speakable summary.
+- Late transcript fragments of your own request no longer interrupt the voice's acknowledgement.
+- **Removed:** ElevenLabs Eleven Realtime, the provider argument to `/talk start`, `PI_VOICE_PROVIDER`, and the OpenAI-hosted backend model (`backend.md`, `session.json` `backend`).
+
 ## 0.1.4 (2026-10-24)
 
 - GPT-Live: Pi results and progress are clipped by a pessimistic token estimate instead of 1800 characters, so long, code-heavy results (paths, versions, hashes) no longer exceed GPT-Live's 500-token append limit and get dropped with "Context append text must not exceed 500 tokens".

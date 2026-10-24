@@ -18,7 +18,7 @@ Requirements match the package: macOS 14+, Node 24+, Pi, and `swiftc` (`xcode-se
 - Keep runtime dependencies at zero; Pi provides its own modules (declared as `peerDependencies`).
 - Tests must not need credentials, network, or audio devices. Live behaviour (a real session, the Swift helper) is checked by hand; say in the pull request what you tried.
 - Never log or persist API keys, audio, or transcripts.
-- Provider defaults live in `providers/<name>/`. A new provider needs a session class (see `realtime.ts`, `live.ts`), an entry in `providers.ts`, and tests against a fake socket.
+- The voice is GPT-Live (`live.ts`, defaults in `providers/openai-live/`); the backend is the Pi session, reached through `pi-bridge.ts`. Protocol changes need tests against the fake socket in `tests/`.
 - Match the surrounding code style; there is no formatter config.
 
 ## Reporting audio problems

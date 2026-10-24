@@ -1,9 +1,4 @@
 {
   "model": "gpt-live-1",
-  "voice": "vesper",
-  "backend": {
-    "model": "gpt-5.6-luna",
-    "tool_choice": "auto",
-    "parallel_tool_calls": false
-  }
+  "voice": "vesper"
 }

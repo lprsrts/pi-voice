@@ -1,18 +1,33 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
-import { PI_TOOLS } from "./pi-bridge.ts";
+import { VOICE_REQUEST } from "./pi-bridge.ts";
 import { Captions, clipTokens, type CaptionLine, waveform, type VoiceState } from "./protocol.ts";
 
-// OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with Responses
-// delegation: the voice model hands work to an OpenAI backend model, which
-// calls the same Pi tools as the ElevenLabs provider (ask_pi, pi_status,
-// cancel_pi). Pi updates go in as commentary (spoken) or thinking (silent).
-// Config lives in providers/openai-live/.
+// OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with client
+// delegation: the Pi session itself is the backend. When GPT-Live delegates,
+// the user's words since the last delegation (its input transcript) go to Pi
+// as a message; Pi works with its own model, tools, and environment, and its
+// progress (thinking, silent) and results (commentary, spoken) go back tagged
+// with the delegation. Config lives in providers/openai-live/.
 
 const ENDPOINT = "wss://api.openai.com/v1/live/sessions";
 const RATE = 24000; // PCM16 mono both ways; the native helper runs unresampled at this rate
 const APPEND_TOKENS = 400; // commentary/thinking accept at most 500 tokens; the estimate is pessimistic, and this leaves margin
-const SPEECH_PEAK = 600;   // GPT-Live streams continuously, silence included (measured: 44.8 s of audio in a 47 s session)
+const SPEECH_PEAK = 600;
+const DELEGATION_SETTLE_MS = 350; // input transcript fragments trailing a delegation still count toward it
+// While Pi works, these are handled locally instead of being sent to Pi as messages.
+const STOP_REQUEST = /^(please\s+)?(stop|cancel|abort|halt|never\s?mind|forget it)(\s+(it|that|this|the task|the job|everything|pi|now))*(\s+please)?[.!]*$/i;
+const STATUS_REQUEST = /^(so\s+|and\s+|okay,?\s+|ok,?\s+)?(what('?s| is)\s+(pi|it|he|she)\s+doing|what are you doing|how('?s| is)\s+it\s+going|how far|(is|are)\s+(it|pi|you)\s+(done|finished)|any\s+(news|progress|update)|status|progress)\b[^.!?]{0,40}[.?!]*$/i;
+
+/** Pi's status (pi_status) as a sentence GPT-Live can relay. */
+export function describeStatus(status: any): string {
+  if (status?.state === "idle") return status.last_result ? `Pi is idle. Its last answer: ${status.last_result}` : "Pi is idle.";
+  const doing = status?.state === "waiting_for_approval" ? "waiting for the user to answer a prompt in the terminal" : "working";
+  const parts = [`Pi is ${doing} on "${status?.task ?? "a task"}"${typeof status?.elapsed_s === "number" ? ` for ${status.elapsed_s} seconds` : ""}`];
+  if (status?.last_tool) parts.push(`last step: ${status.last_tool}`);
+  if (status?.queued?.length) parts.push(`${status.queued.length} more request${status.queued.length === 1 ? "" : "s"} queued`);
+  return `${parts.join("; ")}.`;
+}   // GPT-Live streams continuously, silence included (measured: 44.8 s of audio in a 47 s session)
 
 /** Whether a PCM16 frame carries speech rather than the stream's silence. */
 export function audibleFrame(frame: Buffer): boolean {
@@ -22,7 +37,7 @@ export function audibleFrame(frame: Buffer): boolean {
 
 /** A built-in voice name, or a custom (prompt-generated) voice by ID with its original description. */
 type LiveVoiceSetting = string | { id: string; name?: string; description?: string };
-type LiveFile = { model: string; voice: LiveVoiceSetting; backend: { model: string; tool_choice?: string; parallel_tool_calls?: boolean; service_tier?: string } };
+type LiveFile = { model: string; voice: LiveVoiceSetting };
 
 /** The session.start payload, from providers/openai-live/ or the user override directory. */
 export function liveSessionConfig(files: ProviderFiles = providerFiles("openai-live")) {
@@ -34,17 +49,8 @@ export function liveSessionConfig(files: ProviderFiles = providerFiles("openai-l
     // Custom voices perform best with their original description in the instructions (OpenAI custom-voices guide).
     instructions: custom?.description ? `${instructions}\n\nVoice: ${custom.description}` : instructions,
     audio: { format: { type: "audio/pcm", rate: RATE }, output: { voice: custom ? { id: custom.id } : file.voice } },
-    delegation: {
-      type: "responses",
-      responses: {
-        model: file.backend.model,
-        instructions: files.text("backend.md"),
-        tools: PI_TOOLS,
-        tool_choice: file.backend.tool_choice ?? "auto",
-        parallel_tool_calls: file.backend.parallel_tool_calls ?? false,
-        ...(file.backend.service_tier ? { service_tier: file.backend.service_tier } : {}),
-      },
-    },
+    // Pi is the backend: GPT-Live hands over a delegation ID; pi-voice gives Pi the task.
+    delegation: { type: "client" },
   };
 }
 
@@ -53,7 +59,7 @@ type Hooks = {
   samples: (source: "input" | "output", samples: number[]) => void;
   error: (message: string) => void;
   closed: () => void;
-  /** Function calls from the backend model; must return quickly (Pi work continues in the background). */
+  /** Pi bridge calls (ask_pi, pi_status, cancel_pi); return at once while Pi works in the background. */
   tool: (name: string, args: Record<string, unknown>) => object;
   /** Whether Pi is working, for the resting waveform state. */
   busy: () => boolean;
@@ -79,9 +85,15 @@ export class LiveVoice {
   private resolveStart?: () => void;
   private rejectStart?: (error: Error) => void;
   private seq = 0;
-  // Backend function calls awaiting continuation, per delegation.
-  private submitted = new Map<string, number>();
-  private handledCalls = new Set<string>();
+  // Pi backend: what the user said (input transcript, session clock), how far
+  // delegations have consumed it, and the delegation Pi is answering.
+  private heard: { start: number; end: number; text: string }[] = [];
+  private consumedMs = -1;
+  private lastRequest = "";
+  private said = "";  // what the voice has said since the user last spoke
+  private prior = ""; // what it said before the user's current turn: context for short replies
+  private voiceFrom?: number; // session-clock start of the voice's current reply
+  private delegation?: string;
   // Playback bookkeeping for the waveform state.
   private playing = false;
   private lastAudible = 0;
@@ -151,14 +163,18 @@ export class LiveVoice {
     this.hooks.state(this.hooks.busy() ? "thinking" : this.muted ? "idle" : "listening");
   }
 
-  /** A Pi update GPT-Live should say aloud (it paraphrases commentary). */
-  notify(text: string) {
-    this.send({ type: "session.commentary.append", delegation_id: null, content: clipTokens(text, APPEND_TOKENS) });
-  }
+  /** A Pi update GPT-Live should say aloud (it paraphrases commentary), tied to the delegation Pi is answering. */
+  notify(text: string) { this.commentary(text, this.delegation ?? null); }
 
   /** Silent context GPT-Live can use when asked, without speaking it now. */
-  context(text: string) {
-    this.send({ type: "session.thinking.append", delegation_id: null, content: clipTokens(text, APPEND_TOKENS) });
+  context(text: string) { this.thinking(text, this.delegation ?? null); }
+
+  private commentary(text: string, delegation: string | null) {
+    this.send({ type: "session.commentary.append", delegation_id: delegation, content: clipTokens(text, APPEND_TOKENS) });
+  }
+
+  private thinking(text: string, delegation: string | null) {
+    this.send({ type: "session.thinking.append", delegation_id: delegation, content: clipTokens(text, APPEND_TOKENS) });
   }
 
   private startAudio() {
@@ -209,24 +225,35 @@ export class LiveVoice {
         // GPT-Live times every fragment on its session clock (start_ms/end_ms);
         // per the API docs these ranges replace packet arrival times for pacing.
         const timed = typeof event.start_ms === "number" && typeof event.end_ms === "number";
-        if (this.userTurn) { this.userTurn = false; this.captions.turn(timed ? event.start_ms : undefined); }
+        if (this.userTurn) { this.userTurn = false; this.voiceFrom = timed ? event.start_ms : undefined; this.captions.turn(timed ? event.start_ms : undefined); }
+        this.said = (this.said + String(event.delta ?? "")).slice(-600);
         this.captions.text(String(event.delta ?? ""), timed ? event.start_ms : undefined, timed ? event.end_ms : undefined);
         break;
       }
-      case "session.input_transcript.delta":
+      case "session.input_transcript.delta": {
+        this.hear(String(event.delta ?? ""), event.start_ms, event.end_ms);
+        // A late fragment of words spoken before the voice's current reply began is
+        // not new speech: it neither interrupts the reply nor starts a user turn.
+        if (!this.userTurn && typeof event.start_ms === "number" && this.voiceFrom !== undefined && event.start_ms < this.voiceFrom) break;
         // GPT-Live decides when to yield; while the user talks over playback, drop the
         // locally queued audio so the model's own stop is not delayed by our buffer.
         if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); }
-        if (!this.userTurn) this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
+        if (!this.userTurn) {
+          this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
+          this.prior = this.said;     // an acknowledgement spoken after the request is not its context
+          this.said = "";
+        }
         this.userTurn = true;
         this.hooks.state("listening");
         break;
-      case "session.delegation.created":
+      }
+      case "session.delegation.created": {
         this.hooks.state("thinking");
+        const id = event.delegation?.id;
+        // The last words of the request can still be in flight; give them a moment.
+        if (typeof id === "string") setTimeout(() => this.delegate(id), DELEGATION_SETTLE_MS).unref?.();
         break;
-      case "response.event":
-        this.backendEvent(String(event.delegation_id ?? ""), event.event ?? {});
-        break;
+      }
       case "session.closed":
         this.stop();
         break;
@@ -240,28 +267,45 @@ export class LiveVoice {
     }
   }
 
-  /** Nested Responses events of a delegation: run Pi tools and continue the backend. */
-  private backendEvent(delegation: string, inner: any) {
-    if (inner.type === "response.output_item.done" && inner.item?.type === "function_call") {
-      const item = inner.item as { call_id?: string; name?: string; arguments?: string };
-      if (typeof item.call_id !== "string" || typeof item.name !== "string" || this.handledCalls.has(item.call_id)) return;
-      this.handledCalls.add(item.call_id);
-      let output: object;
-      try {
-        const args = item.arguments ? JSON.parse(item.arguments) : {};
-        output = this.hooks.tool(item.name, args && typeof args === "object" ? args : {});
-      } catch (error) {
-        output = { error: error instanceof Error ? error.message : "Tool failed." };
-      }
-      this.send({ type: "response.item.create", item: { type: "function_call_output", call_id: item.call_id, output: JSON.stringify(output) } });
-      this.submitted.set(delegation, (this.submitted.get(delegation) ?? 0) + 1);
+  /** Keeps the user's recent words on the session clock (fragments without timing go at the end). */
+  private hear(text: string, start?: number, end?: number) {
+    if (!text.trim()) return;
+    const last = this.heard.at(-1)?.end ?? 0;
+    const from = typeof start === "number" ? start : last, to = typeof end === "number" ? end : from + 1;
+    this.heard = [...this.heard.slice(-79), { start: from, end: to, text }];
+  }
+
+  /**
+   * GPT-Live delegated: Pi takes the user's words since the last delegation.
+   * A bare "stop"/"cancel" while Pi works aborts it, and a status question while
+   * Pi works is answered from Pi's state without interrupting it.
+   */
+  private delegate(id: string) {
+    if (this.stopped) return;
+    const fresh = this.heard.filter(fragment => fragment.end > this.consumedMs);
+    if (fresh.length) this.consumedMs = Math.max(...fresh.map(fragment => fragment.end));
+    const words = fresh.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    const request = words || this.lastRequest;
+    if (!request) { this.thinking("No request was heard for this delegation; ask the user to repeat it.", id); return; }
+    this.lastRequest = request;
+    const busy = this.hooks.busy();
+    if (busy && STOP_REQUEST.test(request)) {
+      const result = this.hooks.tool("cancel_pi", {}) as { status?: string };
+      this.commentary(result.status === "cancelled" ? "Pi's task is cancelled." : "Pi wasn't working on anything.", id);
       return;
     }
-    // Results for every call of the response are in: continue it exactly once.
-    if (/^response\.(completed|incomplete|failed)$/.test(inner.type) && this.submitted.get(delegation)) {
-      this.submitted.delete(delegation);
-      this.send({ type: "response.create" });
+    if (busy && STATUS_REQUEST.test(request)) {
+      this.commentary(describeStatus(this.hooks.tool("pi_status", {})), id);
+      return;
     }
+    // Short replies ("yes, do that") need what the voice had just said to make sense.
+    const context = request.length < 80 && this.prior.trim() ? `\n(The voice assistant had just said: "${this.prior.trim().slice(-300)}")` : "";
+    const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${context}`, when: "now" }) as { status?: string; error?: string };
+    if (result.error) { this.commentary(`Pi could not take the request: ${result.error}`, id); return; }
+    this.delegation = id;
+    this.thinking(result.status === "started"
+      ? "Pi has started on the request. Its result arrives as commentary; do not state any result before that."
+      : "Pi was already working; the request was added to its running task. Its result arrives as commentary.", id);
   }
 
   mute(value: boolean) {

@@ -1,7 +1,7 @@
 {
   "name": "@lprsrts/pi-voice",
   "version": "0.1.4",
-  "description": "Talk to your coding agent: full-duplex, echo-cancelled voice for Pi on macOS (ElevenLabs Realtime or OpenAI GPT-Live) that hands work to your Pi session",
+  "description": "Talk to your coding agent: full-duplex GPT-Live voice for Pi on macOS, with your Pi session (its model, tools, and local environment) as the backend",
   "keywords": [
     "pi-package",
     "pi",
@@ -9,9 +9,10 @@
     "voice",
     "realtime",
     "speech-to-speech",
-    "elevenlabs",
     "openai",
-    "macos"
+    "macos",
+    "gpt-live",
+    "agent"
   ],
   "license": "MIT",
   "author": "Alper Sarıtaş",

@@ -2,29 +2,32 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
 import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
-import { RealtimeVoice, sessionConfig } from '../realtime.ts';
-import { PiBridge, PI_TOOLS, describeTool } from '../pi-bridge.ts';
-import { resolveApiKey, apiKeyStatus, provisionCommand, ELEVENLABS_KEY, OPENAI_KEY } from '../keys.ts';
-import { LiveVoice, liveSessionConfig, audibleFrame } from '../live.ts';
-import { selectProvider, PROVIDERS } from '../providers.ts';
+import { PiBridge, describeTool, VOICE_REQUEST } from '../pi-bridge.ts';
+import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
+// A neutral short key for the keychain tests (OpenAI keys are the long kind).
+const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
+import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus } from '../live.ts';
+import { PROVIDER } from '../providers.ts';
 import { providerFiles, userConfigDir } from '../config.ts';
 import { AudioPipes, parseRoute, pcmStats } from '../audio.ts';
 import { aecEnabled, helperPath } from '../native.ts';
 
 // No real credentials, network, microphone, speakers, or shell execution in tests.
-const originalKeyEnv = process.env.ELEVENLABS_API_KEY;
+const originalKeyEnv = process.env.PI_VOICE_TEST_API_KEY;
 const originalAec = process.env.PI_VOICE_AEC;
 after(() => {
-  if (originalKeyEnv === undefined) delete process.env.ELEVENLABS_API_KEY;
-  else process.env.ELEVENLABS_API_KEY = originalKeyEnv;
+  if (originalKeyEnv === undefined) delete process.env.PI_VOICE_TEST_API_KEY;
+  else process.env.PI_VOICE_TEST_API_KEY = originalKeyEnv;
   if (originalAec === undefined) delete process.env.PI_VOICE_AEC;
   else process.env.PI_VOICE_AEC = originalAec;
 });
 const signal = new AbortController().signal;
+const liveSource = readFileSync(new URL('../live.ts', import.meta.url), 'utf8');
 
 test('PCM chunks preserve split sample bytes and pad final frame', () => {
   const f = new PcmFramer(16000);
@@ -54,16 +57,16 @@ test('waveform samples are signed and bounded', () => {
   assert.deepEqual(waveform(b), [-1, 32767 / 32768]);
 });
 // Keychain convention: env override first, then the
-// login-keychain item elevenlabs-api-key, service-only lookup like ollama-api-key.
+// login-keychain item <provider>-api-key, service-only lookup.
 test('key resolution prefers the env override without touching the keychain', async () => {
-  process.env.ELEVENLABS_API_KEY = 'sk_env_override';
-  const key = await resolveApiKey(ELEVENLABS_KEY, signal, { platform: 'darwin', call: async () => { throw new Error('keychain must not be queried'); } });
+  process.env.PI_VOICE_TEST_API_KEY = 'sk_env_override';
+  const key = await resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: async () => { throw new Error('keychain must not be queried'); } });
   assert.equal(key, 'sk_env_override');
 });
 test('key resolution reads the convention item, trims the secret, and forwards the abort signal', async () => {
-  delete process.env.ELEVENLABS_API_KEY;
-  const key = await resolveApiKey(ELEVENLABS_KEY, signal, { platform: 'darwin', call: async (args, opts) => {
-    assert.deepEqual(args, ['find-generic-password', '-s', 'elevenlabs-api-key', '-w']);
+  delete process.env.PI_VOICE_TEST_API_KEY;
+  const key = await resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: async (args, opts) => {
+    assert.deepEqual(args, ['find-generic-password', '-s', 'test-api-key', '-w']);
     assert.equal(opts.signal, signal);
     assert.ok(opts.timeout > 0);
     return { stdout: 'sk_test\n', stderr: '' };
@@ -71,48 +74,48 @@ test('key resolution reads the convention item, trims the secret, and forwards t
   assert.equal(key, 'sk_test');
 });
 test('missing keychain item maps to the provisioning command', async () => {
-  delete process.env.ELEVENLABS_API_KEY;
+  delete process.env.PI_VOICE_TEST_API_KEY;
   const failure = Object.assign(new Error('not found'), { code: 44, stderr: 'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.' });
   await assert.rejects(
-    () => resolveApiKey(ELEVENLABS_KEY, signal, { platform: 'darwin', call: async () => { throw failure; } }),
-    /add-generic-password -U -s "elevenlabs-api-key" -a "\$USER"/
+    () => resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: async () => { throw failure; } }),
+    /add-generic-password -U -s "test-api-key" -a "\$USER"/
   );
 });
 test('denied or headless keychain reads fail with a clear reason', async () => {
-  delete process.env.ELEVENLABS_API_KEY;
+  delete process.env.PI_VOICE_TEST_API_KEY;
   await assert.rejects(
-    () => resolveApiKey(ELEVENLABS_KEY, signal, { platform: 'darwin', call: async () => { throw Object.assign(new Error('x'), { stderr: 'security: SecKeychainSearchCopyNext: User interaction is not allowed.' }); } }),
+    () => resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: async () => { throw Object.assign(new Error('x'), { stderr: 'security: SecKeychainSearchCopyNext: User interaction is not allowed.' }); } }),
     /denied|GUI terminal/
   );
 });
 test('corrupted or empty keychain secrets are rejected', async () => {
-  delete process.env.ELEVENLABS_API_KEY;
+  delete process.env.PI_VOICE_TEST_API_KEY;
   for (const stdout of ['\n', 'sk bad\n']) {
     await assert.rejects(
-      () => resolveApiKey(ELEVENLABS_KEY, signal, { platform: 'darwin', call: async () => ({ stdout, stderr: '' }) }),
+      () => resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: async () => ({ stdout, stderr: '' }) }),
       /empty or malformed/
     );
   }
 });
 test('non-darwin platforms fail closed without the env override', async () => {
-  delete process.env.ELEVENLABS_API_KEY;
-  await assert.rejects(() => resolveApiKey(ELEVENLABS_KEY, signal, { platform: 'linux', call: async () => ({ stdout: '', stderr: '' }) }), /ELEVENLABS_API_KEY/);
-  assert.match(await apiKeyStatus(ELEVENLABS_KEY, { platform: 'linux' }), /missing/);
+  delete process.env.PI_VOICE_TEST_API_KEY;
+  await assert.rejects(() => resolveApiKey(TEST_KEY, signal, { platform: 'linux', call: async () => ({ stdout: '', stderr: '' }) }), /PI_VOICE_TEST_API_KEY/);
+  assert.match(await apiKeyStatus(TEST_KEY, { platform: 'linux' }), /missing/);
 });
 test('status reports the source without ever reading the secret', async () => {
-  process.env.ELEVENLABS_API_KEY = 'sk_env_override';
-  assert.match(await apiKeyStatus(ELEVENLABS_KEY), /env override/);
-  delete process.env.ELEVENLABS_API_KEY;
-  assert.match(await apiKeyStatus(ELEVENLABS_KEY, { platform: 'darwin', call: async args => {
+  process.env.PI_VOICE_TEST_API_KEY = 'sk_env_override';
+  assert.match(await apiKeyStatus(TEST_KEY), /env override/);
+  delete process.env.PI_VOICE_TEST_API_KEY;
+  assert.match(await apiKeyStatus(TEST_KEY, { platform: 'darwin', call: async args => {
     assert.ok(!args.includes('-w')); // presence check only
     return { stdout: '', stderr: '' };
   }}), /present/);
-  assert.match(await apiKeyStatus(ELEVENLABS_KEY, { platform: 'darwin', call: async () => { throw Object.assign(new Error('nf'), { code: 44 }); } }), /add-generic-password/);
+  assert.match(await apiKeyStatus(TEST_KEY, { platform: 'darwin', call: async () => { throw Object.assign(new Error('nf'), { code: 44 }); } }), /add-generic-password/);
 });
 
 test('long keys provision through the clipboard and a 128-character key is reported as truncated', async () => {
   assert.match(provisionCommand(OPENAI_KEY), /-w "\$\(pbpaste\)" && pbcopy <\/dev\/null/);
-  assert.doesNotMatch(provisionCommand(ELEVENLABS_KEY), /pbpaste/);
+  assert.doesNotMatch(provisionCommand(TEST_KEY), /pbpaste/);
   delete process.env.OPENAI_API_KEY;
   await assert.rejects(
     () => resolveApiKey(OPENAI_KEY, signal, { platform: 'darwin', call: async args => { assert.deepEqual(args.slice(0, 3), ['find-generic-password', '-s', 'openai-api-key']); return { stdout: 'sk-proj-' + 'x'.repeat(120) + '\n', stderr: '' }; } }),
@@ -121,19 +124,9 @@ test('long keys provision through the clipboard and a 128-character key is repor
   assert.equal(await resolveApiKey(OPENAI_KEY, signal, { platform: 'darwin', call: async () => ({ stdout: 'sk-proj-' + 'x'.repeat(156), stderr: '' }) }), 'sk-proj-' + 'x'.repeat(156));
 });
 
-test('provider selection: argument over PI_VOICE_PROVIDER over the default', () => {
-  const original = process.env.PI_VOICE_PROVIDER;
-  try {
-    delete process.env.PI_VOICE_PROVIDER;
-    assert.equal(selectProvider().name, 'elevenlabs');
-    process.env.PI_VOICE_PROVIDER = 'openai-live';
-    assert.equal(selectProvider().name, 'openai-live');
-    assert.equal(selectProvider('ElevenLabs').name, 'elevenlabs');
-    assert.throws(() => selectProvider('gemini'), /Unknown voice provider "gemini". Available: elevenlabs, openai-live/);
-    assert.deepEqual(Object.values(PROVIDERS).map(p => p.key.service), ['elevenlabs-api-key', 'openai-api-key']);
-  } finally {
-    if (original === undefined) delete process.env.PI_VOICE_PROVIDER; else process.env.PI_VOICE_PROVIDER = original;
-  }
+test('the one provider is GPT-Live with the OpenAI key', () => {
+  assert.equal(PROVIDER.name, 'openai-live');
+  assert.equal(PROVIDER.key.service, 'openai-api-key');
 });
 
 test('device route parses from the helper and rejects malformed output', () => {
@@ -148,8 +141,6 @@ test('pcm level stats compute dBFS for signal, silence, and empty input', () => 
   assert.deepEqual(pcmStats(Buffer.alloc(2000)), { peakDbfs: -Infinity, rmsDbfs: -Infinity });
   assert.deepEqual(pcmStats(Buffer.alloc(1)), { peakDbfs: -Infinity, rmsDbfs: -Infinity });
 });
-// ---------- Eleven Realtime session (fake socket, no network or audio) ----------
-
 class FakeSocket extends EventTarget {
   static OPEN = 1;
   static last;
@@ -161,182 +152,14 @@ class FakeSocket extends EventTarget {
   types() { return this.sent.map(e => e.type); }
 }
 
-async function startVoice({ tool = () => ({ ok: true }), busy = () => false } = {}) {
-  const audio = { enqueued: [], finishes: 0, interrupts: 0, muted: [], stopped: 0 };
-  const errors = [], states = [], captions = [];
-  let mint, audioHooks;
-  globalThis.WebSocket = FakeSocket;
-  globalThis.fetch = async (url, init) => { mint = { url, init }; return { ok: true, json: async () => ({ value: 'ek_test_secret' }) }; };
-  const voice = new RealtimeVoice({ state: s => states.push(s), samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), closed() {}, tool, busy }, hooks => {
-    audioHooks = hooks;
-    return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish: () => audio.finishes++,
-      interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
-  });
-  const started = voice.start(() => 'test-not-a-real-key');
-  await new Promise(r => setImmediate(r));
-  const socket = FakeSocket.last;
-  socket.event({ type: 'session.created', session: {} });
-  await started;
-  return { voice, socket, audio, errors, states, mint, captions, input: f => audioHooks.input(f), output: (f, a) => audioHooks.output(f, a), played: f => audioHooks.played(f) };
-}
-
-test('ElevenLabs session config comes from providers/elevenlabs/ with the Pi tools', () => {
-  const config = sessionConfig();
-  assert.equal(config.model, 'eleven_realtime_v1_max');
-  assert.match(config.instructions, /ask_pi/);
-  assert.deepEqual(config.tools.map(t => t.name), ['ask_pi', 'pi_status', 'cancel_pi']);
-  assert.deepEqual(config.audio.input.format, { type: 'audio/pcm', rate: 24000 });
-  assert.equal(config.audio.input.turn_detection.interrupt_response, true);
-});
-
-test('start mints a scoped client secret and authenticates the socket with it, not the API key', async () => {
-  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
-  try {
-    const { voice, socket, mint } = await startVoice();
-    assert.equal(mint.url, 'https://api.elevenlabs.io/v1/convai/realtime/client_secrets');
-    assert.equal(mint.init.headers['xi-api-key'], 'test-not-a-real-key');
-    const body = JSON.parse(mint.init.body);
-    assert.equal(body.session.model, 'eleven_realtime_v1_max');
-    assert.equal(body.expires_after.seconds, 60);
-    assert.equal(socket.url, 'wss://api.elevenlabs.io/v1/convai/realtime');
-    assert.deepEqual(socket.protocols, ['realtime', 'openai-insecure-api-key.ek_test_secret']);
-    assert.ok(!JSON.stringify(socket.protocols).includes('test-not-a-real-key'));
-    voice.stop();
-  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
-});
-
-test('audio flows both ways; barge-in drops queued audio, truncates, and ignores late deltas', async () => {
-  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
-  try {
-    const { voice, socket, audio, input, output, played } = await startVoice();
-    const frame = Buffer.alloc(960, 3);
-    input(frame);
-    assert.deepEqual(socket.sent.at(-1), { type: 'input_audio_buffer.append', audio: frame.toString('base64') });
-    socket.event({ type: 'response.created', response: { id: 'r1' } });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', delta: Buffer.alloc(960 * 3).toString('base64') });
-    assert.equal(audio.enqueued.length, 1);
-    for (let i = 0; i < 3; i++) output(Buffer.alloc(960), true); // 60 ms written to the helper,
-    played(Buffer.alloc(960)); played(Buffer.alloc(960));          // of which the speaker played 40 ms
-    socket.event({ type: 'input_audio_buffer.speech_started' });
-    assert.equal(audio.interrupts, 1);
-    assert.deepEqual(socket.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'i1', content_index: 0, audio_end_ms: 40 });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', delta: Buffer.alloc(960).toString('base64') });
-    assert.equal(audio.enqueued.length, 1, 'late audio of the interrupted item is dropped');
-    voice.mute(true);
-    assert.deepEqual(audio.muted, [true]);
-    const n = socket.sent.length; input(frame);
-    assert.equal(socket.sent.length, n, 'muted mic sends nothing');
-    voice.stop(); voice.stop();
-    assert.equal(audio.stopped, 1);
-  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
-});
-
-test("truncation counts only the interrupted item's own heard audio, not the previous item's tail", async () => {
-  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
-  try {
-    const { voice, socket, played } = await startVoice();
-    socket.event({ type: 'response.output_audio.delta', item_id: 'a', response_id: 'r1', delta: Buffer.alloc(960 * 2).toString('base64') });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'b', response_id: 'r2', delta: Buffer.alloc(960 * 4).toString('base64') });
-    for (let i = 0; i < 3; i++) played(Buffer.alloc(960)); // a's 40 ms, then 20 ms of b
-    socket.event({ type: 'input_audio_buffer.speech_started' });
-    assert.deepEqual(socket.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'b', content_index: 0, audio_end_ms: 20 });
-    // After the flush the count restarts: the next item's heard audio is measured from zero.
-    socket.event({ type: 'response.output_audio.delta', item_id: 'c', response_id: 'r3', delta: Buffer.alloc(960 * 2).toString('base64') });
-    played(Buffer.alloc(960));
-    socket.event({ type: 'input_audio_buffer.speech_started' });
-    assert.deepEqual(socket.sent.at(-1), { type: 'conversation.item.truncate', item_id: 'c', content_index: 0, audio_end_ms: 20 });
-    voice.stop();
-  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
-});
-
-test('function calls return immediately and a response follows only when nobody is talking', async () => {
-  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
-  try {
-    const calls = [];
-    const { voice, socket, errors } = await startVoice({ tool: (name, args) => { calls.push([name, args]); return { status: 'started' }; } });
-    socket.event({ type: 'response.created', response: { id: 'r1' } });
-    socket.event({ type: 'response.done', response: { output: [{ type: 'function_call', call_id: 'c1', name: 'ask_pi', arguments: '{"request":"run the tests"}' }] } });
-    assert.deepEqual(calls, [['ask_pi', { request: 'run the tests' }]]);
-    const outputItem = socket.sent.find(e => e.type === 'conversation.item.create' && e.item.type === 'function_call_output');
-    assert.deepEqual(JSON.parse(outputItem.item.output), { status: 'started' });
-    assert.equal(socket.types().at(-1), 'response.create');
-    // Duplicate delivery of the same call is ignored.
-    socket.event({ type: 'response.done', response: { output: [{ type: 'function_call', call_id: 'c1', name: 'ask_pi', arguments: '{}' }] } });
-    assert.equal(calls.length, 1);
-    // A spoken notice while the user talks waits for the end of speech.
-    socket.event({ type: 'response.created', response: { id: 'r2' } });
-    socket.event({ type: 'response.done', response: { output: [] } });
-    socket.event({ type: 'input_audio_buffer.speech_started' });
-    voice.notify('Pi finished the task "run the tests". Pi\'s answer: all green');
-    assert.equal(socket.types().at(-1), 'conversation.item.create');
-    // Eleven Realtime ignores system items, so Pi updates are labelled user items.
-    assert.equal(socket.sent.at(-1).item.role, 'user');
-    assert.match(socket.sent.at(-1).item.content[0].text, /^\(Automatic update from Pi, not spoken by the user\.\) Pi finished/);
-    socket.event({ type: 'input_audio_buffer.speech_stopped' });
-    assert.equal(socket.types().at(-1), 'response.create');
-    // Racing a server-created response: retried once that response is done.
-    socket.event({ type: 'error', error: { code: 'conversation_already_has_active_response', message: 'Conversation already has an active response' } });
-    socket.event({ type: 'response.created', response: { id: 'r3' } });
-    const before = socket.types().filter(t => t === 'response.create').length;
-    socket.event({ type: 'response.done', response: { output: [] } });
-    assert.equal(socket.types().filter(t => t === 'response.create').length, before + 1);
-    assert.deepEqual(errors, []);
-    voice.stop();
-  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
-});
-
-test('ask_pi after a spoken preamble gets no second acknowledgement; pi_status always gets an answer', async () => {
-  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
-  try {
-    const { voice, socket, audio } = await startVoice({ tool: name => ({ name }) });
-    const creates = () => socket.types().filter(t => t === 'response.create').length;
-    const turn = (callId, name, spoken) => {
-      socket.event({ type: 'input_audio_buffer.speech_started' });
-      socket.event({ type: 'input_audio_buffer.speech_stopped' });
-      socket.event({ type: 'response.created', response: { id: `pre-${callId}` } });
-      if (spoken) socket.event({ type: 'response.output_audio.delta', item_id: `say-${callId}`, delta: Buffer.alloc(960).toString('base64') });
-      socket.event({ type: 'response.done', response: { output: [] } });
-      socket.event({ type: 'response.created', response: { id: `call-${callId}` } });
-      socket.event({ type: 'response.done', response: { output: [{ type: 'function_call', call_id: callId, name, arguments: '{}' }] } });
-    };
-    let n = creates(); turn('a', 'ask_pi', true);
-    assert.equal(creates(), n, '"Checking." already said: no second response');
-    // The server's own follow-up response is cancelled and its audio dropped.
-    socket.event({ type: 'response.created', response: { id: 'auto-a' } });
-    assert.deepEqual(socket.sent.at(-1), { type: 'response.cancel', response_id: 'auto-a' });
-    socket.event({ type: 'response.output_audio.delta', response_id: 'auto-a', item_id: 'x', delta: Buffer.alloc(960).toString('base64') });
-    socket.event({ type: 'response.done', response: { id: 'auto-a', status: 'cancelled', output: [] } });
-    n = creates(); turn('b', 'ask_pi', false);
-    assert.equal(creates(), n + 1, 'silent tool call still gets an acknowledgement');
-    socket.event({ type: 'response.created', response: { id: 'ack-b' } });
-    socket.event({ type: 'response.done', response: { output: [] } });
-    n = creates(); turn('c', 'pi_status', true);
-    assert.equal(creates(), n + 1, 'status needs its answer');
-    assert.equal(audio.enqueued.length, 2, 'only the two spoken preambles played; the cancelled auto-response did not');
-    voice.stop();
-  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
-});
-
-test('start surfaces key-resolution failures and cleans up exactly once', async () => {
-  let closed = 0;
-  const voice = new RealtimeVoice({ state() {}, samples() {}, error() {}, closed() { closed++; }, tool: () => ({}), busy: () => false }, () => assert.fail('audio must not start'));
-  await assert.rejects(
-    voice.start(() => { throw new Error('No ElevenLabs API key: add Keychain item "elevenlabs-api-key".'); }),
-    /elevenlabs-api-key/
-  );
-  assert.equal(closed, 1);
-  voice.stop();
-  assert.equal(closed, 1); // stop is idempotent
-});
-
 // ---------- OpenAI GPT-Live session (fake socket, no network or audio) ----------
 
-async function startLive({ tool = () => ({ ok: true }) } = {}) {
+async function startLive({ tool = () => ({ ok: true }), busy = () => false } = {}) {
   const audio = { enqueued: [], interrupts: 0, muted: [], stopped: 0 };
   const errors = [], captions = [];
   let audioHooks;
   globalThis.WebSocket = FakeSocket;
-  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), closed() {}, tool, busy: () => false }, hooks => {
+  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), closed() {}, tool, busy }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish() {},
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -382,33 +205,6 @@ test('GPT-Live captions follow the session clock and restart after the user spea
   } finally { globalThis.WebSocket = originalWS; }
 });
 
-test('ElevenLabs captions drop tags, split a sentence chunk into phrases, and skip barged-in text', async () => {
-  const originalFetch = globalThis.fetch, originalWS = globalThis.WebSocket;
-  try {
-    const { voice, socket, captions, played } = await startVoice();
-    // Eleven sends a whole sentence ahead of its audio; its phrases are spread over that audio.
-    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: '[Tone] Twenty pass, two fail.' });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: voiced(20).toString('base64') });
-    socket.event({ type: 'response.output_audio.done', item_id: 'i1', response_id: 'r1' }); // the span is now known
-    played(voiced(1)); // the device reports finishing a frame; write time alone would not move the caption
-    assert.deepEqual(captions.at(-1), 'Twenty pass,');
-    for (let i = 0; i < 12; i++) played(voiced(1));
-    assert.deepEqual(captions.at(-1), 'two fail.');
-    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i1', response_id: 'r1', delta: ' Never said.' });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i1', response_id: 'r1', delta: voiced(10).toString('base64') });
-    socket.event({ type: 'response.output_audio.done', item_id: 'i1', response_id: 'r1' });
-    socket.event({ type: 'input_audio_buffer.speech_started' }); // barge-in before "Never said." plays
-    for (let i = 0; i < 10; i++) played(voiced(1));
-    assert.ok(!captions.includes('Never said.'));
-    socket.event({ type: 'response.output_audio_transcript.delta', item_id: 'i2', response_id: 'r2', delta: 'Stopped.' });
-    socket.event({ type: 'response.output_audio.delta', item_id: 'i2', response_id: 'r2', delta: voiced(5).toString('base64') });
-    socket.event({ type: 'response.output_audio.done', item_id: 'i2', response_id: 'r2' });
-    played(voiced(1));
-    assert.deepEqual(captions.at(-1), 'Stopped.');
-    voice.stop();
-  } finally { globalThis.fetch = originalFetch; globalThis.WebSocket = originalWS; }
-});
-
 test('captions split at commas, semicolons, colons, dashes, and sentence ends', () => {
   const text = 'Twenty pass, two fail; both in the parser: one fixed — the other needs you. Done.';
   const at = cursor => phraseAt(text, cursor).phrase;
@@ -448,26 +244,6 @@ test('voiced time ignores silence and breaths', () => {
   assert.equal(voicedMs(Buffer.concat([voiced(2), Buffer.alloc(960 * 3)]), 24000), 40);
 });
 
-test('a transcript burst ahead of its audio paces every sentence in order', () => {
-  const shown = [];
-  const captions = new Captions(line => shown.push(line.phrase));
-  // The whole paragraph arrives as several deltas before any audio: every stamp ties,
-  // and the old pacing jumped straight into the last delta's text.
-  captions.text('Twenty pass, ');
-  captions.text('two fail; ');
-  captions.text('one is flaky.');
-  captions.queued(voiced(20), 24000); // 400 ms of the paragraph's audio, all at once
-  captions.done();                     // the item's audio is fully queued: the span is known
-  const hear = frames => { for (let i = 0; i < frames; i++) captions.played(voiced(1), 24000); };
-  hear(1);
-  assert.equal(shown.at(-1), 'Twenty pass,');
-  hear(9); // 200 ms heard: halfway through the queued span
-  assert.equal(shown.at(-1), 'two fail;');
-  hear(8); // 360 ms heard
-  assert.equal(shown.at(-1), 'one is flaky.');
-  assert.ok(!shown.slice(0, 2).includes('one is flaky.'), 'the last sentence never jumps the queue');
-});
-
 test('a streaming response keeps the caption with the voice, not the delivery', () => {
   const shown = [];
   const captions = new Captions(line => shown.push(line.phrase));
@@ -484,17 +260,6 @@ test('a streaming response keeps the caption with the voice, not the delivery', 
   for (let i = 0; i < 4; i++) step(); // 1800 ms heard
   assert.equal(shown.at(-1), 'one is flaky.');
   assert.ok(!shown.slice(0, 5).includes('one is flaky.'), 'the last sentence never jumps ahead of the voice');
-});
-
-test('closing a span never pulls the caption back', () => {
-  const shown = [];
-  const captions = new Captions(line => shown.push(line.phrase));
-  captions.text('Twenty pass, two fail.');           // 22 chars
-  captions.queued(voiced(154), 24000);               // 3080 ms: a slow voice, longer than the prior rate expects
-  for (let i = 0; i < 50; i++) captions.played(voiced(1), 24000); // 1000 ms heard
-  assert.equal(shown.at(-1), 'two fail.');           // the prior rate places the cursor ~14 chars in
-  captions.done();                                    // the real span turns out much longer
-  assert.equal(shown.at(-1), 'two fail.', 'the caption never snaps back');
 });
 
 test('GPT-Live fragments pace by their server ranges against played output audio', () => {
@@ -568,16 +333,13 @@ test('GPT-Live appends are clipped by a pessimistic token estimate, not characte
   assert.ok(clipTokens('1234567890'.repeat(100), 400).length <= 401);
 });
 
-test('GPT-Live config comes from providers/openai-live/ with Responses delegation to the Pi tools', () => {
+test('GPT-Live config comes from providers/openai-live/ and delegates to the Pi session', () => {
   const config = liveSessionConfig();
   assert.equal(config.model, 'gpt-live-1');
   assert.match(config.instructions, /<\|SpawnThinking\|>/);
   assert.deepEqual(config.audio, { format: { type: 'audio/pcm', rate: 24000 }, output: { voice: 'vesper' } });
   assert.doesNotMatch(config.instructions, /\n\nVoice: /);
-  assert.equal(config.delegation.type, 'responses');
-  assert.deepEqual(config.delegation.responses.tools.map(t => t.name), ['ask_pi', 'pi_status', 'cancel_pi']);
-  assert.match(config.delegation.responses.instructions, /pi_status/);
-  assert.equal(config.delegation.responses.parallel_tool_calls, false);
+  assert.deepEqual(config.delegation, { type: 'client' });
 });
 
 test('GPT-Live authenticates with a header, starts the session, and streams audio both ways', async () => {
@@ -608,37 +370,119 @@ test('GPT-Live authenticates with a header, starts the session, and streams audi
   } finally { globalThis.WebSocket = originalWS; }
 });
 
+const settle = () => new Promise(r => setTimeout(r, 400)); // trailing transcript fragments get 350 ms
+const lastOf = (socket, type) => socket.sent.filter(e => e.type === type).at(-1);
+
+test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s result answers it', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const calls = [];
+    const { voice, socket, audio, output } = await startLive({ tool: (name, args) => { calls.push([name, args]); return { status: 'started' }; } });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Run the tests ', start_ms: 1000, end_ms: 1800 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'On it.', start_ms: 1850, end_ms: 2000 }); // the voice acknowledges
+    const spoken = Buffer.alloc(960); spoken.writeInt16LE(5000, 100);
+    output(spoken, true); // and is audibly playing
+    socket.event({ type: 'session.delegation.created', offset_ms: 1900, delegation: { id: 'd1', type: 'delegation', target: 'client' } });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'in the voice repo.', start_ms: 1800, end_ms: 2400 }); // trails the delegation
+    await settle();
+    assert.equal(audio.interrupts, 0, 'a straggling fragment of the request does not cut off the acknowledgement');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'ask_pi');
+    assert.equal(calls[0][1].when, 'now');
+    assert.match(calls[0][1].request, /^Voice request \(speech transcript; may contain recognition errors\): Run the tests in the voice repo\.$/);
+    assert.deepEqual([lastOf(socket, 'session.thinking.append').delegation_id], ['d1'], 'GPT-Live learns that Pi took it');
+    // Pi's progress and result go back on the same delegation.
+    voice.context('Pi is working on "run the tests"; it just ran bash: npm test.');
+    assert.equal(lastOf(socket, 'session.thinking.append').delegation_id, 'd1');
+    voice.notify('Pi finished the task. Pi\'s answer: 47 pass, none fail.');
+    assert.deepEqual([lastOf(socket, 'session.commentary.append').delegation_id, lastOf(socket, 'session.commentary.append').content], ['d1', 'Pi finished the task. Pi\'s answer: 47 pass, none fail.']);
+    // The next delegation takes only what was said after the first one.
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Then commit.', start_ms: 5000, end_ms: 5600 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 5700, delegation: { id: 'd2', type: 'delegation', target: 'client' } });
+    await settle();
+    // It is short, so it carries what the voice said before it (not after).
+    assert.match(calls[1][1].request, /: Then commit\.\n\(The voice assistant had just said: "On it\."\)$/);
+    assert.ok(socket.sent.every(e => typeof e.event_id === 'string'), 'every client event carries an event_id');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('Pi status and notices name the spoken words, not the voice framing', () => {
+  const { bridge, sent, notices, control } = fakePi();
+  bridge.call('ask_pi', { request: `${VOICE_REQUEST}Yes, do it.\n(The voice assistant had just said: "Shall Pi fix it?")` });
+  assert.equal(sent[0][0].startsWith(VOICE_REQUEST), true, 'Pi itself gets the framing');
+  control.idle = false;
+  assert.equal(bridge.status().task, 'Yes, do it.');
+  bridge.settled(false);
+  assert.match(notices[0], /^Pi finished the task "Yes, do it"/);
+});
+
+test('a short reply reaches Pi with what the voice had just said', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const calls = [];
+    const { voice, socket } = await startLive({ tool: (name, args) => { calls.push([name, args]); return { status: 'started' }; } });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'The build fails on a missing import. Shall Pi fix it?', start_ms: 0, end_ms: 2000 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Yes, do it.', start_ms: 2500, end_ms: 3000 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 3100, delegation: { id: 'd1' } });
+    await settle();
+    assert.match(calls[0][1].request, /Yes, do it\.\n\(The voice assistant had just said: "The build fails on a missing import\. Shall Pi fix it\?"\)$/);
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('while Pi works, "stop" aborts it and a status question is answered without disturbing it', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const calls = [];
+    const tool = (name, args) => {
+      calls.push(name);
+      if (name === 'cancel_pi') return { status: 'cancelled' };
+      if (name === 'pi_status') return { state: 'working', task: 'run the tests', elapsed_s: 42, last_tool: 'bash: npm test' };
+      return { status: 'steered' };
+    };
+    const { voice, socket } = await startLive({ tool, busy: () => true });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'What is Pi doing?', start_ms: 0, end_ms: 800 });
+    socket.event({ type: 'session.delegation.created', delegation: { id: 'd1' } });
+    await settle();
+    assert.deepEqual(calls, ['pi_status']);
+    assert.equal(lastOf(socket, 'session.commentary.append').content, 'Pi is working on "run the tests" for 42 seconds; last step: bash: npm test.');
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Stop that.', start_ms: 1000, end_ms: 1500 });
+    socket.event({ type: 'session.delegation.created', delegation: { id: 'd2' } });
+    await settle();
+    assert.deepEqual(calls, ['pi_status', 'cancel_pi']);
+    assert.deepEqual([lastOf(socket, 'session.commentary.append').delegation_id, lastOf(socket, 'session.commentary.append').content], ['d2', "Pi's task is cancelled."]);
+    // Anything else while Pi works steers the running task.
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Also run the linter.', start_ms: 2000, end_ms: 2800 });
+    socket.event({ type: 'session.delegation.created', delegation: { id: 'd3' } });
+    await settle();
+    assert.deepEqual(calls, ['pi_status', 'cancel_pi', 'ask_pi']);
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('stop and status phrases are matched narrowly', () => {
+  const stop = ['stop', 'Stop that.', 'cancel it', 'never mind', 'please stop', 'abort the task!'];
+  const notStop = ['stop the server and restart it', 'cancel my 3pm meeting in the calendar file', 'stop using tabs in config.ts'];
+  const status = ['What is Pi doing?', "how's it going", 'is it done?', 'any progress', 'status'];
+  const notStatus = ['what is Pi doing wrong in the parser? fix it', 'show the git status and commit everything that changed today'];
+  const re = name => new RegExp(String(liveSource.match(new RegExp(`const ${name} = /(.*)/i;`))[1]), 'i');
+  for (const text of stop) assert.ok(re('STOP_REQUEST').test(text), text);
+  for (const text of notStop) assert.ok(!re('STOP_REQUEST').test(text), text);
+  for (const text of status) assert.ok(re('STATUS_REQUEST').test(text), text);
+  for (const text of notStatus) assert.ok(!re('STATUS_REQUEST').test(text), text);
+});
+
+test('Pi status reads as one sentence for the voice', () => {
+  assert.equal(describeStatus({ state: 'idle' }), 'Pi is idle.');
+  assert.equal(describeStatus({ state: 'waiting_for_approval', task: 'deploy' }), 'Pi is waiting for the user to answer a prompt in the terminal on "deploy".');
+});
+
 test('GPT-Live silence frames do not count as speech', () => {
   const quiet = Buffer.alloc(960); quiet.writeInt16LE(120, 10);
   const speech = Buffer.alloc(960); speech.writeInt16LE(-4000, 300);
   assert.equal(audibleFrame(quiet), false);
   assert.equal(audibleFrame(speech), true);
-});
-
-test('GPT-Live backend function calls run the Pi tools and continue the response once', async () => {
-  const originalWS = globalThis.WebSocket;
-  try {
-    const calls = [];
-    const { voice, socket } = await startLive({ tool: (name, args) => { calls.push([name, args]); return { status: 'started' }; } });
-    socket.event({ type: 'session.delegation.created', delegation: { id: 'd1', type: 'delegation', target: 'responses' } });
-    const done = { type: 'response.output_item.done', item: { type: 'function_call', call_id: 'c1', name: 'ask_pi', arguments: '{"request":"run the tests"}' } };
-    socket.event({ type: 'response.event', delegation_id: 'd1', event: done });
-    socket.event({ type: 'response.event', delegation_id: 'd1', event: done }); // duplicate delivery
-    assert.deepEqual(calls, [['ask_pi', { request: 'run the tests' }]]);
-    const result = socket.sent.find(e => e.type === 'response.item.create');
-    assert.deepEqual(result.item, { type: 'function_call_output', call_id: 'c1', output: '{"status":"started"}' });
-    assert.equal(socket.sent.filter(e => e.type === 'response.create').length, 0, 'continue only after the response completes');
-    socket.event({ type: 'response.event', delegation_id: 'd1', event: { type: 'response.completed', response: { output: [] } } });
-    socket.event({ type: 'response.event', delegation_id: 'd1', event: { type: 'response.completed', response: { output: [] } } });
-    assert.equal(socket.sent.filter(e => e.type === 'response.create').length, 1);
-    // Pi updates: spoken commentary and silent thinking, both session-wide.
-    voice.notify('Pi finished the task "run the tests". Pi\'s answer: 23 pass.');
-    assert.deepEqual([socket.sent.at(-1).type, socket.sent.at(-1).delegation_id], ['session.commentary.append', null]);
-    voice.context('Pi is working on "run the tests"; it just ran bash: npm test.');
-    assert.equal(socket.sent.at(-1).type, 'session.thinking.append');
-    assert.ok(socket.sent.every(e => typeof e.event_id === 'string'), 'every client event carries an event_id');
-    voice.stop();
-  } finally { globalThis.WebSocket = originalWS; }
 });
 
 // ---------- Pi bridge (fake Pi host and context) ----------
@@ -746,7 +590,6 @@ test('tool descriptions are one bounded line', () => {
   assert.equal(describeTool('bash', { command: 'git\n  status' }), 'bash: git status');
   assert.equal(describeTool('custom', {}), 'custom');
   assert.ok(describeTool('bash', { command: 'x'.repeat(500) }).length <= 160);
-  assert.deepEqual(PI_TOOLS.map(t => t.parameters.required), [['request'], [], []]);
 });
 
 test('echo cancellation defaults on and the helper binary is cached by source hash', () => {
@@ -822,12 +665,10 @@ test('user overrides merge into session.json and replace Markdown files', async 
   const user = await mkdtemp(join(tmpdir(), 'pi-voice-overrides-'));
   try {
     await writeFile(join(user, 'session.json'), JSON.stringify({ voice: { id: 'voice_custom', description: 'Calm baritone.' } }));
-    await writeFile(join(user, 'backend.md'), 'Custom backend.');
     const config = liveSessionConfig(providerFiles('openai-live', { user }));
     assert.equal(config.model, 'gpt-live-1'); // untouched keys keep the packaged default
     assert.deepEqual(config.audio.output, { voice: { id: 'voice_custom' } });
     assert.match(config.instructions, /<\|SpawnThinking\|>[\s\S]*\n\nVoice: Calm baritone\.$/);
-    assert.equal(config.delegation.responses.instructions, 'Custom backend.');
   } finally { await rm(user, { recursive: true, force: true }); }
 });
 

@@ -2,12 +2,12 @@
 
 ![pi-voice: the voice bar listening, thinking, and speaking](https://raw.githubusercontent.com/lprsrts/pi-voice/main/assets/cover.png)
 
-**Talk to your coding agent.** Full-duplex voice for [Pi](https://pi.dev) on macOS. Say what you want; a realtime voice model hands the work to the Pi session in your terminal and tells you the outcome when it's done.
+**Talk to your coding agent.** Full-duplex voice for [Pi](https://pi.dev) on macOS. OpenAI GPT-Live is the voice; your Pi session is its backend. Say what you want and Pi does it with its own model, tools, and local environment, then the voice tells you the outcome.
 
-- **Not dictation:** a conversation. The voice model starts, steers, checks on, and cancels Pi tasks for you. Every request shows up in the Pi session, and Pi's permission prompts work as usual.
+- **Pi is the brain:** your words go straight to the Pi session in your terminal. It works with whatever model you picked (`/model`), all its tools, and its permission prompts, and every request shows up in the session.
+- **GPT-Live is the voice:** realtime, full-duplex speech. Ask what Pi is doing, add to the task, or say "stop" while it works.
 - **Use your speakers:** echo cancellation keeps the agent from hearing itself. Headphones are optional.
 - **Interrupt any time:** talk over the agent and it stops. Switching audio devices (e.g. AirPods connecting) mid-session just works.
-- **Two providers:** ElevenLabs Eleven Realtime or OpenAI GPT-Live.
 
 For local speech-to-text into the editor, use the official `@earendil-works/pi-voice` instead. The two install side by side; this package's command is `/talk`.
 
@@ -17,7 +17,7 @@ For local speech-to-text into the editor, use the official `@earendil-works/pi-v
    ```sh
    pi install npm:@lprsrts/pi-voice
    ```
-2. Add an API key for one provider (see [API keys](#api-keys)).
+2. Add your OpenAI API key (see [API key](#api-key)).
 3. In Pi:
    ```text
    /talk start
@@ -29,43 +29,40 @@ The first start takes a little longer (up to ~40 s) while the audio helper is bu
 
 - macOS 14+, Pi, Node 24+.
 - Xcode Command Line Tools (`xcode-select --install`).
-- An ElevenLabs or OpenAI API key.
+- An OpenAI API key with billing (GPT-Live).
 
 ## Cost
 
-The package is free (MIT). Voice sessions are billed by the provider to your API key:
+The package is free (MIT). Two things cost money:
 
-- **ElevenLabs:** Eleven Realtime per-minute pricing plus tokens, on your ElevenLabs plan.
-- **OpenAI GPT-Live:** $0.05 per minute plus model tokens. Needs API billing; a ChatGPT plan does not cover it.
+- **The voice:** GPT-Live, $0.05 per minute, billed to your OpenAI API key. A ChatGPT plan does not cover it (OpenAI rejects plan sign-ins for GPT-Live).
+- **The work:** whatever your Pi model costs, exactly as when you type. Pi uses your configured provider; no extra model runs in between.
 
-ElevenLabs sessions end after 60 minutes. `/talk mute` keeps the session open (and billable); `/talk stop` ends it.
+`/talk mute` keeps the session open (and billable); `/talk stop` ends it.
+
+## How it works
+
+When GPT-Live decides your request needs real work, it hands it off, and pi-voice sends what you said to Pi as a message. While Pi works, its progress reaches the voice silently, so "what's Pi doing?" gets an answer without interrupting it. Saying something else adds to the running task, and "stop" or "cancel" stops it. When Pi finishes, the voice says the result. While a voice session runs, Pi is told that its answers are spoken, so it ends with a short, speakable summary.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `/talk start [elevenlabs\|openai-live]` | Start a voice session (default: ElevenLabs). |
+| `/talk start` | Start a voice session with this Pi session as the backend. |
 | `/talk stop` | End the session. A Pi task it started keeps running. |
 | `/talk mute` / `/talk unmute` | Stop or resume the microphone. |
 | `/talk captions [on\|off]` | Show what the agent is saying, phrase by phrase, timed to the audio the speaker actually plays. Off by default; no argument toggles. |
-| `/talk check` | Show setup status: audio helper, devices, API keys, settings. No network or microphone use. |
+| `/talk check` | Show setup status: audio helper, devices, API key, Pi's backend model, settings. No network or microphone use. |
 | `/talk devices` | Show the input and output in use (the macOS defaults). |
 | `/talk tone [hz]` | Play a test tone. |
 | `/talk mic-test [seconds]` | Record a short clip, report its level, and play it back. Nothing leaves your Mac. |
 | `/talk-preview [listening\|thinking\|speaking\|…\|off]` | Preview the voice bar without a session. |
 
-## API keys
+## API key
 
-Set an environment variable, or store the key in your login keychain (the environment variable wins if both exist):
-
-| Provider | Environment variable | Keychain service |
-|---|---|---|
-| ElevenLabs | `ELEVENLABS_API_KEY` | `elevenlabs-api-key` |
-| OpenAI GPT-Live | `OPENAI_API_KEY` | `openai-api-key` |
+Set `OPENAI_API_KEY`, or store the key in your login keychain as `openai-api-key` (the environment variable wins if both exist). OpenAI keys are too long for the `security` prompt, so copy the key, then run:
 
 ```sh
-security add-generic-password -U -s "elevenlabs-api-key" -a "$USER" -l "ElevenLabs API key" -w
-# OpenAI keys are too long for that prompt: copy the key, then
 security add-generic-password -U -s "openai-api-key" -a "$USER" -l "OpenAI API key" -w "$(pbpaste)" && pbcopy </dev/null
 ```
 
@@ -75,26 +72,18 @@ Keys are read only when a session starts and are never logged. Audio and transcr
 
 | Environment variable | Effect |
 |---|---|
-| `PI_VOICE_PROVIDER` | Provider for `/talk start` without an argument (`elevenlabs` or `openai-live`). |
 | `PI_VOICE_CAPTIONS=1` | Start with captions on. |
 | `PI_VOICE_AEC=0` | Turn off echo cancellation (headphones only, or the agent hears itself). |
 | `PI_VOICE_CONFIG_DIR` | Where your overrides live (see below). |
 
 ## Voice and persona
 
-Override a provider's defaults by putting files in `~/.pi/agent/pi-voice/<provider>/` (under `$PI_CODING_AGENT_DIR` if you set it, or `$PI_VOICE_CONFIG_DIR/<provider>/`). `/talk check` shows the directory.
+The backend model is Pi's: switch it with `/model` as usual. For the voice, put files in `~/.pi/agent/pi-voice/openai-live/` (under `$PI_CODING_AGENT_DIR` if you set it, or `$PI_VOICE_CONFIG_DIR/openai-live/`). `/talk check` shows the directory.
 
-- `session.json`: only the top-level keys you set change. To pick a voice:
-  - ElevenLabs: `{ "voice": "<voice id>" }`
-  - GPT-Live: `{ "voice": "<built-in voice name>" }`, or a custom voice: `{ "voice": { "id": "voice_…", "description": "<its design prompt>" } }`
-  - ElevenLabs turn-taking: set `eagerness` to `"low"` if the agent cuts in too early, `"high"` if it waits too long. Keep the other fields, since the whole `turn_detection` object is replaced:
-    ```json
-    { "turn_detection": { "type": "semantic_vad", "eagerness": "low", "create_response": true, "interrupt_response": true } }
-    ```
-- `instructions.md`: replaces the voice persona.
-- `backend.md` (GPT-Live only): replaces the prompt of the model that talks to Pi.
+- `session.json`: only the top-level keys you set change. To pick a voice, use `{ "voice": "<built-in voice name>" }`, or a custom voice: `{ "voice": { "id": "voice_…", "description": "<its design prompt>" } }`.
+- `instructions.md`: replaces the voice persona and its rules for handing work to Pi.
 
-The defaults are in [`providers/`](providers).
+The defaults are in [`providers/openai-live/`](providers/openai-live).
 
 ## Troubleshooting
 

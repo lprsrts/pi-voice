@@ -1,35 +1,16 @@
-// The voice model is Pi's mouth and ears; Pi's own agent does the work. These
-// three tools hand requests to Pi, report what it is doing, and stop it. Pi's
-// tools, permission prompts, and session transcript stay exactly as in the TUI.
+// The voice model is Pi's mouth and ears; Pi's own agent does the work. The
+// bridge hands requests to Pi (ask_pi), reports what it is doing (pi_status),
+// and stops it (cancel_pi). Pi's tools, permission prompts, and session
+// transcript stay exactly as in the TUI.
 
-/** Function tools sent to the Realtime session (OpenAI function-tool shape). */
-export const PI_TOOLS = [
-  {
-    type: "function",
-    name: "ask_pi",
-    description: "Hand a request to Pi, the coding agent running in the user's terminal, which has the real access: files, shell, git, Basic Memory, the web. Returns immediately; Pi works in the background and an automatic update from Pi arrives with the result.",
-    parameters: {
-      type: "object",
-      properties: {
-        request: { type: "string", description: "The request in the user's own words, plus any context from this conversation Pi needs." },
-        when: { type: "string", enum: ["now", "after"], description: "Only matters while Pi is busy. now: add to or correct the running task. after: queue as the next task. Default after." },
-      },
-      required: ["request"],
-    },
-  },
-  {
-    type: "function",
-    name: "pi_status",
-    description: "What Pi is doing right now: current request, last tool it ran, elapsed time, queued requests, whether it waits for approval in the terminal.",
-    parameters: { type: "object", properties: {}, required: [] },
-  },
-  {
-    type: "function",
-    name: "cancel_pi",
-    description: "Stop Pi's running task. Use when the user says stop, cancel, or never mind about Pi's work.",
-    parameters: { type: "object", properties: {}, required: [] },
-  },
-] as const;
+// Added to Pi's system prompt while a voice session runs: Pi is the backend of
+// the voice, so its answers are heard rather than read.
+export const VOICE_PROMPT = [
+  "A live voice front end (GPT-Live) is connected to this session. It hears the user, hands their requests to you, and speaks your final answer aloud, possibly paraphrased.",
+  "Messages that start with \"Voice request\" are speech transcripts: they can contain recognition errors, missing punctuation, or half-finished phrases. Interpret them sensibly from the conversation; ask only if you truly cannot act.",
+  "Do the work exactly as you would for typed requests, with your usual tools and care.",
+  "End with a short answer meant to be spoken: the outcome first, one to three sentences, no code, paths, tables, or long lists unless asked. Details stay in the terminal.",
+].join("\n");
 
 /** The parts of Pi's ExtensionAPI and ExtensionContext the bridge needs (keeps it testable). */
 export type PiHost = {
@@ -47,6 +28,11 @@ export type Notice = (text: string) => void;
 export type Progress = (text: string) => void;
 
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 1)}…` : text;
+
+/** How a voice request is introduced to Pi (the system prompt section explains it). */
+export const VOICE_REQUEST = "Voice request (speech transcript; may contain recognition errors): ";
+/** The user's words of a request, without the voice framing, for status and notices. */
+const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split("\n(The voice assistant")[0] : request;
 
 /** One-line, bounded description of a tool call for pi_status. */
 export function describeTool(name: string, args: unknown): string {
@@ -91,7 +77,7 @@ export class PiBridge {
     this.progress = progress;
   }
 
-  /** Dispatches a Realtime function call; results are JSON-serializable and returned immediately. */
+  /** Dispatches a bridge call by name; results are JSON-serializable and returned immediately. */
   call(name: string, args: Record<string, unknown>): object {
     if (name === "ask_pi") return this.ask(String(args.request ?? ""), args.when === "now" ? "now" : "after");
     if (name === "pi_status") return this.status();
@@ -104,7 +90,7 @@ export class PiBridge {
     if (!request) return { error: "Empty request; ask the user what Pi should do." };
     request = clip(request, 4000);
     if (this.control.isIdle()) {
-      this.task = request;
+      this.task = spokenPart(request);
       this.startedAt = this.now();
       this.lastTool = undefined;
       this.lastText = "";
@@ -132,7 +118,7 @@ export class PiBridge {
       elapsed_s: this.startedAt ? Math.round((this.now() - this.startedAt) / 1000) : undefined,
       last_tool: this.lastTool,
       latest_text: this.lastText ? clip(this.lastText, 400) : undefined,
-      queued: this.queued.length ? this.queued.map(q => clip(q, 120)) : undefined,
+      queued: this.queued.length ? this.queued.map(q => clip(spokenPart(q), 120)) : undefined,
       approval: this.approval,
     };
   }
@@ -168,7 +154,7 @@ export class PiBridge {
     if (m?.role === "user" && this.queued.length) {
       const content = typeof m.content === "string" ? m.content : assistantText({ role: "assistant", content: m.content });
       const index = this.queued.findIndex(q => content.includes(q.slice(0, 200)));
-      if (index !== -1) this.task = this.queued.splice(index, 1)[0];
+      if (index !== -1) this.task = spokenPart(this.queued.splice(index, 1)[0]);
     }
   }
 
