@@ -1,6 +1,6 @@
 {
   "name": "@lprsrts/pi-voice",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Talk to your coding agent: full-duplex GPT-Live voice for Pi on macOS, with your Pi session (its model, tools, and local environment) as the backend",
   "keywords": [
     "pi-package",
