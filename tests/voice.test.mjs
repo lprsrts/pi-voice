@@ -7,7 +7,7 @@ import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
 import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
-import { PiBridge, describeTool, VOICE_REQUEST } from '../pi-bridge.ts';
+import { PiBridge, describeTool, VOICE_REQUEST, sessionBriefing } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
@@ -392,10 +392,10 @@ test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s r
     assert.match(calls[0][1].request, /^Voice request \(speech transcript; may contain recognition errors\): Run the tests in the voice repo\.$/);
     assert.deepEqual([lastOf(socket, 'session.thinking.append').delegation_id], ['d1'], 'GPT-Live learns that Pi took it');
     // Pi's progress and result go back on the same delegation.
-    voice.context('Pi is working on "run the tests"; it just ran bash: npm test.');
+    voice.context('Progress on my task "run the tests": I just ran bash: npm test.');
     assert.equal(lastOf(socket, 'session.thinking.append').delegation_id, 'd1');
-    voice.notify('Pi finished the task. Pi\'s answer: 47 pass, none fail.');
-    assert.deepEqual([lastOf(socket, 'session.commentary.append').delegation_id, lastOf(socket, 'session.commentary.append').content], ['d1', 'Pi finished the task. Pi\'s answer: 47 pass, none fail.']);
+    voice.notify('I finished the task. My answer: 47 pass, none fail.');
+    assert.deepEqual([lastOf(socket, 'session.commentary.append').delegation_id, lastOf(socket, 'session.commentary.append').content], ['d1', 'I finished the task. My answer: 47 pass, none fail.']);
     // The next delegation takes only what was said after the first one.
     socket.event({ type: 'session.input_transcript.delta', delta: 'Then commit.', start_ms: 5000, end_ms: 5600 });
     socket.event({ type: 'session.delegation.created', offset_ms: 5700, delegation: { id: 'd2', type: 'delegation', target: 'client' } });
@@ -414,7 +414,7 @@ test('Pi status and notices name the spoken words, not the voice framing', () =>
   control.idle = false;
   assert.equal(bridge.status().task, 'Yes, do it.');
   bridge.settled(false);
-  assert.match(notices[0], /^Pi finished the task "Yes, do it"/);
+  assert.match(notices[0], /^I finished the task "Yes, do it"/);
 });
 
 test('a complete request goes to Pi at once; an incomplete one waits briefly for its last words', async () => {
@@ -464,12 +464,12 @@ test('while Pi works, "stop" aborts it and a status question is answered without
     socket.event({ type: 'session.delegation.created', delegation: { id: 'd1' } });
     await settle();
     assert.deepEqual(calls, ['pi_status']);
-    assert.equal(lastOf(socket, 'session.commentary.append').content, 'Pi is working on "run the tests" for 42 seconds; last step: bash: npm test.');
+    assert.equal(lastOf(socket, 'session.commentary.append').content, 'I\'m working on "run the tests" for 42 seconds; last step: bash: npm test.');
     socket.event({ type: 'session.input_transcript.delta', delta: 'Stop that.', start_ms: 1000, end_ms: 1500 });
     socket.event({ type: 'session.delegation.created', delegation: { id: 'd2' } });
     await settle();
     assert.deepEqual(calls, ['pi_status', 'cancel_pi']);
-    assert.deepEqual([lastOf(socket, 'session.commentary.append').delegation_id, lastOf(socket, 'session.commentary.append').content], ['d2', "Pi's task is cancelled."]);
+    assert.deepEqual([lastOf(socket, 'session.commentary.append').delegation_id, lastOf(socket, 'session.commentary.append').content], ['d2', 'I stopped the task.']);
     // Anything else while Pi works steers the running task.
     socket.event({ type: 'session.input_transcript.delta', delta: 'Also run the linter.', start_ms: 2000, end_ms: 2800 });
     socket.event({ type: 'session.delegation.created', delegation: { id: 'd3' } });
@@ -495,10 +495,64 @@ test('a delegation takes only the latest turn: a question the voice answered its
   } finally { globalThis.WebSocket = originalWS; }
 });
 
+test('a new voice session is briefed from the Pi session, in the first person', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    globalThis.WebSocket = FakeSocket;
+    const voice = new LiveVoice({ state() {}, samples() {}, error() {}, closed() {}, tool: () => ({}), busy: () => false, briefing: () => 'What I know about this session: I fixed the parser.' }, () => ({ start() {}, enqueue() {}, finish() {}, interrupt() {}, mute() {}, stop() {} }));
+    const started = voice.start(() => 'test-not-a-real-key');
+    await new Promise(r => setImmediate(r));
+    FakeSocket.last.dispatchEvent(new Event('open'));
+    const instructions = FakeSocket.last.sent[0].session.instructions;
+    assert.match(instructions, /^You are Pi, the coding agent/);
+    assert.match(instructions, /first person/);
+    assert.match(instructions, /\n\nWhat I know about this session: I fixed the parser\.$/);
+    FakeSocket.last.event({ type: 'session.started', session: {} });
+    await started;
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the briefing keeps the newest turns, marks spoken requests, and says what is running', () => {
+  const message = (role, text) => ({ type: 'message', message: role === 'user' ? { role, content: text } : { role, content: [{ type: 'text', text }] } });
+  const entries = [
+    message('user', 'an old request that the compaction summary replaces'),
+    { type: 'compaction', summary: 'Set up the repo and fixed lint.' },
+    message('user', 'fix the parser'), message('assistant', 'Fixed the off-by-one in the parser.'),
+    message('user', `${VOICE_REQUEST}run the tests\n(Just before, the voice assistant said: "Done.")`),
+    { type: 'model_change' },
+  ];
+  const text = sessionBriefing(entries, { cwd: '/repo', status: { state: 'working', task: 'run the tests', last_tool: 'bash: npm test' } });
+  assert.doesNotMatch(text, /an old request/);
+  assert.match(text, /Earlier in this session \(summary\): Set up the repo and fixed lint\./);
+  assert.match(text, /- The user \(typed\): fix the parser\n- Me: Fixed the off-by-one in the parser\.\n- The user \(spoken\): run the tests\n/);
+  assert.match(text, /Right now I'm still working on "run the tests"; last step: bash: npm test\. Its result will arrive as an update\.$/);
+  assert.match(sessionBriefing([], {}), /Nothing has been said in this session yet\.\nRight now nothing is running\.$/);
+  const long = Array.from({ length: 200 }, (_, i) => message('user', `request ${i} ${'x'.repeat(200)}`));
+  const trimmed = sessionBriefing(long, {});
+  assert.ok(trimmed.length < 4600, `briefing is bounded (${trimmed.length})`);
+  assert.match(trimmed, /request 199/, 'the newest turns are kept');
+});
+
+test('a voice session started mid-task adopts it, so its result is still announced', () => {
+  const { bridge, notices, control } = fakePi({ idle: false });
+  bridge.adopt(`${VOICE_REQUEST}deploy the site`, 'Built it.');
+  assert.equal(bridge.status().task, 'deploy the site');
+  bridge.messageEnd({ role: 'assistant', content: [{ type: 'text', text: 'Deployed.' }] });
+  control.idle = true;
+  bridge.settled(false);
+  assert.equal(notices.at(-1), 'I finished the task "deploy the site". My answer: Deployed.');
+  const idle = fakePi();
+  idle.bridge.adopt('old request', 'Last answer.');
+  assert.equal(idle.bridge.status().last_result, 'Last answer.', 'an idle session only remembers the last answer');
+  idle.bridge.settled(false);
+  assert.equal(idle.notices.length, 0, 'nothing to announce');
+});
+
 test('stop and status phrases are matched narrowly', () => {
   const stop = ['stop', 'Stop that.', 'cancel it', 'never mind', 'please stop', 'abort the task!'];
   const notStop = ['stop the server and restart it', 'cancel my 3pm meeting in the calendar file', 'stop using tabs in config.ts'];
-  const status = ['What is Pi doing?', "how's it going", 'is it done?', 'any progress', 'status'];
+  const status = ['What is Pi doing?', 'what are you working on', "what're you up to?", "how's it going", 'is it done?', 'any progress', 'status'];
   const notStatus = ['what is Pi doing wrong in the parser? fix it', 'show the git status and commit everything that changed today'];
   const re = name => new RegExp(String(liveSource.match(new RegExp(`const ${name} = /(.*)/i;`))[1]), 'i');
   for (const text of stop) assert.ok(re('STOP_REQUEST').test(text), text);
@@ -508,8 +562,9 @@ test('stop and status phrases are matched narrowly', () => {
 });
 
 test('Pi status reads as one sentence for the voice', () => {
-  assert.equal(describeStatus({ state: 'idle' }), 'Pi is idle.');
-  assert.equal(describeStatus({ state: 'waiting_for_approval', task: 'deploy' }), 'Pi is waiting for the user to answer a prompt in the terminal on "deploy".');
+  assert.equal(describeStatus({ state: 'idle' }), 'Nothing is running.');
+  assert.equal(describeStatus({ state: 'idle', last_result: '9 files.' }), 'Nothing is running. My last answer: 9 files.');
+  assert.equal(describeStatus({ state: 'waiting_for_approval', task: 'deploy' }), 'I\'m waiting for the user to answer a prompt in the terminal on "deploy".');
 });
 
 test('GPT-Live silence frames do not count as speech', () => {
@@ -575,12 +630,12 @@ test('Pi outcomes are announced for voice runs only', () => {
   bridge.ask('fix the failing test.', 'after');
   control.idle = false;
   bridge.promptStart('Allow edit?');
-  assert.deepEqual(notices, ['Pi is waiting for the user to answer a prompt in the terminal: Allow edit?']);
+  assert.deepEqual(notices, ['I\'m blocked until the user answers a prompt in the terminal: Allow edit?']);
   bridge.toolStart('edit', { path: 'audio.ts' });
   assert.equal(notices.length, 1);
   bridge.messageEnd({ role: 'assistant', content: [{ type: 'text', text: 'Fixed the off-by-one; 18 tests pass.' }] });
   bridge.settled(false);
-  assert.equal(notices.at(-1), 'Pi finished the task "fix the failing test". Pi\'s answer: Fixed the off-by-one; 18 tests pass.');
+  assert.equal(notices.at(-1), 'I finished the task "fix the failing test". My answer: Fixed the off-by-one; 18 tests pass.');
   control.idle = true;
   // Cancellation by voice aborts Pi; the voice model confirms it, so it is not announced again.
   bridge.ask('rebuild everything', 'after');
@@ -598,12 +653,12 @@ test('Pi outcomes are announced for voice runs only', () => {
   control.idle = false;
   bridge.agentStart();
   bridge.settled(true);
-  assert.match(notices.at(-1), /^Pi stopped the task "rebuild everything" before finishing/);
+  assert.match(notices.at(-1), /^I stopped the task "rebuild everything" before finishing/);
   // After the voice session ends, nothing more is emitted.
   bridge.detach();
   bridge.ask('one more', 'after');
   bridge.settled(false);
-  assert.match(notices.at(-1), /^Pi stopped/);
+  assert.match(notices.at(-1), /^I stopped/);
 });
 
 test('progress goes to the silent channel for voice runs only, at most every 3 s', () => {
@@ -617,7 +672,7 @@ test('progress goes to the silent channel for voice runs only, at most every 3 s
   bridge.toolStart('bash', { command: 'npm test' });
   bridge.toolStart('read', { path: 'a.ts' });
   clock += 3000; bridge.toolStart('edit', { path: 'b.ts' });
-  assert.deepEqual(progress, ['Pi is working on "run the tests"; it just ran bash: npm test.', 'Pi is working on "run the tests"; it just ran edit: b.ts.']);
+  assert.deepEqual(progress, ['Progress on my task "run the tests": I just ran bash: npm test.', 'Progress on my task "run the tests": I just ran edit: b.ts.']);
 });
 
 test('tool descriptions are one bounded line', () => {

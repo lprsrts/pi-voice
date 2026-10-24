@@ -20,13 +20,13 @@ const SPEECH_PEAK = 600;
 const DELEGATION_SETTLE_MS = 350;
 // While Pi works, these are handled locally instead of being sent to Pi as messages.
 const STOP_REQUEST = /^(please\s+)?(stop|cancel|abort|halt|never\s?mind|forget it)(\s+(it|that|this|the task|the job|everything|pi|now))*(\s+please)?[.!]*$/i;
-const STATUS_REQUEST = /^(so\s+|and\s+|okay,?\s+|ok,?\s+)?(what('?s| is)\s+(pi|it|he|she)\s+doing|what are you doing|how('?s| is)\s+it\s+going|how far|(is|are)\s+(it|pi|you)\s+(done|finished)|any\s+(news|progress|update)|status|progress)\b[^.!?]{0,40}[.?!]*$/i;
+const STATUS_REQUEST = /^(so\s+|and\s+|okay,?\s+|ok,?\s+)?(what('?s| is)\s+(pi|it|he|she)\s+doing|what('?re|\s+are)\s+you\s+(doing|working\s+on|up\s+to)|how('?s| is)\s+it\s+going|how far|(is|are)\s+(it|pi|you)\s+(done|finished)|any\s+(news|progress|update)|status|progress)\b[^.!?]{0,40}[.?!]*$/i;
 
-/** Pi's status (pi_status) as a sentence GPT-Live can relay. */
+/** The work's status (pi_status) as a first-person sentence the voice can relay. */
 export function describeStatus(status: any): string {
-  if (status?.state === "idle") return status.last_result ? `Pi is idle. Its last answer: ${status.last_result}` : "Pi is idle.";
+  if (status?.state === "idle") return status.last_result ? `Nothing is running. My last answer: ${status.last_result}` : "Nothing is running.";
   const doing = status?.state === "waiting_for_approval" ? "waiting for the user to answer a prompt in the terminal" : "working";
-  const parts = [`Pi is ${doing} on "${status?.task ?? "a task"}"${typeof status?.elapsed_s === "number" ? ` for ${status.elapsed_s} seconds` : ""}`];
+  const parts = [`I'm ${doing} on "${status?.task ?? "a task"}"${typeof status?.elapsed_s === "number" ? ` for ${status.elapsed_s} seconds` : ""}`];
   if (status?.last_tool) parts.push(`last step: ${status.last_tool}`);
   if (status?.queued?.length) parts.push(`${status.queued.length} more request${status.queued.length === 1 ? "" : "s"} queued`);
   return `${parts.join("; ")}.`;
@@ -66,6 +66,8 @@ type Hooks = {
   tool: (name: string, args: Record<string, unknown>) => object;
   /** Whether Pi is working, for the resting waveform state. */
   busy: () => boolean;
+  /** What this voice session should know at start: the agent's memory of the Pi session. */
+  briefing?: () => string;
   /** The phrase the agent is saying now and how much of it is spoken, in step with playback. */
   caption?: (line: CaptionLine) => void;
 };
@@ -116,6 +118,9 @@ export class LiveVoice {
   /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
   async start(getKey: (signal: AbortSignal) => Promise<string> | string, config = liveSessionConfig()) {
     if (process.platform !== "darwin") throw new Error("This audio backend currently supports macOS only.");
+    // Each voice session starts blank; the Pi session is the memory it continues from.
+    const briefing = this.hooks.briefing?.();
+    if (briefing) config = { ...config, instructions: `${config.instructions}\n\n${briefing}` };
     this.hooks.state("thinking");
     let key: string;
     try {
@@ -323,7 +328,7 @@ export class LiveVoice {
     const busy = this.hooks.busy();
     if (busy && STOP_REQUEST.test(request)) {
       const result = this.hooks.tool("cancel_pi", {}) as { status?: string };
-      this.commentary(result.status === "cancelled" ? "Pi's task is cancelled." : "Pi wasn't working on anything.", id);
+      this.commentary(result.status === "cancelled" ? "I stopped the task." : "Nothing was running.", id);
       return;
     }
     if (busy && STATUS_REQUEST.test(request)) {
@@ -337,11 +342,11 @@ export class LiveVoice {
     ].filter(Boolean).join(", then ");
     const context = request.length < 80 && before ? `\n(Just before, ${before})` : "";
     const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${context}`, when: "now" }) as { status?: string; error?: string };
-    if (result.error) { this.commentary(`Pi could not take the request: ${result.error}`, id); return; }
+    if (result.error) { this.commentary(`I couldn't take that request: ${result.error}`, id); return; }
     this.delegation = id;
     this.thinking(result.status === "started"
-      ? "Pi has started on the request. Its result arrives as commentary; do not state any result before that."
-      : "Pi was already working; the request was added to its running task. Its result arrives as commentary.", id);
+      ? "I've started on it. The result arrives as an update; do not state any result before that."
+      : "I was already working; this was added to the running task. The result arrives as an update.", id);
   }
 
   mute(value: boolean) {

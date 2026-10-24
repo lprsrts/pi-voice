@@ -16,6 +16,8 @@ export type VoiceHooks = {
   closed: () => void;
   tool: (name: string, args: Record<string, unknown>) => object;
   busy: () => boolean;
+  /** The agent's memory of the Pi session, given to each new voice session. */
+  briefing?: () => string;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;

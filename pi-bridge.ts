@@ -1,12 +1,14 @@
-// The voice model is Pi's mouth and ears; Pi's own agent does the work. The
-// bridge hands requests to Pi (ask_pi), reports what it is doing (pi_status),
-// and stops it (cancel_pi). Pi's tools, permission prompts, and session
-// transcript stay exactly as in the TUI.
+// The voice and the Pi session are one agent: the voice is its mouth and ears,
+// the Pi session its hands and reasoning. The bridge hands requests to the Pi
+// session (ask_pi), reports what it is doing (pi_status), and stops it
+// (cancel_pi). Tools, permission prompts, and the transcript stay as in the TUI.
+// Everything the voice is told about the work is in the first person, since
+// the work is its own.
 
-// Added to Pi's system prompt while a voice session runs: Pi is the backend of
-// the voice, so its answers are heard rather than read.
+// Added to Pi's system prompt while a voice session runs: the voice is Pi's own
+// voice, so its answers are heard rather than read.
 export const VOICE_PROMPT = [
-  "A live voice front end (GPT-Live) is connected to this session. It hears the user, hands their requests to you, and speaks your final answer aloud, possibly paraphrased.",
+  "You are speaking with the user right now: a live voice (GPT-Live) is your own voice and ears in this session. It hears the user, passes their requests to you, and speaks your final answer aloud in your name, possibly paraphrased. You and the voice are one agent, not two.",
   "Messages that start with \"Voice request\" are speech transcripts: they can contain recognition errors, missing punctuation, or half-finished phrases. Interpret them sensibly from the conversation; ask only if you truly cannot act.",
   "Do the work exactly as you would for typed requests, with your usual tools and care.",
   "End with a short answer meant to be spoken: the outcome first, one to three sentences, no code, paths, tables, or long lists unless asked. Details stay in the terminal.",
@@ -50,6 +52,51 @@ export function assistantText(message: unknown): string {
   const m = message as { role?: string; content?: unknown };
   if (m?.role !== "assistant" || !Array.isArray(m.content)) return "";
   return m.content.filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n").trim();
+}
+
+/** Text of a user message (string or content parts). */
+function userText(message: any): string {
+  if (message?.role !== "user") return "";
+  if (typeof message.content === "string") return message.content.trim();
+  return Array.isArray(message.content) ? message.content.filter((c: any) => c?.type === "text" && typeof c.text === "string").map((c: any) => c.text).join("\n").trim() : "";
+}
+
+const BRIEFING_CHARS = 4000;
+
+/**
+ * What a new voice session should know, in the first person: the voice starts
+ * blank each time, but the Pi session holds the conversation and the work.
+ * Built from the session branch (latest compaction summary, then recent user
+ * requests and answers) plus the work running right now.
+ */
+export function sessionBriefing(entries: readonly any[], options: { cwd?: string; status?: any } = {}): string {
+  let summary = "";
+  const turns: string[] = [];
+  for (const entry of entries) {
+    if (entry?.type === "compaction" && typeof entry.summary === "string") { summary = entry.summary; turns.length = 0; continue; }
+    if (entry?.type !== "message") continue;
+    const user = userText(entry.message);
+    if (user) {
+      const spoken = user.startsWith(VOICE_REQUEST);
+      turns.push(`- The user (${spoken ? "spoken" : "typed"}): ${clip(spokenPart(user).replace(/\s+/g, " "), 300)}`);
+      continue;
+    }
+    const answer = assistantText(entry.message);
+    if (answer) turns.push(`- Me: ${clip(answer.replace(/\s+/g, " "), 400)}`);
+  }
+  const lines = ["What I know about this session (my own memory; the work below is mine):"];
+  if (options.cwd) lines.push(`Working directory: ${options.cwd}`);
+  let budget = BRIEFING_CHARS - (summary ? Math.min(summary.length, 1200) : 0);
+  const recent: string[] = [];
+  for (let i = turns.length - 1; i >= 0 && budget - turns[i].length > 0; i--) { recent.unshift(turns[i]); budget -= turns[i].length; }
+  if (summary) lines.push(`Earlier in this session (summary): ${clip(summary.replace(/\s+/g, " "), 1200)}`);
+  lines.push(recent.length ? `Recent conversation, oldest first:\n${recent.join("\n")}` : "Nothing has been said in this session yet.");
+  const status = options.status;
+  if (status && status.state !== "idle") {
+    const waiting = status.state === "waiting_for_approval" ? ` I'm waiting for the user to answer a prompt in the terminal${status.approval ? `: ${status.approval}` : ""}.` : "";
+    lines.push(`Right now I'm still working on "${status.task ?? "a task"}"${status.last_tool ? `; last step: ${status.last_tool}` : ""}.${waiting} Its result will arrive as an update.`);
+  } else lines.push("Right now nothing is running.");
+  return lines.join("\n");
 }
 
 export class PiBridge {
@@ -96,16 +143,16 @@ export class PiBridge {
       this.lastText = "";
       this.voiceInRun = true;
       this.host.sendUserMessage(request);
-      return { status: "started", note: "Pi is working on it. Do not state any result until Pi's automatic update arrives." };
+      return { status: "started", note: "Started on it. Do not state any result until the update with the result arrives." };
     }
     this.voiceInRun = true;
     if (when === "now") {
       this.host.sendUserMessage(request, { deliverAs: "steer" });
-      return { status: "steered", note: "Added to Pi's running task." };
+      return { status: "steered", note: "Added to the running task." };
     }
     this.queued.push(request);
     this.host.sendUserMessage(request, { deliverAs: "followUp" });
-    return { status: "queued", position: this.queued.length, note: "Pi will start it after the current task." };
+    return { status: "queued", position: this.queued.length, note: "Queued after the current task." };
   }
 
   status(): object {
@@ -124,10 +171,22 @@ export class PiBridge {
   }
 
   cancel(): object {
-    if (this.control.isIdle()) return { status: "idle", note: "Pi was not working on anything." };
+    if (this.control.isIdle()) return { status: "idle", note: "Nothing was running." };
     this.cancelledByVoice = true;
     this.control.abort();
     return { status: "cancelled", still_queued: this.control.hasPendingMessages() };
+  }
+
+  /**
+   * A voice session started while the Pi session is already working (e.g. the
+   * user restarted voice mid-task): treat the run as voice-requested, so its
+   * result is still announced, and remember the last answer for status.
+   */
+  adopt(task: string | undefined, lastAnswer: string | undefined) {
+    if (lastAnswer) this.lastText = lastAnswer;
+    if (this.control.isIdle()) return;
+    this.voiceInRun = true;
+    if (task) this.task = spokenPart(task);
   }
 
   // ---------- Pi events (wired by index.ts) ----------
@@ -143,7 +202,7 @@ export class PiBridge {
     this.lastTool = describeTool(name, args);
     if (!this.progress || !this.voiceInRun || !this.active || this.now() - this.lastProgressAt < 3000) return;
     this.lastProgressAt = this.now();
-    this.progress(`Pi is working on "${clip(this.task ?? "the current task", 120)}"; it just ran ${this.lastTool}.`);
+    this.progress(`Progress on my task "${clip(this.task ?? "the current task", 120)}": I just ran ${this.lastTool}.`);
   }
 
   messageEnd(message: unknown) {
@@ -160,7 +219,7 @@ export class PiBridge {
 
   promptStart(title?: string) {
     this.approval = title ? clip(title, 160) : "a confirmation";
-    if (this.voiceInRun && this.active) this.notice(`Pi is waiting for the user to answer a prompt in the terminal: ${this.approval}`);
+    if (this.voiceInRun && this.active) this.notice(`I'm blocked until the user answers a prompt in the terminal: ${this.approval}`);
   }
 
   promptEnd() {
@@ -181,8 +240,8 @@ export class PiBridge {
     const subject = task ? `the task "${clip(task.replace(/[.!?\s]+$/, ""), 300)}"` : "its task";
     const result = this.lastText ? clip(this.lastText, 1500) : "(no text answer)";
     this.notice(aborted
-      ? `Pi stopped ${subject} before finishing. Pi's last output: ${result}`
-      : `Pi finished ${subject}. Pi's answer: ${result}`);
+      ? `I stopped ${subject} before finishing. My last output: ${result}`
+      : `I finished ${subject}. My answer: ${result}`);
   }
 
   /** The voice session ended: stop emitting notices (Pi keeps running). */

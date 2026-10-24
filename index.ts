@@ -6,7 +6,7 @@ import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
-import { PiBridge, VOICE_PROMPT } from "./pi-bridge.ts";
+import { assistantText, PiBridge, sessionBriefing, VOICE_PROMPT } from "./pi-bridge.ts";
 import { PROVIDER, type VoiceSession } from "./providers.ts";
 import { dominantFrequency, formatCaption, type CaptionLine } from "./protocol.ts";
 
@@ -305,6 +305,13 @@ export default function voicePreview(pi: ExtensionAPI) {
       show(ctx, "live");
       let helper: string | undefined;
       const currentBridge = new PiBridge(pi, ctx, text => current.notify(text), undefined, text => current.context?.(text));
+      // Voice restarted mid-task: keep announcing the running task, and know the last answer.
+      const branch = ctx.sessionManager.getBranch();
+      const lastOf = (pick: (message: any) => string) => { for (let i = branch.length - 1; i >= 0; i--) { const entry = branch[i] as any; const text = entry.type === "message" ? pick(entry.message) : ""; if (text) return text; } return undefined; };
+      currentBridge.adopt(
+        lastOf(message => message?.role === "user" ? (typeof message.content === "string" ? message.content : assistantText({ role: "assistant", content: message.content })) : ""),
+        lastOf(assistantText),
+      );
       const current: VoiceSession = provider.create({
         state: state => { liveState = state; },
         samples: (source, samples) => {
@@ -320,6 +327,7 @@ export default function voicePreview(pi: ExtensionAPI) {
         },
         tool: (name, args) => currentBridge.call(name, args),
         busy: () => !ctx.isIdle(),
+        briefing: () => sessionBriefing(ctx.sessionManager.getBranch(), { cwd: ctx.sessionManager.getCwd(), status: currentBridge.status() }),
       }, callbacks => new AudioPipes({
         ...callbacks,
         route: route => ctx.ui.notify(`Audio switched: input ${route.input}, output ${route.output}`, "info"),
