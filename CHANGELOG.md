@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Auto-pause.** GPT-Live bills per second while connected, so voice closes its connection after 15 s of silence while Pi works (`PI_VOICE_AUTOPAUSE`) and comes back by itself to say the result; after 60 s of silence with nothing running (`PI_VOICE_IDLE_PAUSE`) it pauses until `/talk start`. Measured live: a 56 s wait billed 31 s instead of 56 s.
+- **Results are never lost.** A talk session (`talk.ts`) owns the Pi bridge across voice connections: a result that arrives while voice is paused, connecting, or stopped by the user is said as soon as a connection is open. The consent prompt is shown once per Pi session.
+- Live scenarios `autopause` and `result-after-stop`; the harness runs through the shipped talk session and reports billed voice time.
 - **Requests carry the conversation.** A handoff sends your latest turn as the request together with everything said since the previous one (your earlier turns and the voice's replies), so a question like "does that single line addition work?" reaches Pi with the explanation it refers to. Pi's voice prompt explains the format.
 - The voice lets you think aloud and explain over several turns without handing off, and Pi answers questions about a change instead of making it unless asked.
 - **Live test scripts** (`scripts/live/`): real-life scenarios (quick answer, status and stop, restart memory, multi-turn explanation, correction mid-task) against real GPT-Live and a real Pi session, with checks, timing, model comparison (`--model`), and three audio modes.

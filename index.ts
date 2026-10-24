@@ -6,8 +6,9 @@ import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
-import { assistantText, PiBridge, sessionBriefing, VOICE_PROMPT } from "./pi-bridge.ts";
-import { PROVIDER, type VoiceSession } from "./providers.ts";
+import { VOICE_PROMPT } from "./pi-bridge.ts";
+import { describePause, pauseAfterFromEnv, TalkSession } from "./talk.ts";
+import { PROVIDER } from "./providers.ts";
 import { dominantFrequency, formatCaption, type CaptionLine } from "./protocol.ts";
 
 const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
@@ -75,8 +76,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   let owner: ExtensionContext | undefined;
   let choice = "cycle";
   let cycleStarted = Date.now();
-  let conversation: VoiceSession | undefined;
-  let bridge: PiBridge | undefined;
+  let talk: TalkSession | undefined; // from the first /talk start until the Pi session ends
   let liveState: State = "idle";
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
@@ -84,6 +84,8 @@ export default function voicePreview(pi: ExtensionAPI) {
   // Caption row under the bar: off unless PI_VOICE_CAPTIONS=1 or /talk captions on.
   let captionsOn = ["1", "true", "on"].includes(process.env.PI_VOICE_CAPTIONS?.trim().toLowerCase() ?? "");
   let muted = false;
+  let talking = false;   // between /talk start and /talk stop: Pi is told its answers are spoken
+  let consented = false; // the consent prompt is shown once per Pi session
 
   function stop() {
     if (timer) clearInterval(timer);
@@ -199,7 +201,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   pi.registerCommand("talk-preview", {
     description: "Visual-only preview: cycle, idle, listening, thinking, speaking, error, off",
     handler: async (args, ctx) => {
-      if (conversation) { ctx.ui.notify("Stop voice before entering preview mode.", "warning"); return; }
+      if (talk?.connected) { ctx.ui.notify("Stop voice before entering preview mode.", "warning"); return; }
       show(ctx, args.trim() || "cycle");
     },
   });
@@ -217,9 +219,9 @@ export default function voicePreview(pi: ExtensionAPI) {
       if (ctx.mode !== "tui") return;
       const command = args.trim();
       if (command === "stop") {
-        conversation?.stop(); conversation = undefined;
-        bridge?.detach(); bridge = undefined;
-        liveState = "idle"; inputSamples = []; outputSamples = []; caption = undefined;
+        // Pi keeps working; a result that arrives before the next /talk start is said then.
+        talk?.close(); talking = false;
+        inputSamples = []; outputSamples = []; caption = undefined;
         stop(); return;
       }
       if (command === "check") {
@@ -230,7 +232,7 @@ export default function voicePreview(pi: ExtensionAPI) {
           try { const route = await currentRoute(await ensureHelper()); lines.push(`input: ${route.input}`, `output: ${route.output}`); }
           catch { lines.push("devices: query failed"); }
         }
-        ctx.ui.notify([...lines, `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`, `voice: ${PROVIDER.label}`, `backend: this Pi session (${modelName(ctx)}; change it with /model)`, `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key)}`, `captions: ${captionsOn ? "on" : "off"} (/talk captions on|off)`, `config overrides: ${userConfigDir()}`, `platform: ${process.platform}`, `session: ${conversation ? (muted ? "muted" : "active/connecting") : "off"}`].join("\n"), "info");
+        ctx.ui.notify([...lines, `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`, `voice: ${PROVIDER.label}`, `backend: this Pi session (${modelName(ctx)}; change it with /model)`, `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key)}`, `captions: ${captionsOn ? "on" : "off"} (/talk captions on|off)`, `config overrides: ${userConfigDir()}`, `platform: ${process.platform}`, `session: ${talk?.connected ? (muted ? "muted" : "active/connecting") : talk?.isPaused ? "paused (comes back with the result)" : talking ? "paused" : "off"}${talk?.waiting ? `; ${talk.waiting} result(s) to say` : ""}`, `auto-pause: after ${describePause()} (PI_VOICE_AUTOPAUSE, PI_VOICE_IDLE_PAUSE)`].join("\n"), "info");
         return;
       }
       if (command === "devices") {
@@ -257,7 +259,7 @@ export default function voicePreview(pi: ExtensionAPI) {
         return;
       }
       if (command.startsWith("mic-test")) {
-        if (conversation) { ctx.ui.notify("Stop the session first: /talk stop", "warning"); return; }
+        if (talk?.connected) { ctx.ui.notify("Stop the session first: /talk stop", "warning"); return; }
         const seconds = Math.min(10, Math.max(1, Number(command.slice(8).trim()) || 3));
         let helper: string, route: Awaited<ReturnType<typeof currentRoute>>;
         try { helper = await nativeHelper(ctx); route = await currentRoute(helper); }
@@ -289,73 +291,68 @@ export default function voicePreview(pi: ExtensionAPI) {
         return;
       }
       if (command === "mute" || command === "unmute") {
-        if (!conversation) { ctx.ui.notify("Voice is not running.", "warning"); return; }
+        if (!talk?.connected) { ctx.ui.notify("Voice is not running.", "warning"); return; }
         muted = command === "mute";
-        conversation.mute(muted);
+        talk.mute(muted);
         ctx.ui.notify(muted ? "Microphone stopped." : "Microphone resumed.", "info");
         return;
       }
       const [verb, providerArg] = command.split(/\s+/);
       if (verb !== "start" || providerArg) { ctx.ui.notify("Use /talk start|stop|mute|unmute|captions|check|devices|tone|mic-test", "info"); return; }
-      if (conversation) { ctx.ui.notify("Voice is already running or connecting.", "info"); return; }
-      const provider = PROVIDER;
-      const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (PI_VOICE_AEC=0): use headphones, or the agent may hear itself and loop."} The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
-      if (!consent || conversation) return;
-      muted = false; liveState = "thinking"; inputSamples = []; outputSamples = []; caption = undefined;
-      show(ctx, "live");
-      let helper: string | undefined;
-      const currentBridge = new PiBridge(pi, ctx, text => current.notify(text), undefined, text => current.context?.(text));
-      // Voice restarted mid-task: keep announcing the running task, and know the last answer.
-      const branch = ctx.sessionManager.getBranch();
-      const lastOf = (pick: (message: any) => string) => { for (let i = branch.length - 1; i >= 0; i--) { const entry = branch[i] as any; const text = entry.type === "message" ? pick(entry.message) : ""; if (text) return text; } return undefined; };
-      currentBridge.adopt(
-        lastOf(message => message?.role === "user" ? (typeof message.content === "string" ? message.content : assistantText({ role: "assistant", content: message.content })) : ""),
-        lastOf(assistantText),
-      );
-      const current: VoiceSession = provider.create({
+      if (talk?.connected) { ctx.ui.notify("Voice is already running or connecting.", "info"); return; }
+      if (!consented) {
+        const provider = PROVIDER;
+        const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (PI_VOICE_AEC=0): use headphones, or the agent may hear itself and loop."} Voice is billed while connected; it pauses by itself after ${describePause()}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
+        if (!consent || talk?.connected) return;
+        consented = true;
+      }
+      talking = true;
+      talkSession(ctx).open();
+    },
+  });
+
+  /** The talk session for this Pi session: one bridge, voice connections under it. */
+  function talkSession(ctx: ExtensionContext): TalkSession {
+    if (talk) return talk;
+    let helper: string | undefined;
+    talk = new TalkSession({
+      pi,
+      control: ctx,
+      branch: () => ctx.sessionManager.getBranch(),
+      cwd: () => ctx.sessionManager.getCwd(),
+      createVoice: hooks => {
+        muted = false; liveState = "thinking"; inputSamples = []; outputSamples = []; caption = undefined;
+        show(ctx, "live");
+        return PROVIDER.create(hooks, callbacks => new AudioPipes({
+          ...callbacks,
+          route: route => ctx.ui.notify(`Audio switched: input ${route.input}, output ${route.output}`, "info"),
+        }, helper!));
+      },
+      // The helper build runs before the network deadline, like the keychain read.
+      getKey: async signal => { helper = await nativeHelper(ctx, signal); return resolveApiKey(PROVIDER.key, signal); },
+      notify: (message, level) => ctx.ui.notify(message, level),
+      view: {
         state: state => { liveState = state; },
         samples: (source, samples) => {
           if (source === "input") { inputSamples = samples; inputTime = Date.now(); }
           else { outputSamples = samples; outputTime = Date.now(); }
         },
-        error: message => ctx.ui.notify(message, "error"),
         caption: line => { caption = line; captionAt = Date.now(); },
-        closed: () => {
-          currentBridge.detach();
-          if (conversation === current) { conversation = undefined; bridge = undefined; }
-          liveState = "idle"; inputSamples = []; outputSamples = []; caption = undefined;
-        },
-        tool: (name, args) => currentBridge.call(name, args),
-        busy: () => !ctx.isIdle(),
-        briefing: () => sessionBriefing(ctx.sessionManager.getBranch(), { cwd: ctx.sessionManager.getCwd(), status: currentBridge.status() }),
-      }, callbacks => new AudioPipes({
-        ...callbacks,
-        route: route => ctx.ui.notify(`Audio switched: input ${route.input}, output ${route.output}`, "info"),
-      }, helper!));
-      conversation = current;
-      bridge = currentBridge;
-      // Do not hold the command handler open: /talk stop must work during startup.
-      // The helper build runs before the network deadline, like the keychain read.
-      void current.start(async signal => {
-        helper = await nativeHelper(ctx, signal);
-        return resolveApiKey(provider.key, signal);
-      }).catch(error => {
-        current.stop();
-        if (conversation !== current) return; // already stopped by the user; no error banner
-        liveState = "error";
-        ctx.ui.notify(error instanceof Error ? error.message : "Voice failed to start.", "error");
-      });
-    },
-  });
+      },
+      pauseAfter: () => pauseAfterFromEnv(),
+    });
+    return talk;
+  }
+
   // Pi's agent activity feeds the bridge (status, approvals, results) while voice runs.
   pi.on("before_agent_start", event => {
-    if (conversation) event.systemPromptOptions.sections.voice = VOICE_PROMPT;
+    if (talking) event.systemPromptOptions.sections.voice = VOICE_PROMPT;
   });
-  pi.on("agent_start", () => { bridge?.agentStart(); });
-  pi.on("tool_execution_start", event => { bridge?.toolStart(event.toolName, event.args); });
-  pi.on("message_end", event => { bridge?.messageEnd(event.message); });
-  pi.on("ui_prompt_start", event => { bridge?.promptStart(event.title); });
-  pi.on("ui_prompt_end", () => { bridge?.promptEnd(); });
-  pi.on("agent_settled", event => { bridge?.settled(event.aborted); });
-  pi.on("session_shutdown", () => { conversation?.stop(); conversation = undefined; bridge?.detach(); bridge = undefined; stop(); });
+  pi.on("agent_start", () => { talk?.bridge.agentStart(); });
+  pi.on("tool_execution_start", event => { talk?.bridge.toolStart(event.toolName, event.args); });
+  pi.on("message_end", event => { talk?.bridge.messageEnd(event.message); });
+  pi.on("ui_prompt_start", event => { talk?.bridge.promptStart(event.title); });
+  pi.on("ui_prompt_end", () => { talk?.bridge.promptEnd(); });
+  pi.on("agent_settled", event => { talk?.bridge.settled(event.aborted); });
+  pi.on("session_shutdown", () => { talk?.end(); talk = undefined; talking = false; consented = false; stop(); });
 }

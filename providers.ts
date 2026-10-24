@@ -18,6 +18,8 @@ export type VoiceHooks = {
   busy: () => boolean;
   /** The agent's memory of the Pi session, given to each new voice session. */
   briefing?: () => string;
+  /** Someone is talking (user speech or audible playback): resets the auto-pause timer. */
+  activity?: () => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;

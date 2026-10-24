@@ -17,7 +17,8 @@ const FRAME = 960; // 20 ms of PCM16 at 24 kHz
 
 const { resolveApiKey, OPENAI_KEY } = await import(`${REPO}/keys.ts`);
 const { LiveVoice, audibleFrame } = await import(`${REPO}/live.ts`);
-const { PiBridge, VOICE_PROMPT, sessionBriefing, assistantText } = await import(`${REPO}/pi-bridge.ts`);
+const { VOICE_PROMPT, assistantText } = await import(`${REPO}/pi-bridge.ts`);
+const { TalkSession } = await import(`${REPO}/talk.ts`);
 const { AudioPipes } = await import(`${REPO}/audio.ts`);
 const { ensureHelper } = await import(`${REPO}/native.ts`);
 
@@ -109,92 +110,88 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
   };
   const mark = (kind, data = "") => { const t = (Date.now() - t0) / 1000; r.events.push({ t, kind, data }); log(t, kind, data); return t; };
 
-  let bridge;
+  // The shipped talk session (talk.ts): one bridge, voice connections under it,
+  // auto-pause and resume. Only the Pi host and the audio are the harness's.
+  let mic, speechEnd = 0, resultAt = 0, connectedAt = 0;
+  const heardFrame = frame => {
+    if (!audibleFrame(frame)) return;
+    if (speechEnd) { mark("voice.heard", `${((Date.now() - speechEnd) / 1000).toFixed(2)} s after speech end`); if (r.turns.length) r.turns.at(-1).replyHeard = (Date.now() - speechEnd) / 1000; speechEnd = 0; }
+    if (resultAt) { mark("result.heard", `${((Date.now() - resultAt) / 1000).toFixed(2)} s after the result`); if (r.turns.length) r.turns.at(-1).resultHeard = (Date.now() - resultAt) / 1000; resultAt = 0; }
+  };
+  const audioFactory = callbacks => {
+    if (audio === "silent") {
+      mic = callbacks.input;
+      return { start() {}, enqueue(pcm) { for (let i = 0; i + FRAME <= pcm.length; i += FRAME) heardFrame(pcm.subarray(i, i + FRAME)); }, finish() {}, interrupt() {}, mute() {}, stop() {} };
+    }
+    if (audio === "inject") mic = callbacks.input;
+    return new AudioPipes({
+      ...callbacks,
+      input: audio === "inject" ? () => {} : callbacks.input,
+      route: route => mark("audio.route", JSON.stringify(route)),
+      played: frame => { heardFrame(frame); callbacks.played?.(frame); },
+    }, helper);
+  };
+  const talk = new TalkSession({
+    pi: { sendUserMessage: (text, options) => {
+      r.piRequests.push(text);
+      mark(`pi.${options?.deliverAs ?? "prompt"}`, text);
+      if (options?.deliverAs === "steer") session.steer(text);
+      else if (options?.deliverAs === "followUp") session.followUp(text);
+      else session.prompt(text).catch(error => mark("pi.error", error.message));
+    } },
+    control: { isIdle: () => session.isIdle, abort: () => { mark("pi.abort"); session.abort(); }, hasPendingMessages: () => session.pendingMessageCount > 0 },
+    branch: () => session.sessionManager.getBranch(),
+    cwd: () => cwd,
+    createVoice: hooks => {
+      mark("voice.connect");
+      connectedAt = Date.now();
+      const voice = new LiveVoice({
+        ...hooks,
+        tool: (name, args) => { r.bridgeCalls.push(name); mark(`bridge.${name}`); return hooks.tool(name, args); },
+        briefing: () => { const text = hooks.briefing(); r.briefings.push(text); return text; },
+        closed: () => { r.voiceSeconds += (Date.now() - connectedAt) / 1000; mark("voice.closed"); hooks.closed(); },
+      }, audioFactory);
+      const notify = voice.notify.bind(voice);
+      voice.notify = text => { r.results.push(text); resultAt = Date.now(); mark("result", text.slice(0, 160)); notify(text); };
+      return voice;
+    },
+    getKey: async () => key,
+    notify: (message, level) => mark(`ui.${level}`, message),
+    view: {},
+    pauseAfter: () => scenario.pauseAfter ?? { busy: 15, idle: 60 },
+  });
   session.subscribe(event => {
-    if (event.type === "agent_start") bridge?.agentStart();
-    if (event.type === "tool_execution_start") { r.piTools.push(`${event.toolName} ${JSON.stringify(event.args)}`); mark("pi.tool", `${event.toolName} ${JSON.stringify(event.args).slice(0, 80)}`); bridge?.toolStart(event.toolName, event.args); }
-    if (event.type === "message_end") { bridge?.messageEnd(event.message); const text = assistantText(event.message); if (text) mark("pi.text", text.slice(0, 160)); }
-    if (event.type === "agent_settled") { if (event.aborted) r.aborted = true; mark("pi.settled", event.aborted ? "aborted" : ""); bridge?.settled(!!event.aborted); }
+    if (event.type === "agent_start") talk.bridge.agentStart();
+    if (event.type === "tool_execution_start") { r.piTools.push(`${event.toolName} ${JSON.stringify(event.args)}`); mark("pi.tool", `${event.toolName} ${JSON.stringify(event.args).slice(0, 80)}`); talk.bridge.toolStart(event.toolName, event.args); }
+    if (event.type === "message_end") { talk.bridge.messageEnd(event.message); const text = assistantText(event.message); if (text) mark("pi.text", text.slice(0, 160)); }
+    if (event.type === "agent_settled") { if (event.aborted) r.aborted = true; mark("pi.settled", event.aborted ? "aborted" : ""); talk.bridge.settled(!!event.aborted); }
   });
 
+  // Watch GPT-Live's own events next to pi-voice's handling.
+  const OrigWS = globalThis.WebSocket;
+  globalThis.WebSocket = class extends OrigWS {
+    constructor(...args) {
+      super(...args);
+      let line = "";
+      this.addEventListener("message", message => {
+        const e = JSON.parse(message.data);
+        if (e.type === "session.output_transcript.delta") {
+          line += e.delta;
+          if (/[.!?]["”’)]*\s*$/.test(line)) { r.voiceLines.push(line.trim()); mark("voice.says", line.trim()); line = ""; }
+        }
+        if (e.type === "session.input_transcript.delta") r.heard.push(e.delta);
+        if (e.type === "session.delegation.created") mark("delegation", `offset_ms ${e.offset_ms}`);
+        if (e.type === "error") { r.errors.push(JSON.stringify(e.error)); mark("gpt-live.error", JSON.stringify(e.error)); }
+      });
+    }
+  };
+
+  // Each scripted voice session: /talk start, timed lines, then /talk stop (unless kept open).
+  const wall = Date.now();
   for (const [index, voiceSession] of scenario.sessions.entries()) {
-    mark("voice.session", `${index + 1}/${scenario.sessions.length}`);
+    mark("talk.start", `${index + 1}/${scenario.sessions.length}`);
     for (const turn of voiceSession.turns) turn.pcm = await speech(key, turn.say);
-    let voice;
-    const b = bridge = new PiBridge(
-      { sendUserMessage: (text, options) => {
-          r.piRequests.push(text);
-          mark(`pi.${options?.deliverAs ?? "prompt"}`, text);
-          if (options?.deliverAs === "steer") session.steer(text);
-          else if (options?.deliverAs === "followUp") session.followUp(text);
-          else session.prompt(text).catch(error => mark("pi.error", error.message));
-        } },
-      { isIdle: () => session.isIdle, abort: () => { mark("pi.abort"); session.abort(); }, hasPendingMessages: () => session.pendingMessageCount > 0 },
-      text => { r.results.push(text); mark("result", text.slice(0, 160)); voice.notify(text); },
-      undefined,
-      text => voice.context?.(text),
-    );
-    // As index.ts does on /talk start.
-    const branch = session.sessionManager.getBranch();
-    const lastOf = pick => { for (let i = branch.length - 1; i >= 0; i--) { const e = branch[i]; const t = e.type === "message" ? pick(e.message) : ""; if (t) return t; } };
-    b.adopt(lastOf(m => m?.role === "user" ? (typeof m.content === "string" ? m.content : assistantText({ role: "assistant", content: m.content })) : ""), lastOf(assistantText));
-    const briefing = sessionBriefing(session.sessionManager.getBranch(), { cwd, status: b.status() });
-    r.briefings.push(briefing);
-
-    // Watch GPT-Live's own events next to pi-voice's handling.
-    const OrigWS = globalThis.WebSocket;
-    globalThis.WebSocket = class extends OrigWS {
-      constructor(...args) {
-        super(...args);
-        let line = "";
-        this.addEventListener("message", message => {
-          const e = JSON.parse(message.data);
-          if (e.type === "session.output_transcript.delta") {
-            line += e.delta;
-            if (/[.!?]["”’)]*\s*$/.test(line)) { r.voiceLines.push(line.trim()); mark("voice.says", line.trim()); line = ""; }
-          }
-          if (e.type === "session.input_transcript.delta") { r.heard.push(e.delta); }
-          if (e.type === "session.delegation.created") mark("delegation", `offset_ms ${e.offset_ms}`);
-          if (e.type === "error") { r.errors.push(JSON.stringify(e.error)); mark("gpt-live.error", JSON.stringify(e.error)); }
-        });
-      }
-    };
-
-    // Audio: playback is observed where the speaker reports it (device clock).
-    let mic, speechEnd = 0, resultAt = 0;
-    const heardFrame = frame => {
-      if (!audibleFrame(frame)) return;
-      if (speechEnd) { mark("voice.heard", `${((Date.now() - speechEnd) / 1000).toFixed(2)} s after speech end`); if (r.turns.length) r.turns.at(-1).replyHeard = (Date.now() - speechEnd) / 1000; speechEnd = 0; }
-      if (resultAt) { mark("result.heard", `${((Date.now() - resultAt) / 1000).toFixed(2)} s after the result`); if (r.turns.length) r.turns.at(-1).resultHeard = (Date.now() - resultAt) / 1000; resultAt = 0; }
-    };
-    const factory = callbacks => {
-      if (audio === "silent") {
-        mic = callbacks.input;
-        return { start() {}, enqueue(pcm) { for (let i = 0; i + FRAME <= pcm.length; i += FRAME) heardFrame(pcm.subarray(i, i + FRAME)); }, finish() {}, interrupt() {}, mute() {}, stop() {} };
-      }
-      if (audio === "inject") mic = callbacks.input;
-      return new AudioPipes({
-        ...callbacks,
-        input: audio === "inject" ? () => {} : callbacks.input,
-        route: route => mark("audio.route", JSON.stringify(route)),
-        played: frame => { heardFrame(frame); callbacks.played?.(frame); },
-      }, helper);
-    };
-    voice = new LiveVoice({
-      state() {}, samples() {}, caption() {}, closed() {},
-      error: e => { r.errors.push(e); mark("error", e); },
-      tool: (name, args) => { r.bridgeCalls.push(name); mark(`bridge.${name}`); return b.call(name, args); },
-      busy: () => !session.isIdle,
-      briefing: () => briefing,
-    }, factory);
-    // Each new result starts a "result heard" measurement.
-    let resultsSeen = r.results.length;
-    const watchResults = setInterval(() => { if (r.results.length > resultsSeen) { resultsSeen = r.results.length; resultAt = Date.now(); } }, 20);
-    const started = Date.now();
-    await voice.start(() => key);
-    mark("voice.started");
-
-    // Scripted turns.
+    talk.open();
     const timers = [];
     let frameIndex = 0, feeding;
     if (audio === "acoustic") {
@@ -222,18 +219,15 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
         mic?.(out);
       }, 20);
     }
-
     await new Promise(done => setTimeout(done, voiceSession.seconds * 1000));
     for (const timer of timers) clearTimeout(timer);
     clearInterval(feeding);
-    clearInterval(watchResults);
-    voice.stop();
-    b.detach();
-    globalThis.WebSocket = OrigWS;
-    r.voiceSeconds += (Date.now() - started) / 1000;
-    mark("voice.stopped", session.isIdle ? "Pi idle" : "Pi still working");
-    await new Promise(done => setTimeout(done, voiceSession.pauseAfter ? voiceSession.pauseAfter * 1000 : 1500));
+    if (!voiceSession.keepOpen) { talk.close(); mark("talk.stop", session.isIdle ? "Pi idle" : "Pi still working"); }
+    await new Promise(done => setTimeout(done, (voiceSession.waitAfter ?? 1.5) * 1000));
   }
+  r.wallSeconds = (Date.now() - wall) / 1000;
+  talk.end();
+  globalThis.WebSocket = OrigWS;
   if (!session.isIdle) { await session.abort(); mark("pi.abort", "end of scenario"); }
   session.dispose();
   return r;

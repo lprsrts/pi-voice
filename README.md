@@ -38,7 +38,7 @@ The package is free (MIT). Two things cost money:
 - **The voice:** GPT-Live, $0.05 per minute, billed to your OpenAI API key. A ChatGPT plan does not cover it (OpenAI rejects plan sign-ins for GPT-Live).
 - **The work:** whatever your Pi model costs, exactly as when you type. Pi uses your configured provider; no extra model runs in between.
 
-`/talk mute` keeps the session open (and billable); `/talk stop` ends it.
+GPT-Live bills per second while a voice connection is open, whether anyone speaks or not. To avoid paying for silence, voice **pauses by itself**: after 15 s of silence while Pi works (it comes back to say the result), or 60 s of silence when nothing is running (`/talk start` resumes). `/talk mute` keeps the connection open (and billable); `/talk stop` ends it. A result that arrives while voice is off is said at the next `/talk start`.
 
 ## How it works
 
@@ -49,7 +49,7 @@ When GPT-Live decides your request needs real work, it hands it off, and pi-voic
 | Command | What it does |
 |---|---|
 | `/talk start` | Start a voice session with this Pi session as the backend. |
-| `/talk stop` | End the session. A Pi task it started keeps running. |
+| `/talk stop` | End the voice connection. A Pi task keeps running; its result is said at the next `/talk start`. |
 | `/talk mute` / `/talk unmute` | Stop or resume the microphone. |
 | `/talk captions [on\|off]` | Show what the agent is saying, phrase by phrase, timed to the audio the speaker actually plays. Off by default; no argument toggles. |
 | `/talk check` | Show setup status: audio helper, devices, API key, Pi's backend model, settings. No network or microphone use. |
@@ -73,6 +73,8 @@ Keys are read only when a session starts and are never logged. Audio and transcr
 | Environment variable | Effect |
 |---|---|
 | `PI_VOICE_CAPTIONS=1` | Start with captions on. |
+| `PI_VOICE_AUTOPAUSE` | Seconds of silence while Pi works before voice pauses (default 15; `0` = never). |
+| `PI_VOICE_IDLE_PAUSE` | Seconds of silence while nothing runs before voice pauses (default 60; `0` = never). |
 | `PI_VOICE_AEC=0` | Turn off echo cancellation (headphones only, or the agent hears itself). |
 | `PI_VOICE_CONFIG_DIR` | Where your overrides live (see below). |
 
@@ -98,6 +100,7 @@ The defaults are in [`providers/openai-live/`](providers/openai-live).
 git clone https://github.com/lprsrts/pi-voice && cd pi-voice
 npm test
 pi -e .   # run Pi with your checkout (pi remove the npm package first)
+node scripts/live/run.mjs all --quiet   # live scenarios: real GPT-Live and Pi (costs a little; see scripts/live)
 ```
 
 Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).

@@ -83,6 +83,8 @@ type Hooks = {
   busy: () => boolean;
   /** What this voice session should know at start: the agent's memory of the Pi session. */
   briefing?: () => string;
+  /** Someone is talking: the user (input transcript) or the voice (audible playback). */
+  activity?: () => void;
   /** The phrase the agent is saying now and how much of it is spoken, in step with playback. */
   caption?: (line: CaptionLine) => void;
 };
@@ -216,6 +218,7 @@ export class LiveVoice {
         if (this.stopped) return;
         if (queued && audibleFrame(frame)) {
           this.lastAudible = Date.now();
+          this.hooks.activity?.();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
           this.hooks.samples("output", waveform(frame));
         } else if (this.playing && Date.now() - this.lastAudible > 250) {
@@ -259,6 +262,7 @@ export class LiveVoice {
         break;
       }
       case "session.input_transcript.delta": {
+        this.hooks.activity?.();
         this.hear(String(event.delta ?? ""), event.start_ms, event.end_ms);
         // A late fragment of words spoken before the voice's current reply began is
         // not new speech: it neither interrupts the reply nor starts a user turn.

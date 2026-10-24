@@ -72,6 +72,41 @@ export const SCENARIOS = {
     },
   },
 
+  "autopause": {
+    description: "Silence while Pi works pauses the (billed) voice connection; Pi's result brings it back to say it.",
+    pauseAfter: { busy: 8, idle: 60 },
+    sessions: [{ seconds: 55, keepOpen: true, turns: [{ at: 1.5, say: "Run sleep 30 in the shell, then tell me it finished." }] }],
+    checks: r => {
+      const settled = r.events.find(e => e.kind === "pi.settled")?.t ?? Infinity;
+      const connects = r.events.filter(e => e.kind === "voice.connect");
+      const spokenAfter = r.events.filter(e => e.kind === "voice.says" && e.t > settled).map(e => e.data);
+      return [
+        check("voice paused while Pi worked", r.events.some(e => e.kind === "ui.info" && /paused while I work/.test(e.data))),
+        check("Pi's result reopened voice", connects.some(e => e.t >= settled - 0.5), connects.map(e => e.t.toFixed(1)).join(", ")),
+        check("the result was spoken after reopening", spokenAfter.length > 0, spokenAfter.join(" ")),
+        check("billed voice time well under the wall time", r.voiceSeconds < r.wallSeconds - 15, `${r.voiceSeconds.toFixed(1)} s connected of ${r.wallSeconds.toFixed(1)} s`),
+      ];
+    },
+  },
+
+  "result-after-stop": {
+    description: "Voice is stopped by the user, the task finishes meanwhile, and the next /talk start says the result unprompted.",
+    sessions: [
+      { seconds: 10, waitAfter: 22, turns: [{ at: 1.5, say: "Run sleep 15 in the shell, then tell me it finished." }] },
+      { seconds: 15, turns: [] },
+    ],
+    checks: r => {
+      const reopened = r.events.filter(e => e.kind === "talk.start")[1]?.t ?? Infinity;
+      const settled = r.events.find(e => e.kind === "pi.settled")?.t ?? Infinity;
+      const spoken = r.events.filter(e => e.kind === "voice.says" && e.t > reopened).map(e => e.data);
+      return [
+        check("the task finished while voice was off", settled < reopened, `settled ${settled.toFixed(1)} s, reopened ${reopened.toFixed(1)} s`),
+        check("the result was handed to the new connection", r.events.some(e => e.kind === "result" && e.t > reopened)),
+        check("and spoken without being asked", spoken.length > 0, spoken.join(" ")),
+      ];
+    },
+  },
+
   "correction-mid-task": {
     description: "A correction while the task runs is added to it, and the answer follows the correction.",
     sessions: [{ seconds: 40, turns: [

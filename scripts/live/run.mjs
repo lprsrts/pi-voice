@@ -53,6 +53,7 @@ for (const name of names) {
     for (const c of checks) console.log(`    ${c.pass ? "PASS" : "FAIL"}  ${c.name}${c.detail && !c.pass ? `\n          ${String(c.detail).replace(/\s+/g, " ").slice(0, 300)}` : ""}`);
     const turns = r.turns.map(t => `"${t.say.slice(0, 32)}…" reply heard ${t.replyHeard?.toFixed(2) ?? "–"} s, result heard ${t.resultHeard?.toFixed(2) ?? "–"} s after it`);
     if (turns.length) console.log(`    timing:\n      ${turns.join("\n      ")}`);
+    console.log(`    voice connected (billed): ${r.voiceSeconds.toFixed(1)} s of ${r.wallSeconds.toFixed(1)} s`);
     summary.push({ name, run, model: r.model, passed: checks.filter(c => c.pass).length, total: checks.length, latency: answerLatency(r) });
   }
 }

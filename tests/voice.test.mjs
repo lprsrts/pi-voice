@@ -13,6 +13,7 @@ import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../ke
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
 import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext } from '../live.ts';
 import { PROVIDER } from '../providers.ts';
+import { TalkSession, pauseAfterFromEnv, describePause } from '../talk.ts';
 import { providerFiles, userConfigDir } from '../config.ts';
 import { AudioPipes, parseRoute, pcmStats } from '../audio.ts';
 import { aecEnabled, helperPath } from '../native.ts';
@@ -801,4 +802,100 @@ test('override directory follows PI_VOICE_CONFIG_DIR, then Pi\'s agent directory
   assert.equal(userConfigDir({ PI_VOICE_CONFIG_DIR: '/x/voice' }), '/x/voice');
   assert.equal(userConfigDir({ PI_CODING_AGENT_DIR: '/x/pi' }), '/x/pi/pi-voice');
   assert.match(userConfigDir({}), /\.pi\/agent\/pi-voice$/);
+});
+
+// ---------- Talk session: auto-pause and results across voice connections ----------
+
+function fakeTalk({ idle = false, branch = [] } = {}) {
+  let clock = 0;
+  const voices = [], toasts = [], sent = [];
+  const control = { idle, isIdle() { return this.idle; }, abort() {}, hasPendingMessages() { return false; } };
+  const talk = new TalkSession({
+    pi: { sendUserMessage: (text, options) => sent.push([text, options]) },
+    control,
+    branch: () => branch,
+    cwd: () => '/repo',
+    createVoice: hooks => {
+      let resolveStart;
+      const voice = { hooks, said: [], context: [], stopped: 0, started: new Promise(r => { resolveStart = r; }),
+        start(getKey) { return getKey(new AbortController().signal).then(() => voice.started); },
+        notify(text) { voice.said.push(text); }, context(text) { voice.context.push(text); }, mute() {}, stop() { voice.stopped++; },
+        ready() { resolveStart(); return new Promise(r => setImmediate(r)); } };
+      voices.push(voice);
+      return voice;
+    },
+    getKey: async () => 'test-key',
+    notify: (message, level) => toasts.push([level, message]),
+    pauseAfter: () => ({ busy: 15, idle: 60 }),
+    now: () => clock,
+  });
+  return { talk, voices, toasts, sent, control, tick: ms => { clock += ms; talk.checkIdle(); } };
+}
+
+test('auto-pause closes voice after silence while Pi works, and Pi\'s result brings it back to say it', async () => {
+  const { talk, voices, toasts, control, tick } = fakeTalk({ idle: false });
+  talk.open();
+  await voices[0].ready();
+  tick(14_000);
+  assert.equal(talk.connected, true, 'not yet');
+  voices[0].hooks.activity(); // the user said something
+  tick(14_000);
+  assert.equal(talk.connected, true, 'activity resets the silence timer');
+  tick(1_500);
+  assert.deepEqual([talk.connected, talk.isPaused, voices[0].stopped], [false, true, 1]);
+  assert.match(toasts.at(-1)[1], /paused while I work/);
+  // Pi finishes: a new connection opens and says the result once it is ready.
+  control.idle = true;
+  talk.deliver('I finished the task "run the tests". My answer: 47 pass.');
+  assert.equal(voices.length, 2);
+  assert.deepEqual(voices[1].said, [], 'not before the session has started');
+  await voices[1].ready();
+  assert.deepEqual(voices[1].said, ['I finished the task "run the tests". My answer: 47 pass.']);
+  talk.end();
+});
+
+test('while the voice speaks it is never paused; with nothing running the limit is longer', async () => {
+  const { talk, voices, tick } = fakeTalk({ idle: true });
+  talk.open();
+  await voices[0].ready();
+  voices[0].hooks.state('speaking');
+  tick(120_000);
+  assert.equal(talk.connected, true, 'speaking holds the connection');
+  voices[0].hooks.state('listening');
+  tick(59_000);
+  assert.equal(talk.connected, true);
+  tick(2_000);
+  assert.deepEqual([talk.connected, talk.isPaused], [false, false], 'idle pause does not come back by itself');
+  talk.end();
+});
+
+test('after /talk stop, a result waits and is said when voice opens again', async () => {
+  const { talk, voices } = fakeTalk({ idle: false });
+  talk.open();
+  await voices[0].ready();
+  talk.close();
+  talk.deliver('I finished the deploy. My answer: it is live.');
+  assert.equal(voices.length, 1, 'a user stop is not undone by a result');
+  assert.equal(talk.waiting, 1);
+  talk.open();
+  await voices[1].ready();
+  assert.deepEqual(voices[1].said, ['I finished the deploy. My answer: it is live.']);
+  assert.equal(talk.waiting, 0);
+  talk.end();
+});
+
+test('a talk session adopts a task already running and briefs each connection', async () => {
+  const branch = [{ type: 'message', message: { role: 'user', content: `${VOICE_REQUEST}deploy the site` } }];
+  const { talk, voices } = fakeTalk({ idle: false, branch });
+  assert.equal(talk.bridge.status().task, 'deploy the site');
+  talk.open();
+  assert.match(voices[0].hooks.briefing(), /Right now I'm still working on "deploy the site"/);
+  talk.end();
+});
+
+test('auto-pause settings come from the environment', () => {
+  assert.deepEqual(pauseAfterFromEnv({}), { busy: 15, idle: 60 });
+  assert.deepEqual(pauseAfterFromEnv({ PI_VOICE_AUTOPAUSE: '0', PI_VOICE_IDLE_PAUSE: '120' }), { busy: 0, idle: 120 });
+  assert.deepEqual(pauseAfterFromEnv({ PI_VOICE_AUTOPAUSE: 'soon', PI_VOICE_IDLE_PAUSE: '-1' }), { busy: 15, idle: 60 });
+  assert.equal(describePause({ busy: 0, idle: 0 }), 'never (auto-pause is off)');
 });
