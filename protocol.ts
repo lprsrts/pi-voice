@@ -248,7 +248,8 @@ export class Captions {
 const PHRASE = /[^,;:.!?…—–]*(?:[,;:.!?…]+["”’)]*|\s[—–])(?=\s|$)\s*|[^,;:.!?…—–]+$|[^\s]+\s*/g;
 
 /** A caption phrase: `continues` an unfinished sentence, and/or leaves it `open` for more. */
-export type CaptionLine = { phrase: string; spoken: number; continues: boolean; open: boolean };
+/** A caption phrase; `role` is "user" for the user's own words as they are recognized (default: the voice). */
+export type CaptionLine = { phrase: string; spoken: number; continues: boolean; open: boolean; role?: "user" | "voice" };
 
 const SENTENCE_END = /[.!?…]+["”’)]*$/;
 
@@ -296,6 +297,63 @@ export function formatCaption(line: CaptionLine, width: number, measure: (text: 
   const index = Math.max(0, chunks.findIndex(c => line.spoken <= c.end));
   const last = chunks.length - 1;
   return decorate(chunks[index].text, index > 0 || line.continues, index < last || line.open);
+}
+
+// Split-flap caption board: each new letter flips through glyphs for a moment,
+// staggered left to right, then settles with a short glow (after Codex's voice board).
+const FLAP_GLYPHS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+export const FLAP_SETTLE_MS = 180;
+export const FLAP_GLOW_MS = 135;
+const FLAP_BLANK_MS = 40;
+const FLAP_FRAME_MS = 45;
+const FLAP_STAGGER_MS = 12;
+const FLAP_SPREAD_MS = 500; // a whole new line arrives within this
+
+export type FlapTile = { text: string; state: "flip" | "glow" | "still" };
+
+export class FlapBoard {
+  private text = "";
+  private arrivals: number[] = [];
+
+  /**
+   * The line as tiles at `now`. Words carried over from the previous line keep
+   * their state, even when a wider-than-the-bar line slides along: only new
+   * words flip in.
+   */
+  tiles(text: string, now: number): FlapTile[] {
+    if (text !== this.text) {
+      const arrivals = new Array<number | undefined>(text.length).fill(undefined);
+      const words = (line: string) => [...line.matchAll(/[^\s…]+/g)].map(match => ({ word: match[0], at: match.index! }));
+      const previous = words(this.text);
+      let from = 0;
+      for (const { word, at } of words(text)) {
+        const index = previous.findIndex((old, i) => i >= from && old.word === word);
+        if (index < 0) continue;
+        for (let c = 0; c < word.length; c++) arrivals[at + c] = this.arrivals[previous[index].at + c];
+        from = index + 1;
+      }
+      const fresh = arrivals.filter(arrival => arrival === undefined).length;
+      const stagger = Math.min(FLAP_STAGGER_MS, FLAP_SPREAD_MS / Math.max(1, fresh));
+      let k = 0;
+      this.arrivals = arrivals.map(arrival => arrival ?? now + stagger * k++);
+      this.text = text;
+    }
+    const tiles: FlapTile[] = [];
+    const frame = Math.floor(now / FLAP_FRAME_MS);
+    [...text].forEach((char, i) => {
+      const elapsed = now - this.arrivals[i];
+      let shown = char, state: FlapTile["state"] = "still";
+      if (/[A-Za-z0-9]/.test(char) && elapsed < FLAP_SETTLE_MS) {
+        state = "flip";
+        const glyph = FLAP_GLYPHS[(char.charCodeAt(0) + i * 7 + frame * 11) % FLAP_GLYPHS.length];
+        shown = elapsed < FLAP_BLANK_MS ? " " : /[a-z]/.test(char) ? glyph.toLowerCase() : glyph;
+      } else if (/\S/.test(char) && elapsed < FLAP_SETTLE_MS + FLAP_GLOW_MS) state = "glow";
+      const last = tiles.at(-1);
+      if (last && last.state === state) last.text += shown;
+      else tiles.push({ text: shown, state });
+    });
+    return tiles;
+  }
 }
 
 /**

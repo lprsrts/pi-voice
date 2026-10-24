@@ -20,6 +20,8 @@ export type VoiceHooks = {
   briefing?: () => string;
   /** Someone is talking (user speech or audible playback): resets the auto-pause timer. */
   activity?: () => void;
+  /** A finished turn for the spoken history; a reply the user cut off holds only what was heard. */
+  transcript?: (role: "user" | "voice", text: string, interrupted: boolean) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;

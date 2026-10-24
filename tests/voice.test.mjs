@@ -1,4 +1,4 @@
-import { test, after } from 'node:test';
+import { test, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,12 +6,14 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
-import { PiBridge, describeTool, VOICE_REQUEST, CONVERSATION_MARK, sessionBriefing } from '../pi-bridge.ts';
+import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions, FlapBoard, FLAP_SETTLE_MS, FLAP_GLOW_MS } from '../protocol.ts';
+import { PiBridge, describeTool, VOICE_REQUEST, CONVERSATION_MARK, sessionBriefing, SPOKEN_ENTRY } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
-import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext } from '../live.ts';
+import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext, heardPart, LATE_WORDS } from '../live.ts';
+// Scripted exchanges happen in no time; the late-words window gets its own test.
+LATE_WORDS.ms = 0;
 import { PROVIDER } from '../providers.ts';
 import { TalkSession, describePause } from '../talk.ts';
 import { resolveSettings, DEFAULT_SETTINGS } from '../settings.ts';
@@ -157,12 +159,12 @@ class FakeSocket extends EventTarget {
 
 // ---------- OpenAI GPT-Live session (fake socket, no network or audio) ----------
 
-async function startLive({ tool = () => ({ ok: true }), busy = () => false } = {}) {
+async function startLive({ tool = () => ({ ok: true }), busy = () => false, transcripts = [] } = {}) {
   const audio = { enqueued: [], interrupts: 0, muted: [], stopped: 0 };
   const errors = [], captions = [];
   let audioHooks;
   globalThis.WebSocket = FakeSocket;
-  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), closed() {}, tool, busy }, hooks => {
+  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), transcript: (...t) => transcripts.push(t), closed() {}, tool, busy }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish() {},
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -898,7 +900,7 @@ test('a talk session adopts a task already running and briefs each connection', 
 
 test('settings: env over "pi-voice" in Pi settings over defaults, with invalid values reported', () => {
   assert.deepEqual(resolveSettings(undefined, {}).values, DEFAULT_SETTINGS);
-  assert.deepEqual(DEFAULT_SETTINGS, { autoPause: 15, idlePause: 60, captions: false, echoCancellation: true });
+  assert.deepEqual(DEFAULT_SETTINGS, { autoPause: 15, idlePause: 60, captions: true, echoCancellation: true });
   const settings = { 'pi-voice': { autoPause: 30, idlePause: 0, captions: true, echoCancellation: 'nope' }, defaultModel: 'x' };
   const fromSettings = resolveSettings(settings, {});
   assert.deepEqual(fromSettings.values, { autoPause: 30, idlePause: 0, captions: true, echoCancellation: true });
@@ -975,4 +977,158 @@ test('the talk session reports connection, pause, and results to say', async () 
   talk.deliver('done');
   assert.ok(changes > paused, 'a result waiting');
   talk.end();
+});
+
+// ---------- Spoken history and the caption board ----------
+
+test('each finished exchange is written once: the user\'s words, then the reply as far as it was heard', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const transcripts = [];
+    const { voice, socket, output, played } = await startLive({ transcripts });
+    const frame = (pcm = voiced(1)) => { output(pcm, true); played(pcm); };
+    socket.event({ type: 'session.input_transcript.delta', delta: 'run the', start_ms: 0, end_ms: 100 });
+    socket.event({ type: 'session.input_transcript.delta', delta: ' tests', start_ms: 100, end_ms: 200 });
+    socket.event({ type: 'session.output_transcript.delta', delta: '[warm] On it.', start_ms: 300, end_ms: 500 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(10).toString('base64') });
+    for (let i = 0; i < 10; i++) frame();
+    assert.deepEqual(transcripts, [], 'nothing before the exchange is over');
+    // The user talks again: the finished exchange is written before the new turn.
+    socket.event({ type: 'session.input_transcript.delta', delta: 'and lint', start_ms: 900, end_ms: 1000 });
+    assert.deepEqual(transcripts, [['user', 'run the tests', false], ['voice', 'On it.', false]]);
+    // A long reply cut off a quarter of the way in keeps only what was heard.
+    socket.event({ type: 'session.output_transcript.delta', delta: 'The migration touched every handler in the payments service.', start_ms: 1100, end_ms: 1900 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(20).toString('base64') });
+    for (let i = 0; i < 5; i++) frame();
+    socket.event({ type: 'session.input_transcript.delta', delta: 'wait', start_ms: 1300, end_ms: 1400 });
+    assert.deepEqual(transcripts.slice(2), [['user', 'and lint', false], ['voice', 'The migration…', true]]);
+    // Stopping writes what is left.
+    voice.stop();
+    assert.deepEqual(transcripts.slice(4), [['user', 'wait', false]]);
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('a quiet moment after the voice speaks writes the exchange; a handoff and its acknowledgement are not', async () => {
+  const originalWS = globalThis.WebSocket;
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  try {
+    const transcripts = [];
+    const live = startLive({ transcripts });
+    mock.timers.tick(0);
+    const { voice, socket, output, played } = await live;
+    // Thinking aloud (no handoff), answered by the voice, then a request it hands to Pi.
+    socket.event({ type: 'session.input_transcript.delta', delta: 'the parser is slow', start_ms: 0, end_ms: 300 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Want me to profile it?', start_ms: 400, end_ms: 600 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'yes profile it', start_ms: 800, end_ms: 1000 });
+    assert.deepEqual(transcripts, [['user', 'the parser is slow', false], ['voice', 'Want me to profile it?', false]]);
+    socket.event({ type: 'session.delegation.created', delegation: { id: 'del_1' }, offset_ms: 1000 });
+    mock.timers.tick(1300);
+    assert.equal(transcripts.length, 2, 'Pi\'s message shows the request; it is not written again');
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Fixing it now.', start_ms: 1100, end_ms: 1400 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+    for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
+    mock.timers.tick(300);
+    output(Buffer.alloc(960), true); // silence: playback has drained
+    mock.timers.tick(1300);
+    assert.equal(transcripts.length, 2, 'the acknowledgement of a handoff stays on the live line');
+    voice.stop();
+    assert.equal(transcripts.length, 2, 'nothing is written later either');
+  } finally { mock.timers.reset(); globalThis.WebSocket = originalWS; }
+});
+
+test('a cut-off reply keeps whole words', () => {
+  assert.equal(heardPart('All tests pass.', 1), 'All tests pass.');
+  assert.equal(heardPart('All tests pass, nothing else changed.', 0.5), 'All tests pass…');
+  assert.equal(heardPart('All tests pass.', 0.1), '');
+});
+
+test('the caption board flips new letters, then settles them with a glow; unchanged letters stay still', () => {
+  const board = new FlapBoard();
+  const at = (text, now) => board.tiles(text, now);
+  const text = tiles => tiles.map(t => t.text).join('');
+  const first = at('Done.', 1000);
+  assert.equal(text(first).length, 5);
+  assert.equal(first[0].state, 'flip');
+  const flipping = at('Done.', 1100);
+  assert.notEqual(text(flipping).slice(0, 4), 'Done', 'letters show other glyphs while flipping');
+  assert.deepEqual(at('Done.', 1000 + FLAP_SETTLE_MS + 60), [{ text: 'Done.', state: 'glow' }]);
+  assert.deepEqual(at('Done.', 1000 + FLAP_SETTLE_MS + FLAP_GLOW_MS + 60), [{ text: 'Done.', state: 'still' }]);
+  // A longer line keeps the shared start still; only the new letters flip.
+  const grown = at('Done. Next', 2000);
+  assert.deepEqual(grown[0], { text: 'Done. ', state: 'still' });
+  assert.ok(grown.slice(1).some(t => t.state === 'flip'));
+  assert.deepEqual(at('', 2100), []);
+  // A line wider than the bar slides along: carried-over words stay still, only the new word flips.
+  at('…testing the synchronisation between…', 3000);
+  const line = '…the synchronisation between voices…';
+  const slid = at(line, 3000 + 500 + FLAP_SETTLE_MS + FLAP_GLOW_MS + 60); // after the first line's stagger
+  const states = slid.flatMap(t => [...t.text].map(() => t.state));
+  const state = word => states[line.indexOf(word)];
+  assert.deepEqual([state('the'), state('synchronisation'), state('between')], ['still', 'still', 'still'], 'carried-over words stay still');
+  assert.equal(state('voices'), 'flip', 'only the new word flips');
+});
+
+test('the briefing includes what was said aloud, without repeating requests Pi already has', () => {
+  const spoken = (role, text) => ({ type: 'custom', customType: SPOKEN_ENTRY, data: { role, text } });
+  const text = sessionBriefing([
+    spoken('user', 'what does the parser do with tabs?'), spoken('voice', 'It expands them to two spaces.'),
+    { type: 'message', message: { role: 'user', content: `${VOICE_REQUEST}make it four` } },
+    spoken('user', 'make it four'), spoken('voice', 'On it.'),
+  ], {});
+  assert.match(text, /- The user \(said to me\): what does the parser do with tabs\?\n- Me \(said aloud\): It expands them to two spaces\.\n- The user \(spoken\): make it four\n- Me \(said aloud\): On it\.\n/);
+});
+
+test('the voice reading out Pi\'s result is not written again under Pi\'s answer', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const transcripts = [];
+    const { voice, socket, output, played } = await startLive({ transcripts });
+    const say = (text, from) => {
+      socket.event({ type: 'session.output_transcript.delta', delta: text, start_ms: from, end_ms: from + 100 });
+      socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+      for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
+    };
+    voice.notify('I finished the task "check the repo". My answer: four packages, no algorithms yet.');
+    say('Four packages, no algorithms yet.', 0);
+    socket.event({ type: 'session.input_transcript.delta', delta: 'what next', start_ms: 500, end_ms: 600 });
+    assert.deepEqual(transcripts, [], 'the read-out is skipped');
+    say('A small working example.', 700);
+    socket.event({ type: 'session.input_transcript.delta', delta: 'ok', start_ms: 1000, end_ms: 1100 });
+    assert.deepEqual(transcripts, [['user', 'what next', false], ['voice', 'A small working example.', false]], 'later replies are written');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('while Pi works, what is said stays on the live line: the user\'s words show there as they are heard', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const transcripts = [];
+    const { voice, socket, captions } = await startLive({ transcripts, busy: () => true });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'how is it', start_ms: 0, end_ms: 100 });
+    socket.event({ type: 'session.input_transcript.delta', delta: ' going', start_ms: 100, end_ms: 200 });
+    assert.equal(captions.at(-1), 'how is it going', 'the live line follows the user\'s words');
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Still on the tests.', start_ms: 300, end_ms: 500 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'ok', start_ms: 700, end_ms: 800 });
+    voice.stop();
+    assert.deepEqual(transcripts, [], 'nothing said while Pi works is written to the chat');
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the user\'s last word arriving after the reply began joins the user\'s turn instead of splitting it', async () => {
+  const originalWS = globalThis.WebSocket;
+  LATE_WORDS.ms = 1500;
+  try {
+    const transcripts = [];
+    const { voice, socket, output, played } = await startLive({ transcripts });
+    // Timing that does not show the word as late on the session clock (as seen live).
+    socket.event({ type: 'session.input_transcript.delta', delta: "How's it", start_ms: 0, end_ms: 300 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Quite well', start_ms: 100, end_ms: 400 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(10).toString('base64') });
+    output(voiced(1), true); played(voiced(1));
+    socket.event({ type: 'session.input_transcript.delta', delta: ' going', start_ms: 350, end_ms: 500 });
+    socket.event({ type: 'session.output_transcript.delta', delta: ', thank you.', start_ms: 400, end_ms: 700 });
+    for (let i = 0; i < 9; i++) { output(voiced(1), true); played(voiced(1)); }
+    voice.stop();
+    assert.deepEqual(transcripts, [['user', "How's it going", false], ['voice', 'Quite well, thank you.', false]]);
+  } finally { LATE_WORDS.ms = 0; globalThis.WebSocket = originalWS; }
 });

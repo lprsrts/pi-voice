@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Spoken history
+
+- **Your conversation with the voice stays in the chat.** Your words and the voice's replies are written into the Pi session once the voice goes quiet, so they show in the transcript and come back when you resume. A reply you talked over keeps only the part you heard, marked *(interrupted)*. What is said while Pi works (progress remarks, acknowledgements, status questions) and the voice reading out Pi's result are not written, since Pi's own messages cover them. Pi's model does not see these entries; it gets each request as a message.
+- A spoken request Pi received shows as what you said (`› make it four`) instead of the transcript framing and the conversation appended for Pi.
+- The voice's briefing at `/talk start` includes the spoken history, so a conversation that never reached Pi is remembered across voice sessions.
+- **Live line above the input.** The voice bar now sits above the input (you can keep typing), and its live line shows your words as they are recognized and the voice's current phrase, flipping in like a split-flap board and settling with a short glow.
+- Captions (the live line) are on by default; `"captions": false` or `/talk captions off` hides them.
+
 ### Breaking changes
 
 - `/talk-preview` is now `/talk preview [state|off]`.

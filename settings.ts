@@ -2,20 +2,20 @@
 // project's .pi/settings.json, which Pi merges over it), each overridable by an
 // environment variable, else the default.
 //
-//   "pi-voice": { "autoPause": 15, "idlePause": 60, "captions": false, "echoCancellation": true }
+//   "pi-voice": { "autoPause": 15, "idlePause": 60, "captions": true, "echoCancellation": true }
 
 export type VoiceSettings = {
   /** Seconds of silence while Pi works before the voice connection pauses (0 = never). */
   autoPause: number;
   /** Seconds of silence while nothing runs before it pauses (0 = never). */
   idlePause: number;
-  /** Show the caption line under the bar at start. */
+  /** Show the live line (what is being said, both ways) under the bar at start. */
   captions: boolean;
   /** Apple voice processing (echo cancellation); off only with headphones. */
   echoCancellation: boolean;
 };
 
-export const DEFAULT_SETTINGS: VoiceSettings = { autoPause: 15, idlePause: 60, captions: false, echoCancellation: true };
+export const DEFAULT_SETTINGS: VoiceSettings = { autoPause: 15, idlePause: 60, captions: true, echoCancellation: true };
 
 export const SETTINGS_KEY = "pi-voice";
 

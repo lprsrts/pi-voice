@@ -36,7 +36,7 @@ export const VOICE_REQUEST = "Voice request (speech transcript; may contain reco
 /** Introduces the spoken conversation a voice request refers to. */
 export const CONVERSATION_MARK = "\n\nWhat we said since my last request, oldest first:\n";
 /** The user's words of a request, without the voice framing, for status and notices. */
-const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split(CONVERSATION_MARK)[0] : request;
+export const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split(CONVERSATION_MARK)[0] : request;
 
 /** One-line, bounded description of a tool call for pi_status. */
 export function describeTool(name: string, args: unknown): string {
@@ -65,6 +65,10 @@ function userText(message: any): string {
 
 const BRIEFING_CHARS = 4000;
 
+/** Session entries (not sent to the model) holding what was said aloud: the user's words and the voice's replies. */
+export const SPOKEN_ENTRY = "pi-voice-spoken";
+export type SpokenEntry = { role: "user" | "voice"; text: string; interrupted?: boolean };
+
 /**
  * What a new voice session should know, in the first person: the voice starts
  * blank each time, but the Pi session holds the conversation and the work.
@@ -74,12 +78,21 @@ const BRIEFING_CHARS = 4000;
 export function sessionBriefing(entries: readonly any[], options: { cwd?: string; status?: any } = {}): string {
   let summary = "";
   const turns: string[] = [];
+  const spokenRequests = new Set<string>();
   for (const entry of entries) {
-    if (entry?.type === "compaction" && typeof entry.summary === "string") { summary = entry.summary; turns.length = 0; continue; }
+    if (entry?.type === "compaction" && typeof entry.summary === "string") { summary = entry.summary; turns.length = 0; spokenRequests.clear(); continue; }
+    if (entry?.type === "custom" && entry.customType === SPOKEN_ENTRY && typeof entry.data?.text === "string") {
+      // What was said aloud. A request handed to Pi is already in the conversation as its message.
+      const text = entry.data.text.replace(/\s+/g, " ").trim();
+      if (entry.data.role === "voice") turns.push(`- Me (said aloud): ${clip(text, 300)}`);
+      else if (!spokenRequests.has(text)) turns.push(`- The user (said to me): ${clip(text, 300)}`);
+      continue;
+    }
     if (entry?.type !== "message") continue;
     const user = userText(entry.message);
     if (user) {
       const spoken = user.startsWith(VOICE_REQUEST);
+      if (spoken) spokenRequests.add(spokenPart(user).replace(/\s+/g, " ").trim());
       turns.push(`- The user (${spoken ? "spoken" : "typed"}): ${clip(spokenPart(user).replace(/\s+/g, " "), 300)}`);
       continue;
     }

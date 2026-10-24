@@ -1,16 +1,16 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { mixColors, visibleWidth, type KeyId } from "@earendil-works/pi-tui";
+import { mixColors, Text, visibleWidth, type KeyId } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
-import { VOICE_PROMPT } from "./pi-bridge.ts";
+import { SPOKEN_ENTRY, spokenPart, VOICE_PROMPT, VOICE_REQUEST, type SpokenEntry } from "./pi-bridge.ts";
 import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
 import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
 import { PROVIDER } from "./providers.ts";
-import { dominantFrequency, formatCaption, type CaptionLine } from "./protocol.ts";
+import { dominantFrequency, FlapBoard, formatCaption, type CaptionLine } from "./protocol.ts";
 import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, type ShortcutAction, type TalkCommand } from "./commands.ts";
 
 const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
@@ -22,6 +22,7 @@ const PREVIEW_CAPTIONS: CaptionLine[] = [
   { phrase: "Pi is still on the migration;", spoken: 0, continues: false, open: true },
   { phrase: "two files to go.", spoken: 0, continues: true, open: false },
 ];
+const PREVIEW_HEARD: CaptionLine = { phrase: "what's left on the migration", spoken: 28, continues: false, open: true, role: "user" };
 type State = (typeof states)[number];
 
 // Listening and speaking draw the same Gaussian beam as thinking. Loudness sets
@@ -66,10 +67,9 @@ function modelName(ctx: ExtensionContext): string {
   return model ? `${model.provider ? `${model.provider}/` : ""}${model.id ?? model.name ?? "model"}` : "no model selected";
 }
 
-function centered(caption: CaptionLine | undefined, width: number, style: (text: string) => string): string {
-  if (!caption || width < 4) return "";
-  const line = formatCaption(caption, width, visibleWidth);
-  return " ".repeat(Math.max(0, Math.floor((width - visibleWidth(line)) / 2))) + style(line);
+function centered(caption: CaptionLine | undefined, width: number, paint: (text: string) => string): string {
+  const line = caption && width >= 4 ? formatCaption(caption, width, visibleWidth) : "";
+  return " ".repeat(Math.max(0, Math.floor((width - visibleWidth(line)) / 2))) + paint(line);
 }
 
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
@@ -114,6 +114,7 @@ export default function voicePreview(pi: ExtensionAPI) {
         let lastSpoke = 0;
         let weights = states.map(state => state === "idle" ? 1 : 0);
         const input = newBeam(200), output = newBeam(200);
+        const board = new FlapBoard();
         timer = setInterval(() => tui.requestRender(), 33);
         timer.unref();
         return {
@@ -183,21 +184,26 @@ export default function voicePreview(pi: ExtensionAPI) {
               previousY = y;
             }
             // Foreground only: no background fill or textual state labels. Below the
-            // bar, the agent's current phrase, centered; the row stays to avoid layout jumps.
+            // bar, the live line: what the user is saying or the voice's current phrase,
+            // centered, flipping in like a split-flap board; the row stays to avoid layout jumps.
             const bar = dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
             if (state === "speaking") lastSpoke = now;
             const line = choice === "live"
               ? (now - Math.max(captionAt, lastSpoke) < CAPTION_HOLD_MS ? caption : undefined)
-              : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 1.6) % PREVIEW_CAPTIONS.length] : undefined;
+              : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 1.6) % PREVIEW_CAPTIONS.length]
+              : weights[1] > 0.5 ? PREVIEW_HEARD : undefined;
             if (!captionsOn()) return bar;
-            return [...bar, centered(line, columns, text => theme.style(text, { fg: theme.colors.muted }))];
+            const fg = line?.role === "user"
+              ? { flip: theme.colors.dim, glow: theme.colors.accent, still: theme.colors.text }
+              : { flip: theme.colors.dim, glow: theme.colors.success, still: theme.colors.muted };
+            return [...bar, centered(line, columns, text => board.tiles(text, now).map(tile => theme.style(tile.text, { fg: fg[tile.state] })).join(""))];
           },
           dispose() {
             if (timer) clearInterval(timer);
             timer = undefined;
           },
         };
-      }, { placement: "belowEditor" });
+      }, { placement: "aboveEditor" });
   }
 
   /** Builds the native audio helper on first use, telling the user why the first command is slow. */
@@ -350,6 +356,22 @@ export default function voicePreview(pi: ExtensionAPI) {
     }
   }
 
+  // The spoken history: what was said aloud stays in the chat (and the session file)
+  // without reaching Pi's model, which gets each request as its own message.
+  pi.registerEntryRenderer<SpokenEntry>(SPOKEN_ENTRY, (entry, _options, theme) => {
+    const spoken = entry.data;
+    if (!spoken?.text) return undefined;
+    if (spoken.role === "user") {
+      return new Text(`${theme.fg("accent", "›")} ${theme.fg("userMessageText", spoken.text)}`, 1, 1, text => theme.bg("userMessageBg", text));
+    }
+    return new Text(`${theme.fg("success", "•")} ${theme.italic(theme.fg("muted", spoken.text))}${spoken.interrupted ? theme.fg("dim", " (interrupted)") : ""}`, 1, 0);
+  });
+
+  // A spoken request Pi received shows as what was said; Pi's model still gets the
+  // transcript framing and the conversation it refers to (shown as spoken entries).
+  pi.registerMarkdownTransformer((markdown, context) =>
+    context.messageType === "user" && markdown.startsWith(VOICE_REQUEST) ? `› ${spokenPart(markdown).trim()}` : markdown);
+
   pi.registerCommand("talk", {
     description: "Realtime voice for Pi: no argument starts or stops it; /talk help lists the rest",
     getArgumentCompletions: talkCompletions,
@@ -398,7 +420,9 @@ export default function voicePreview(pi: ExtensionAPI) {
           if (source === "input") { inputSamples = samples; inputTime = Date.now(); }
           else { outputSamples = samples; outputTime = Date.now(); }
         },
-        caption: line => { caption = line; captionAt = Date.now(); },
+        // A voice-side clear never wipes the words the user is saying.
+        caption: line => { if (!line.phrase && caption?.role === "user") return; caption = line; captionAt = Date.now(); },
+        transcript: (role, text, interrupted) => pi.appendEntry<SpokenEntry>(SPOKEN_ENTRY, interrupted ? { role, text, interrupted } : { role, text }),
       },
       pauseAfter: () => pauseAfterFromSettings(),
       changed: refreshStatus,

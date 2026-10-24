@@ -24,6 +24,8 @@ export type TalkHost = {
     state?(state: VoiceState): void;
     samples?(source: "input" | "output", samples: number[]): void;
     caption?(line: CaptionLine): void;
+    /** A finished spoken turn, for the chat history. */
+    transcript?(role: "user" | "voice", text: string, interrupted: boolean): void;
   };
   /** The connection, pause, or results-to-say changed (for a status indicator). */
   changed?(): void;
@@ -97,6 +99,7 @@ export class TalkSession {
       samples: (source, samples) => view.samples?.(source, samples),
       error: message => this.host.notify(message, "error"),
       caption: line => view.caption?.(line),
+      transcript: (role, text, interrupted) => view.transcript?.(role, text, interrupted),
       closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
       tool: (name, args) => bridge.call(name, args),
       busy: () => !this.host.control.isIdle(),

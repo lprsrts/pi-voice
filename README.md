@@ -41,6 +41,10 @@ GPT-Live bills per second while a voice connection is open, whether anyone speak
 
 When GPT-Live decides your request needs real work, it hands it off, and pi-voice sends what you said to Pi as a message. While Pi works, its progress reaches the voice silently, so "what's Pi doing?" gets an answer without interrupting it. Saying something else adds to the running task, and "stop" or "cancel" stops it. When Pi finishes, the voice says the result. The voice and Pi are one agent: it talks about the work as its own ("I'm running the tests"), and each `/talk start` picks up where the session is (recent requests and answers, and any task still running, whose result it will announce), so you can stop and restart voice mid-task. While a voice session runs, Pi is told that its answers are spoken, so it ends with a short, speakable summary.
 
+While voice runs, a bar sits above the input; you can keep typing. Its live line shows what is being said as it is said, flipping in like a split-flap board: your words as they are recognized, then the voice's current phrase.
+
+Your conversation with the voice also stays in the chat: your words (`›`) and its replies (`•`), each written once the voice goes quiet. A reply you talked over keeps only the part you heard, marked *(interrupted)*. What is said while Pi works (the voice's progress remarks, acknowledgements, status questions) and the voice reading out Pi's result show only on the live line, since Pi's own messages already cover them. A request handed to Pi shows as what you said, in Pi's own message, and the voice's briefing at the next `/talk start` includes this spoken history. It is saved in the Pi session, so it comes back when you resume, and Pi's model never sees it (it gets each request as a message).
+
 ## Commands
 
 | Command | What it does |
@@ -49,7 +53,7 @@ When GPT-Live decides your request needs real work, it hands it off, and pi-voic
 | `/talk start` | Start a voice session with this Pi session as the backend, or resume it after a pause. |
 | `/talk stop` | End the voice connection. A Pi task keeps running; its result is said at the next `/talk start`. |
 | `/talk mute [on\|off]` | Stop or resume the microphone; no argument toggles. `/talk unmute` also resumes it. |
-| `/talk captions [on\|off]` | Show what the agent is saying, phrase by phrase, timed to the audio the speaker actually plays. Off by default; no argument toggles. |
+| `/talk captions [on\|off]` | Show or hide the live line under the bar: your words as they are recognized, and the voice's phrase timed to the audio the speaker actually plays. On by default; no argument toggles. |
 | `/talk check` | Show setup status: audio helper, devices, API key, Pi's backend model, settings, shortcuts. No network or microphone use. |
 | `/talk devices` | Show the input and output in use (the macOS defaults). |
 | `/talk tone [20-20000]` | Play a test tone (440 Hz by default). |
@@ -96,7 +100,7 @@ Put a `"pi-voice"` object in Pi's `settings.json` (`~/.pi/agent/settings.json`, 
   "pi-voice": {
     "autoPause": 15,
     "idlePause": 60,
-    "captions": false,
+    "captions": true,
     "echoCancellation": true
   }
 }
@@ -106,7 +110,7 @@ Put a `"pi-voice"` object in Pi's `settings.json` (`~/.pi/agent/settings.json`, 
 |---|---|---|---|
 | `autoPause` | `PI_VOICE_AUTOPAUSE` | `15` | Seconds of silence while Pi works before voice pauses (it comes back with the result). `0` = never. |
 | `idlePause` | `PI_VOICE_IDLE_PAUSE` | `60` | Seconds of silence while nothing runs before voice pauses (`/talk start` resumes). `0` = never. |
-| `captions` | `PI_VOICE_CAPTIONS` | `false` | Show the caption line at start (`/talk captions` toggles it per session). |
+| `captions` | `PI_VOICE_CAPTIONS` | `true` | Show the live line at start (`/talk captions` toggles it per session). |
 | `echoCancellation` | `PI_VOICE_AEC` | `true` | Apple's voice processing. Turn off only with headphones, or the agent hears itself. |
 
 `PI_VOICE_CONFIG_DIR` sets where your voice and persona overrides live (see below).
