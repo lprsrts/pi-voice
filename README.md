@@ -103,7 +103,7 @@ The defaults are in [`providers/openai-live/`](providers/openai-live).
 
 ## Troubleshooting
 
-- **The agent hears itself and loops:** make sure `PI_VOICE_AEC` isn't `0` (`/talk check`).
+- **The agent hears itself and loops:** make sure echo cancellation is on (`/talk check`; the `echoCancellation` setting or `PI_VOICE_AEC`).
 - **No sound:** run `/talk tone` and check the output in Sound settings.
 - **The agent never hears you:** run `/talk mic-test`. Below about -40 dBFS means the wrong input device or no microphone permission. Another app holding the mic (e.g. a call) can also block it.
 - **Bluetooth sounds bad:** using AirPods as the microphone lowers their audio quality. Use the Mac's microphone for input and AirPods for output.
