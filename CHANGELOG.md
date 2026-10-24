@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Requests carry the conversation.** A handoff sends your latest turn as the request together with everything said since the previous one (your earlier turns and the voice's replies), so a question like "does that single line addition work?" reaches Pi with the explanation it refers to. Pi's voice prompt explains the format.
+- The voice lets you think aloud and explain over several turns without handing off, and Pi answers questions about a change instead of making it unless asked.
+- **Live test scripts** (`scripts/live/`): real-life scenarios (quick answer, status and stop, restart memory, multi-turn explanation, correction mid-task) against real GPT-Live and a real Pi session, with checks, timing, model comparison (`--model`), and three audio modes.
 - **One agent, one voice.** The voice speaks about the work in the first person ("I'm running the tests", "I stopped it"), never as "Pi" or a backend: the voice prompt, every update it receives (results, progress, status, cancellation), and Pi's own voice-mode prompt now treat the voice and the Pi session as one agent.
 - **Memory across voice sessions.** Each `/talk start` briefs the new voice session from the Pi session: the latest compaction summary, recent spoken and typed requests with the answers, and any task still running, so after restarting voice mid-task it knows what it is doing. A task still running when voice starts is adopted, so its result is announced in the new session.
 - **Pi is the backend.** GPT-Live now hands work to the Pi session itself (client delegation): what you said goes to Pi as a message, Pi works with its own model (`/model`), tools, and environment, its progress reaches the voice silently, and its result is spoken on the same delegation. No separate backend model runs in between, so the backend model is whatever Pi uses.

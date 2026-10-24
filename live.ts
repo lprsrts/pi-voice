@@ -1,6 +1,6 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
-import { VOICE_REQUEST } from "./pi-bridge.ts";
+import { CONVERSATION_MARK, VOICE_REQUEST } from "./pi-bridge.ts";
 import { Captions, clipTokens, type CaptionLine, waveform, type VoiceState } from "./protocol.ts";
 
 // OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with client
@@ -21,6 +21,21 @@ const DELEGATION_SETTLE_MS = 350;
 // While Pi works, these are handled locally instead of being sent to Pi as messages.
 const STOP_REQUEST = /^(please\s+)?(stop|cancel|abort|halt|never\s?mind|forget it)(\s+(it|that|this|the task|the job|everything|pi|now))*(\s+please)?[.!]*$/i;
 const STATUS_REQUEST = /^(so\s+|and\s+|okay,?\s+|ok,?\s+)?(what('?s| is)\s+(pi|it|he|she)\s+doing|what('?re|\s+are)\s+you\s+(doing|working\s+on|up\s+to)|how('?s| is)\s+it\s+going|how far|(is|are)\s+(it|pi|you)\s+(done|finished)|any\s+(news|progress|update)|status|progress)\b[^.!?]{0,40}[.?!]*$/i;
+
+const CONTEXT_CHARS = 3000;
+
+/** The spoken conversation since the last request, newest kept, for the request Pi receives. */
+export function conversationContext(conversation: { role: "user" | "voice"; text: string }[]): string {
+  const lines: string[] = [];
+  let chars = 0;
+  for (let i = conversation.length - 1; i >= 0; i--) {
+    const line = `- ${conversation[i].role === "user" ? "User" : "You (voice)"}: ${conversation[i].text}`;
+    if (chars + line.length > CONTEXT_CHARS) { if (!lines.length) lines.unshift(`${line.slice(0, CONTEXT_CHARS - 1)}…`); break; }
+    lines.unshift(line);
+    chars += line.length;
+  }
+  return lines.length ? `${CONVERSATION_MARK}${lines.join("\n")}` : "";
+}
 
 /** The work's status (pi_status) as a first-person sentence the voice can relay. */
 export function describeStatus(status: any): string {
@@ -96,9 +111,11 @@ export class LiveVoice {
   private consumedMs = -1;
   private lastRequest = "";
   private said = "";  // what the voice has said since the user last spoke
-  private prior = ""; // what it said before the user's current turn: context for short replies
   private turnFrom = -Infinity; // session-clock start of the user's current turn
-  private earlier = ""; // the user's previous turn, as context for short replies
+  // Everything said since the last delegation, finished turns only: the request
+  // is the latest turn, and this is the conversation that leads up to it.
+  private conversation: { role: "user" | "voice"; text: string }[] = [];
+  private delegatedFrom?: number; // turnFrom of the turn the last delegation took
   private voiceFrom?: number; // session-clock start of the voice's current reply
   private delegation?: string;
   private waiting?: { id: string; offset: number; timer: ReturnType<typeof setTimeout> };
@@ -251,12 +268,15 @@ export class LiveVoice {
         if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); }
         if (!this.userTurn) {
           this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
-          this.prior = this.said;     // an acknowledgement spoken after the request is not its context
-          this.said = "";
-          // A new user turn: a delegation takes only its words. An earlier turn the
-          // voice answered by itself (say, a status question) must not leak into it.
+          // A new user turn. The finished one and the voice's reply become the
+          // conversation the next request is part of (a turn already sent as a
+          // request is not repeated); the request itself is only the new turn's words.
           const from = typeof event.start_ms === "number" ? event.start_ms : (this.heard.at(-1)?.start ?? -Infinity);
-          this.earlier = this.turnWords(this.turnFrom, from) || this.earlier;
+          const previous = this.turnWords(this.turnFrom, from);
+          if (previous && this.turnFrom !== this.delegatedFrom) this.conversation.push({ role: "user", text: previous });
+          if (this.said.trim()) this.conversation.push({ role: "voice", text: this.said.trim() });
+          this.conversation = this.conversation.slice(-40);
+          this.said = "";
           this.turnFrom = from;
         }
         this.userTurn = true;
@@ -335,14 +355,12 @@ export class LiveVoice {
       this.commentary(describeStatus(this.hooks.tool("pi_status", {})), id);
       return;
     }
-    // Short replies ("yes, do that") need what the voice had just said to make sense.
-    const before = [
-      this.earlier && `the user said: "${this.earlier.slice(-300)}"`,
-      this.prior.trim() && `the voice assistant said: "${this.prior.trim().slice(-300)}"`,
-    ].filter(Boolean).join(", then ");
-    const context = request.length < 80 && before ? `\n(Just before, ${before})` : "";
-    const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${context}`, when: "now" }) as { status?: string; error?: string };
+    // The request is the latest turn; what was said since the last request (an
+    // explanation over several turns, the voice's questions) is what it refers to.
+    const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${conversationContext(this.conversation)}`, when: "now" }) as { status?: string; error?: string };
     if (result.error) { this.commentary(`I couldn't take that request: ${result.error}`, id); return; }
+    this.conversation = [];
+    this.delegatedFrom = this.turnFrom;
     this.delegation = id;
     this.thinking(result.status === "started"
       ? "I've started on it. The result arrives as an update; do not state any result before that."

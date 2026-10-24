@@ -7,11 +7,11 @@ import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
 import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions } from '../protocol.ts';
-import { PiBridge, describeTool, VOICE_REQUEST, sessionBriefing } from '../pi-bridge.ts';
+import { PiBridge, describeTool, VOICE_REQUEST, CONVERSATION_MARK, sessionBriefing } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
-import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus } from '../live.ts';
+import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext } from '../live.ts';
 import { PROVIDER } from '../providers.ts';
 import { providerFiles, userConfigDir } from '../config.ts';
 import { AudioPipes, parseRoute, pcmStats } from '../audio.ts';
@@ -400,8 +400,8 @@ test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s r
     socket.event({ type: 'session.input_transcript.delta', delta: 'Then commit.', start_ms: 5000, end_ms: 5600 });
     socket.event({ type: 'session.delegation.created', offset_ms: 5700, delegation: { id: 'd2', type: 'delegation', target: 'client' } });
     await settle();
-    // It is short, so it carries what the voice said before it (not after).
-    assert.match(calls[1][1].request, /: Then commit\.\n\(Just before, the user said: "Run the tests in the voice repo\.", then the voice assistant said: "On it\."\)$/);
+    // It carries what was said since the first request, which itself is not repeated.
+    assert.match(calls[1][1].request, /: Then commit\.\n\nWhat we said since my last request, oldest first:\n- You \(voice\): On it\.$/);
     assert.ok(socket.sent.every(e => typeof e.event_id === 'string'), 'every client event carries an event_id');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
@@ -409,7 +409,7 @@ test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s r
 
 test('Pi status and notices name the spoken words, not the voice framing', () => {
   const { bridge, sent, notices, control } = fakePi();
-  bridge.call('ask_pi', { request: `${VOICE_REQUEST}Yes, do it.\n(Just before, the voice assistant said: "Shall Pi fix it?")` });
+  bridge.call('ask_pi', { request: `${VOICE_REQUEST}Yes, do it.${CONVERSATION_MARK}- You (voice): Shall I fix it?` });
   assert.equal(sent[0][0].startsWith(VOICE_REQUEST), true, 'Pi itself gets the framing');
   control.idle = false;
   assert.equal(bridge.status().task, 'Yes, do it.');
@@ -435,6 +435,42 @@ test('a complete request goes to Pi at once; an incomplete one waits briefly for
   } finally { globalThis.WebSocket = originalWS; }
 });
 
+test('an explanation over several turns reaches Pi with the question that refers to it', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const calls = [];
+    const { voice, socket } = await startLive({ tool: (name, args) => { calls.push(args.request); return { status: 'started' }; } });
+    // Reported live: a long explanation with pauses, the voice answering in between, then the question.
+    const user = (delta, start) => socket.event({ type: 'session.input_transcript.delta', delta, start_ms: start, end_ms: start + 1000 });
+    const voiceSays = (delta, start) => socket.event({ type: 'session.output_transcript.delta', delta, start_ms: start, end_ms: start + 800 });
+    user('In live.ts the delegate method should also log the delegation id', 1000);
+    voiceSays('Got it, logging the id.', 2500);
+    user('Just one line, next to where the thinking update is sent', 4000);
+    voiceSays('Mm-hm.', 5500);
+    user('. Does that single line addition work in this current structure? Do we need anything else?', 7000);
+    socket.event({ type: 'session.delegation.created', offset_ms: 8000, delegation: { id: 'd1' } });
+    assert.equal(calls.length, 1);
+    const [request, context] = calls[0].split(CONVERSATION_MARK);
+    assert.match(request, /: \. Does that single line addition work in this current structure\? Do we need anything else\?$/);
+    assert.equal(context, [
+      '- User: In live.ts the delegate method should also log the delegation id',
+      '- You (voice): Got it, logging the id.',
+      '- User: Just one line, next to where the thinking update is sent',
+      '- You (voice): Mm-hm.',
+    ].join('\n'));
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('conversation context keeps the newest lines within its budget', () => {
+  assert.equal(conversationContext([]), '');
+  const long = Array.from({ length: 100 }, (_, i) => ({ role: i % 2 ? 'voice' : 'user', text: `line ${i} ${'x'.repeat(80)}` }));
+  const text = conversationContext(long);
+  assert.ok(text.length < 3200, `bounded (${text.length})`);
+  assert.match(text, /line 99/);
+  assert.doesNotMatch(text, /line 0 /);
+});
+
 test('a short reply reaches Pi with what the voice had just said', async () => {
   const originalWS = globalThis.WebSocket;
   try {
@@ -444,7 +480,7 @@ test('a short reply reaches Pi with what the voice had just said', async () => {
     socket.event({ type: 'session.input_transcript.delta', delta: 'Yes, do it.', start_ms: 2500, end_ms: 3000 });
     socket.event({ type: 'session.delegation.created', offset_ms: 3100, delegation: { id: 'd1' } });
     await settle();
-    assert.match(calls[0][1].request, /Yes, do it\.\n\(Just before, the voice assistant said: "The build fails on a missing import\. Shall Pi fix it\?"\)$/);
+    assert.match(calls[0][1].request, /Yes, do it\.\n\nWhat we said since my last request, oldest first:\n- You \(voice\): The build fails on a missing import\. Shall Pi fix it\?$/);
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
@@ -519,7 +555,7 @@ test('the briefing keeps the newest turns, marks spoken requests, and says what 
     message('user', 'an old request that the compaction summary replaces'),
     { type: 'compaction', summary: 'Set up the repo and fixed lint.' },
     message('user', 'fix the parser'), message('assistant', 'Fixed the off-by-one in the parser.'),
-    message('user', `${VOICE_REQUEST}run the tests\n(Just before, the voice assistant said: "Done.")`),
+    message('user', `${VOICE_REQUEST}run the tests${CONVERSATION_MARK}- You (voice): Done.`),
     { type: 'model_change' },
   ];
   const text = sessionBriefing(entries, { cwd: '/repo', status: { state: 'working', task: 'run the tests', last_tool: 'bash: npm test' } });

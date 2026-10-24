@@ -9,8 +9,8 @@
 // voice, so its answers are heard rather than read.
 export const VOICE_PROMPT = [
   "You are speaking with the user right now: a live voice (GPT-Live) is your own voice and ears in this session. It hears the user, passes their requests to you, and speaks your final answer aloud in your name, possibly paraphrased. You and the voice are one agent, not two.",
-  "Messages that start with \"Voice request\" are speech transcripts: they can contain recognition errors, missing punctuation, or half-finished phrases. Interpret them sensibly from the conversation; ask only if you truly cannot act.",
-  "Do the work exactly as you would for typed requests, with your usual tools and care.",
+  "Messages that start with \"Voice request\" are speech transcripts: they can contain recognition errors, missing punctuation, or half-finished phrases. The first line is the request; it can be followed by what was said since the previous request (the user's earlier turns and what you said by voice), which is what the request refers to: read it before acting. Interpret sensibly; ask only if you truly cannot act.",
+  "Do the work exactly as you would for typed requests, with your usual tools and care. When the user is thinking aloud, describing a plan, or asking a question about a change (\"would this work?\", \"do we need anything else?\"), look and answer the question; do not change files until they ask you to make the change.",
   "End with a short answer meant to be spoken: the outcome first, one to three sentences, no code, paths, tables, or long lists unless asked. Details stay in the terminal.",
 ].join("\n");
 
@@ -33,8 +33,10 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
 
 /** How a voice request is introduced to Pi (the system prompt section explains it). */
 export const VOICE_REQUEST = "Voice request (speech transcript; may contain recognition errors): ";
+/** Introduces the spoken conversation a voice request refers to. */
+export const CONVERSATION_MARK = "\n\nWhat we said since my last request, oldest first:\n";
 /** The user's words of a request, without the voice framing, for status and notices. */
-const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split("\n(Just before,")[0] : request;
+const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split(CONVERSATION_MARK)[0] : request;
 
 /** One-line, bounded description of a tool call for pi_status. */
 export function describeTool(name: string, args: unknown): string {
