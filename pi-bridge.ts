@@ -32,7 +32,7 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
 /** How a voice request is introduced to Pi (the system prompt section explains it). */
 export const VOICE_REQUEST = "Voice request (speech transcript; may contain recognition errors): ";
 /** The user's words of a request, without the voice framing, for status and notices. */
-const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split("\n(The voice assistant")[0] : request;
+const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split("\n(Just before,")[0] : request;
 
 /** One-line, bounded description of a tool call for pi_status. */
 export function describeTool(name: string, args: unknown): string {

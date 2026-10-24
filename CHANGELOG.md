@@ -6,6 +6,8 @@
 - While Pi works, "stop"/"cancel" aborts it and "what's Pi doing?" is answered from Pi's state without interrupting it; anything else is added to the running task. Short replies ("yes, do that") carry what the voice had just said.
 - While a voice session runs, Pi's system prompt gets a voice section: requests are speech transcripts, and answers should end with a short, speakable summary.
 - Late transcript fragments of your own request no longer interrupt the voice's acknowledgement.
+- A handoff goes to Pi the moment its transcript is complete (the last fragment reaches the handoff point), instead of after a fixed 350 ms wait; the wait remains only for requests whose last words are still in flight.
+- A handoff takes only your latest turn: a question the voice answered by itself (e.g. a status question) no longer leaks into the next request, which had turned "stop that" into a status check. Short replies carry your previous turn and the voice's last words as context.
 - **Removed:** ElevenLabs Eleven Realtime, the provider argument to `/talk start`, `PI_VOICE_PROVIDER`, and the OpenAI-hosted backend model (`backend.md`, `session.json` `backend`).
 
 ## 0.1.4 (2026-10-24)

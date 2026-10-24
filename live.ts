@@ -14,7 +14,10 @@ const ENDPOINT = "wss://api.openai.com/v1/live/sessions";
 const RATE = 24000; // PCM16 mono both ways; the native helper runs unresampled at this rate
 const APPEND_TOKENS = 400; // commentary/thinking accept at most 500 tokens; the estimate is pessimistic, and this leaves margin
 const SPEECH_PEAK = 600;
-const DELEGATION_SETTLE_MS = 350; // input transcript fragments trailing a delegation still count toward it
+// A delegation's request is complete once a fragment reaches its offset_ms (measured
+// live: the last word's fragment arrived with or before the delegation every time);
+// otherwise late fragments get this long to arrive.
+const DELEGATION_SETTLE_MS = 350;
 // While Pi works, these are handled locally instead of being sent to Pi as messages.
 const STOP_REQUEST = /^(please\s+)?(stop|cancel|abort|halt|never\s?mind|forget it)(\s+(it|that|this|the task|the job|everything|pi|now))*(\s+please)?[.!]*$/i;
 const STATUS_REQUEST = /^(so\s+|and\s+|okay,?\s+|ok,?\s+)?(what('?s| is)\s+(pi|it|he|she)\s+doing|what are you doing|how('?s| is)\s+it\s+going|how far|(is|are)\s+(it|pi|you)\s+(done|finished)|any\s+(news|progress|update)|status|progress)\b[^.!?]{0,40}[.?!]*$/i;
@@ -92,8 +95,11 @@ export class LiveVoice {
   private lastRequest = "";
   private said = "";  // what the voice has said since the user last spoke
   private prior = ""; // what it said before the user's current turn: context for short replies
+  private turnFrom = -Infinity; // session-clock start of the user's current turn
+  private earlier = ""; // the user's previous turn, as context for short replies
   private voiceFrom?: number; // session-clock start of the voice's current reply
   private delegation?: string;
+  private waiting?: { id: string; offset: number; timer: ReturnType<typeof setTimeout> };
   // Playback bookkeeping for the waveform state.
   private playing = false;
   private lastAudible = 0;
@@ -242,6 +248,11 @@ export class LiveVoice {
           this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
           this.prior = this.said;     // an acknowledgement spoken after the request is not its context
           this.said = "";
+          // A new user turn: a delegation takes only its words. An earlier turn the
+          // voice answered by itself (say, a status question) must not leak into it.
+          const from = typeof event.start_ms === "number" ? event.start_ms : (this.heard.at(-1)?.start ?? -Infinity);
+          this.earlier = this.turnWords(this.turnFrom, from) || this.earlier;
+          this.turnFrom = from;
         }
         this.userTurn = true;
         this.hooks.state("listening");
@@ -250,8 +261,14 @@ export class LiveVoice {
       case "session.delegation.created": {
         this.hooks.state("thinking");
         const id = event.delegation?.id;
-        // The last words of the request can still be in flight; give them a moment.
-        if (typeof id === "string") setTimeout(() => this.delegate(id), DELEGATION_SETTLE_MS).unref?.();
+        if (typeof id !== "string") break;
+        if (this.waiting) this.release(); // an earlier one still waiting goes first
+        const offset = typeof event.offset_ms === "number" ? event.offset_ms : Infinity;
+        if ((this.heard.at(-1)?.end ?? -Infinity) >= offset) { this.delegate(id); break; }
+        // The last words of the request are still in flight: wait for them, briefly.
+        const timer = setTimeout(() => this.release(), DELEGATION_SETTLE_MS);
+        timer.unref?.();
+        this.waiting = { id, offset, timer };
         break;
       }
       case "session.closed":
@@ -273,6 +290,21 @@ export class LiveVoice {
     const last = this.heard.at(-1)?.end ?? 0;
     const from = typeof start === "number" ? start : last, to = typeof end === "number" ? end : from + 1;
     this.heard = [...this.heard.slice(-79), { start: from, end: to, text }];
+    if (this.waiting && to >= this.waiting.offset) this.release();
+  }
+
+  /** What the user said between two session-clock positions. */
+  private turnWords(from: number, to: number): string {
+    return this.heard.filter(fragment => fragment.start >= from && fragment.start < to).map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+  }
+
+  /** Hands the waiting delegation to Pi now. */
+  private release() {
+    const waiting = this.waiting;
+    if (!waiting) return;
+    this.waiting = undefined;
+    clearTimeout(waiting.timer);
+    this.delegate(waiting.id);
   }
 
   /**
@@ -282,7 +314,7 @@ export class LiveVoice {
    */
   private delegate(id: string) {
     if (this.stopped) return;
-    const fresh = this.heard.filter(fragment => fragment.end > this.consumedMs);
+    const fresh = this.heard.filter(fragment => fragment.end > this.consumedMs && fragment.start >= this.turnFrom);
     if (fresh.length) this.consumedMs = Math.max(...fresh.map(fragment => fragment.end));
     const words = fresh.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
     const request = words || this.lastRequest;
@@ -299,7 +331,11 @@ export class LiveVoice {
       return;
     }
     // Short replies ("yes, do that") need what the voice had just said to make sense.
-    const context = request.length < 80 && this.prior.trim() ? `\n(The voice assistant had just said: "${this.prior.trim().slice(-300)}")` : "";
+    const before = [
+      this.earlier && `the user said: "${this.earlier.slice(-300)}"`,
+      this.prior.trim() && `the voice assistant said: "${this.prior.trim().slice(-300)}"`,
+    ].filter(Boolean).join(", then ");
+    const context = request.length < 80 && before ? `\n(Just before, ${before})` : "";
     const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${context}`, when: "now" }) as { status?: string; error?: string };
     if (result.error) { this.commentary(`Pi could not take the request: ${result.error}`, id); return; }
     this.delegation = id;
@@ -335,6 +371,7 @@ export class LiveVoice {
       setTimeout(() => ws.close(), 3000).unref();
     }
     this.stopped = true;
+    if (this.waiting) { clearTimeout(this.waiting.timer); this.waiting = undefined; }
     this.abort.abort();
     clearTimeout(this.deadline);
     this.audio?.stop();

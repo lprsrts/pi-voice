@@ -384,7 +384,7 @@ test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s r
     output(spoken, true); // and is audibly playing
     socket.event({ type: 'session.delegation.created', offset_ms: 1900, delegation: { id: 'd1', type: 'delegation', target: 'client' } });
     socket.event({ type: 'session.input_transcript.delta', delta: 'in the voice repo.', start_ms: 1800, end_ms: 2400 }); // trails the delegation
-    await settle();
+    assert.equal(calls.length, 1, 'the fragment reaching the delegation offset releases it without waiting');
     assert.equal(audio.interrupts, 0, 'a straggling fragment of the request does not cut off the acknowledgement');
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], 'ask_pi');
@@ -401,7 +401,7 @@ test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s r
     socket.event({ type: 'session.delegation.created', offset_ms: 5700, delegation: { id: 'd2', type: 'delegation', target: 'client' } });
     await settle();
     // It is short, so it carries what the voice said before it (not after).
-    assert.match(calls[1][1].request, /: Then commit\.\n\(The voice assistant had just said: "On it\."\)$/);
+    assert.match(calls[1][1].request, /: Then commit\.\n\(Just before, the user said: "Run the tests in the voice repo\.", then the voice assistant said: "On it\."\)$/);
     assert.ok(socket.sent.every(e => typeof e.event_id === 'string'), 'every client event carries an event_id');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
@@ -409,12 +409,30 @@ test('a delegation hands the user\'s words since the last one to Pi, and Pi\'s r
 
 test('Pi status and notices name the spoken words, not the voice framing', () => {
   const { bridge, sent, notices, control } = fakePi();
-  bridge.call('ask_pi', { request: `${VOICE_REQUEST}Yes, do it.\n(The voice assistant had just said: "Shall Pi fix it?")` });
+  bridge.call('ask_pi', { request: `${VOICE_REQUEST}Yes, do it.\n(Just before, the voice assistant said: "Shall Pi fix it?")` });
   assert.equal(sent[0][0].startsWith(VOICE_REQUEST), true, 'Pi itself gets the framing');
   control.idle = false;
   assert.equal(bridge.status().task, 'Yes, do it.');
   bridge.settled(false);
   assert.match(notices[0], /^Pi finished the task "Yes, do it"/);
+});
+
+test('a complete request goes to Pi at once; an incomplete one waits briefly for its last words', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const calls = [];
+    const { voice, socket } = await startLive({ tool: (name, args) => { calls.push(args.request); return { status: 'started' }; } });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'List the files.', start_ms: 1000, end_ms: 2000 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 2000, delegation: { id: 'd1' } });
+    assert.equal(calls.length, 1, 'no settle delay when the last fragment already reaches offset_ms');
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Then the', start_ms: 4000, end_ms: 4400 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 5000, delegation: { id: 'd2' } });
+    assert.equal(calls.length, 1, 'waits while the request is incomplete');
+    await settle(); // nothing more arrives: it goes with what was heard
+    assert.equal(calls.length, 2);
+    assert.match(calls[1], /: Then the/);
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
 });
 
 test('a short reply reaches Pi with what the voice had just said', async () => {
@@ -426,7 +444,7 @@ test('a short reply reaches Pi with what the voice had just said', async () => {
     socket.event({ type: 'session.input_transcript.delta', delta: 'Yes, do it.', start_ms: 2500, end_ms: 3000 });
     socket.event({ type: 'session.delegation.created', offset_ms: 3100, delegation: { id: 'd1' } });
     await settle();
-    assert.match(calls[0][1].request, /Yes, do it\.\n\(The voice assistant had just said: "The build fails on a missing import\. Shall Pi fix it\?"\)$/);
+    assert.match(calls[0][1].request, /Yes, do it\.\n\(Just before, the voice assistant said: "The build fails on a missing import\. Shall Pi fix it\?"\)$/);
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
@@ -457,6 +475,22 @@ test('while Pi works, "stop" aborts it and a status question is answered without
     socket.event({ type: 'session.delegation.created', delegation: { id: 'd3' } });
     await settle();
     assert.deepEqual(calls, ['pi_status', 'cancel_pi', 'ask_pi']);
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('a delegation takes only the latest turn: a question the voice answered itself does not leak in', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const calls = [];
+    const { voice, socket } = await startLive({ tool: name => { calls.push(name); return name === 'cancel_pi' ? { status: 'cancelled' } : { state: 'working' }; }, busy: () => true });
+    // Measured live: a status question the voice answered from Pi's progress, then "Stop that".
+    for (const [delta, start] of [[' What is', 10400], [' pi', 10800], [' doing', 11200], [' right', 11600], [' now', 11800]]) socket.event({ type: 'session.input_transcript.delta', delta, start_ms: start, end_ms: start + 200 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'It is in the middle of that sleep command.', start_ms: 12500, end_ms: 15000 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Stop', start_ms: 17200, end_ms: 17400 });
+    socket.event({ type: 'session.input_transcript.delta', delta: ' that', start_ms: 17600, end_ms: 17800 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 17600, delegation: { id: 'd1' } });
+    assert.deepEqual(calls, ['cancel_pi']);
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
