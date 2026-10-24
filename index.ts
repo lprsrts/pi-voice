@@ -7,7 +7,8 @@ import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audi
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
 import { VOICE_PROMPT } from "./pi-bridge.ts";
-import { describePause, pauseAfterFromEnv, TalkSession } from "./talk.ts";
+import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
+import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
 import { PROVIDER } from "./providers.ts";
 import { dominantFrequency, formatCaption, type CaptionLine } from "./protocol.ts";
 
@@ -81,8 +82,11 @@ export default function voicePreview(pi: ExtensionAPI) {
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
   let caption: CaptionLine | undefined, captionAt = 0;
-  // Caption row under the bar: off unless PI_VOICE_CAPTIONS=1 or /talk captions on.
-  let captionsOn = ["1", "true", "on"].includes(process.env.PI_VOICE_CAPTIONS?.trim().toLowerCase() ?? "");
+  // Settings come from Pi's settings.json ("pi-voice"), overridable by env (settings.ts).
+  useSettings(() => pi.getSettings());
+  // Caption row under the bar: the "captions" setting, unless /talk captions changed it this session.
+  let captionsChoice: boolean | undefined;
+  const captionsOn = () => captionsChoice ?? currentSettings().values.captions;
   let muted = false;
   let talking = false;   // between /talk start and /talk stop: Pi is told its answers are spoken
   let consented = false; // the consent prompt is shown once per Pi session
@@ -187,7 +191,7 @@ export default function voicePreview(pi: ExtensionAPI) {
             const line = choice === "live"
               ? (now - Math.max(captionAt, lastSpoke) < CAPTION_HOLD_MS ? caption : undefined)
               : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 1.6) % PREVIEW_CAPTIONS.length] : undefined;
-            if (!captionsOn) return bar;
+            if (!captionsOn()) return bar;
             return [...bar, centered(line, columns, text => theme.style(text, { fg: theme.colors.muted }))];
           },
           dispose() {
@@ -211,7 +215,21 @@ export default function voicePreview(pi: ExtensionAPI) {
     if (!helperBuilt()) ctx.ui.notify("Building the native audio helper (first run only, up to ~40s)…", "info");
     return ensureHelper(signal);
   }
-  const aecLine = () => aecEnabled() ? "echo cancellation: on (PI_VOICE_AEC=0 bypasses it)" : "echo cancellation: off (PI_VOICE_AEC=0; headphones only)";
+  const aecLine = () => aecEnabled() ? "echo cancellation: on" : "echo cancellation: off (headphones only)";
+
+  /** Each setting with its value and source, for /talk check. */
+  function settingsLines(): string[] {
+    const { values, sources, invalid } = currentSettings();
+    const show = (key: keyof VoiceSettings, value: string) => `  ${key}: ${value} (${sources[key] === "env" ? `env ${envName(key)}` : sources[key] === "settings" ? `settings "${SETTINGS_KEY}"` : "default"})`;
+    return [
+      `settings ("${SETTINGS_KEY}" in Pi's settings.json; env variables override):`,
+      show("autoPause", values.autoPause ? `${values.autoPause} s of silence while I work` : "never"),
+      show("idlePause", values.idlePause ? `${values.idlePause} s of silence when nothing runs` : "never"),
+      show("captions", `${values.captions ? "on" : "off"}${captionsChoice !== undefined ? ` (now ${captionsChoice ? "on" : "off"} via /talk captions)` : ""}`),
+      show("echoCancellation", values.echoCancellation ? "on" : "off (headphones only)"),
+      ...invalid.map(entry => `  ignored invalid value: ${entry}`),
+    ];
+  }
 
   pi.registerCommand("talk", {
     description: "Realtime voice for Pi: start, stop, mute, unmute, captions, check, devices, tone, mic-test",
@@ -232,7 +250,7 @@ export default function voicePreview(pi: ExtensionAPI) {
           try { const route = await currentRoute(await ensureHelper()); lines.push(`input: ${route.input}`, `output: ${route.output}`); }
           catch { lines.push("devices: query failed"); }
         }
-        ctx.ui.notify([...lines, `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`, `voice: ${PROVIDER.label}`, `backend: this Pi session (${modelName(ctx)}; change it with /model)`, `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key)}`, `captions: ${captionsOn ? "on" : "off"} (/talk captions on|off)`, `config overrides: ${userConfigDir()}`, `platform: ${process.platform}`, `session: ${talk?.connected ? (muted ? "muted" : "active/connecting") : talk?.isPaused ? "paused (comes back with the result)" : talking ? "paused" : "off"}${talk?.waiting ? `; ${talk.waiting} result(s) to say` : ""}`, `auto-pause: after ${describePause()} (PI_VOICE_AUTOPAUSE, PI_VOICE_IDLE_PAUSE)`].join("\n"), "info");
+        ctx.ui.notify([...lines, `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`, `voice: ${PROVIDER.label}`, `backend: this Pi session (${modelName(ctx)}; change it with /model)`, `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key)}`, ...settingsLines(), `config overrides: ${userConfigDir()}`, `platform: ${process.platform}`, `session: ${talk?.connected ? (muted ? "muted" : "active/connecting") : talk?.isPaused ? "paused (comes back with the result)" : talking ? "paused" : "off"}${talk?.waiting ? `; ${talk.waiting} result(s) to say` : ""}`].join("\n"), "info");
         return;
       }
       if (command === "devices") {
@@ -286,8 +304,8 @@ export default function voicePreview(pi: ExtensionAPI) {
       if (command === "captions" || command.startsWith("captions ")) {
         const value = command.slice(8).trim();
         if (value && value !== "on" && value !== "off") { ctx.ui.notify("Use /talk captions [on|off]", "warning"); return; }
-        captionsOn = value ? value === "on" : !captionsOn;
-        ctx.ui.notify(`Captions ${captionsOn ? "on" : "off"}.`, "info");
+        captionsChoice = value ? value === "on" : !captionsOn();
+        ctx.ui.notify(`Captions ${captionsOn() ? "on" : "off"} for this session (the "captions" setting sets the default).`, "info");
         return;
       }
       if (command === "mute" || command === "unmute") {
@@ -302,7 +320,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       if (talk?.connected) { ctx.ui.notify("Voice is already running or connecting.", "info"); return; }
       if (!consented) {
         const provider = PROVIDER;
-        const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (PI_VOICE_AEC=0): use headphones, or the agent may hear itself and loop."} Voice is billed while connected; it pauses by itself after ${describePause()}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
+        const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (the echoCancellation setting): use headphones, or the agent may hear itself and loop."} Voice is billed while connected; it pauses by itself after ${describePause()}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
         if (!consent || talk?.connected) return;
         consented = true;
       }
@@ -339,7 +357,7 @@ export default function voicePreview(pi: ExtensionAPI) {
         },
         caption: line => { caption = line; captionAt = Date.now(); },
       },
-      pauseAfter: () => pauseAfterFromEnv(),
+      pauseAfter: () => pauseAfterFromSettings(),
     });
     return talk;
   }

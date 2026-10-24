@@ -13,7 +13,8 @@ import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../ke
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
 import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext } from '../live.ts';
 import { PROVIDER } from '../providers.ts';
-import { TalkSession, pauseAfterFromEnv, describePause } from '../talk.ts';
+import { TalkSession, describePause } from '../talk.ts';
+import { resolveSettings, DEFAULT_SETTINGS } from '../settings.ts';
 import { providerFiles, userConfigDir } from '../config.ts';
 import { AudioPipes, parseRoute, pcmStats } from '../audio.ts';
 import { aecEnabled, helperPath } from '../native.ts';
@@ -893,9 +894,19 @@ test('a talk session adopts a task already running and briefs each connection', 
   talk.end();
 });
 
-test('auto-pause settings come from the environment', () => {
-  assert.deepEqual(pauseAfterFromEnv({}), { busy: 15, idle: 60 });
-  assert.deepEqual(pauseAfterFromEnv({ PI_VOICE_AUTOPAUSE: '0', PI_VOICE_IDLE_PAUSE: '120' }), { busy: 0, idle: 120 });
-  assert.deepEqual(pauseAfterFromEnv({ PI_VOICE_AUTOPAUSE: 'soon', PI_VOICE_IDLE_PAUSE: '-1' }), { busy: 15, idle: 60 });
+test('settings: env over "pi-voice" in Pi settings over defaults, with invalid values reported', () => {
+  assert.deepEqual(resolveSettings(undefined, {}).values, DEFAULT_SETTINGS);
+  assert.deepEqual(DEFAULT_SETTINGS, { autoPause: 15, idlePause: 60, captions: false, echoCancellation: true });
+  const settings = { 'pi-voice': { autoPause: 30, idlePause: 0, captions: true, echoCancellation: 'nope' }, defaultModel: 'x' };
+  const fromSettings = resolveSettings(settings, {});
+  assert.deepEqual(fromSettings.values, { autoPause: 30, idlePause: 0, captions: true, echoCancellation: true });
+  assert.deepEqual(fromSettings.sources, { autoPause: 'settings', idlePause: 'settings', captions: 'settings', echoCancellation: 'default' });
+  assert.deepEqual(fromSettings.invalid, ['"pi-voice".echoCancellation: "nope"']);
+  const fromEnv = resolveSettings(settings, { PI_VOICE_AUTOPAUSE: '5', PI_VOICE_CAPTIONS: 'off', PI_VOICE_AEC: '0', PI_VOICE_IDLE_PAUSE: 'soon' });
+  assert.deepEqual(fromEnv.values, { autoPause: 5, idlePause: 0, captions: false, echoCancellation: false });
+  assert.deepEqual(fromEnv.sources, { autoPause: 'env', idlePause: 'settings', captions: 'env', echoCancellation: 'env' });
+  assert.deepEqual(fromEnv.invalid, ['PI_VOICE_IDLE_PAUSE=soon', '"pi-voice".echoCancellation: "nope"']);
+  assert.equal(resolveSettings({ 'pi-voice': { autoPause: -3 } }, {}).values.autoPause, 15, 'negative seconds fall back');
   assert.equal(describePause({ busy: 0, idle: 0 }), 'never (auto-pause is off)');
+  assert.equal(describePause({ busy: 20, idle: 0 }), '20 s of silence while I work');
 });

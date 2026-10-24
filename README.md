@@ -38,7 +38,7 @@ The package is free (MIT). Two things cost money:
 - **The voice:** GPT-Live, $0.05 per minute, billed to your OpenAI API key. A ChatGPT plan does not cover it (OpenAI rejects plan sign-ins for GPT-Live).
 - **The work:** whatever your Pi model costs, exactly as when you type. Pi uses your configured provider; no extra model runs in between.
 
-GPT-Live bills per second while a voice connection is open, whether anyone speaks or not. To avoid paying for silence, voice **pauses by itself**: after 15 s of silence while Pi works (it comes back to say the result), or 60 s of silence when nothing is running (`/talk start` resumes). `/talk mute` keeps the connection open (and billable); `/talk stop` ends it. A result that arrives while voice is off is said at the next `/talk start`.
+GPT-Live bills per second while a voice connection is open, whether anyone speaks or not. To avoid paying for silence, voice **pauses by itself**: after 15 s of silence while Pi works (it comes back to say the result), or 60 s of silence when nothing is running (`/talk start` resumes); both are [settings](#settings). `/talk mute` keeps the connection open (and billable); `/talk stop` ends it. A result that arrives while voice is off is said at the next `/talk start`.
 
 ## How it works
 
@@ -70,13 +70,27 @@ Keys are read only when a session starts and are never logged. Audio and transcr
 
 ## Settings
 
-| Environment variable | Effect |
-|---|---|
-| `PI_VOICE_CAPTIONS=1` | Start with captions on. |
-| `PI_VOICE_AUTOPAUSE` | Seconds of silence while Pi works before voice pauses (default 15; `0` = never). |
-| `PI_VOICE_IDLE_PAUSE` | Seconds of silence while nothing runs before voice pauses (default 60; `0` = never). |
-| `PI_VOICE_AEC=0` | Turn off echo cancellation (headphones only, or the agent hears itself). |
-| `PI_VOICE_CONFIG_DIR` | Where your overrides live (see below). |
+Put a `"pi-voice"` object in Pi's `settings.json` (`~/.pi/agent/settings.json`, or a project's `.pi/settings.json`, which overrides it). Any setting can also be set with its environment variable, which wins over the file. `/talk check` shows each value and where it came from.
+
+```json
+{
+  "pi-voice": {
+    "autoPause": 15,
+    "idlePause": 60,
+    "captions": false,
+    "echoCancellation": true
+  }
+}
+```
+
+| Setting | Environment variable | Default | Effect |
+|---|---|---|---|
+| `autoPause` | `PI_VOICE_AUTOPAUSE` | `15` | Seconds of silence while Pi works before voice pauses (it comes back with the result). `0` = never. |
+| `idlePause` | `PI_VOICE_IDLE_PAUSE` | `60` | Seconds of silence while nothing runs before voice pauses (`/talk start` resumes). `0` = never. |
+| `captions` | `PI_VOICE_CAPTIONS` | `false` | Show the caption line at start (`/talk captions` toggles it per session). |
+| `echoCancellation` | `PI_VOICE_AEC` | `true` | Apple's voice processing. Turn off only with headphones, or the agent hears itself. |
+
+`PI_VOICE_CONFIG_DIR` sets where your voice and persona overrides live (see below).
 
 ## Voice and persona
 

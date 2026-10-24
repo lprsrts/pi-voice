@@ -1,6 +1,7 @@
 import { assistantText, PiBridge, sessionBriefing, type PiControl, type PiHost } from "./pi-bridge.ts";
 import type { VoiceHooks, VoiceSession } from "./providers.ts";
 import type { CaptionLine, VoiceState } from "./protocol.ts";
+import { currentSettings } from "./settings.ts";
 
 // A talk session runs from /talk start to /talk stop. It owns the Pi bridge;
 // voice connections (billed per second) come and go under it. Auto-pause closes
@@ -134,7 +135,7 @@ export class TalkSession {
   checkIdle() {
     if (!this.voice || !this.ready || this.speaking) return;
     const working = !this.host.control.isIdle();
-    const after = this.host.pauseAfter?.() ?? { busy: 15, idle: 60 };
+    const after = this.host.pauseAfter?.() ?? pauseAfterFromSettings();
     const limit = (working ? after.busy : after.idle) * 1000;
     if (!limit || this.now() - this.lastActivity < limit) return;
     this.close();
@@ -155,17 +156,13 @@ export class TalkSession {
   }
 }
 
-/** PI_VOICE_AUTOPAUSE (while Pi works, default 15 s) and PI_VOICE_IDLE_PAUSE (nothing running, default 60 s). */
-export function pauseAfterFromEnv(env: NodeJS.ProcessEnv = process.env): { busy: number; idle: number } {
-  const read = (name: string, fallback: number) => {
-    const raw = env[name]?.trim();
-    const value = Number(raw);
-    return raw && Number.isFinite(value) && value >= 0 ? value : fallback;
-  };
-  return { busy: read("PI_VOICE_AUTOPAUSE", 15), idle: read("PI_VOICE_IDLE_PAUSE", 60) };
+/** Auto-pause limits from the settings (env PI_VOICE_AUTOPAUSE / PI_VOICE_IDLE_PAUSE, or "pi-voice" in Pi's settings). */
+export function pauseAfterFromSettings(): { busy: number; idle: number } {
+  const { autoPause, idlePause } = currentSettings().values;
+  return { busy: autoPause, idle: idlePause };
 }
 
-export function describePause(after = pauseAfterFromEnv()): string {
+export function describePause(after = pauseAfterFromSettings()): string {
   const part = (seconds: number, when: string) => seconds > 0 ? `${seconds} s of silence ${when}` : "";
   return [part(after.busy, "while I work"), part(after.idle, "when nothing runs")].filter(Boolean).join(" or ") || "never (auto-pause is off)";
 }

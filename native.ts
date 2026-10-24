@@ -5,16 +5,16 @@ import { mkdir, readdir, rename, rm } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { currentSettings } from "./settings.ts";
 
 // All audio goes through native/VoiceIO.swift, compiled with swiftc into the
 // user cache, keyed by source hash. No binary is committed to the repo.
 
 const source = fileURLToPath(new URL("./native/VoiceIO.swift", import.meta.url));
 
-/** Echo cancellation is on unless PI_VOICE_AEC turns it off (e.g. headphones only). */
+/** Echo cancellation: PI_VOICE_AEC, else "pi-voice".echoCancellation in Pi's settings, else on. */
 export function aecEnabled(): boolean {
-  const raw = process.env.PI_VOICE_AEC?.trim().toLowerCase();
-  return !(raw === "0" || raw === "false" || raw === "off");
+  return currentSettings().values.echoCancellation;
 }
 
 export function helperPath(cacheRoot = process.env.XDG_CACHE_HOME || join(homedir(), ".cache")): string {
