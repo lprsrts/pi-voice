@@ -4,22 +4,32 @@
 
 ## 0.2.0 (2026-10-24)
 
-- **Settings.** `autoPause`, `idlePause`, `captions`, and `echoCancellation` can be set in a `"pi-voice"` object in Pi's `settings.json` (global or per project), each overridable by its environment variable (`PI_VOICE_AUTOPAUSE`, `PI_VOICE_IDLE_PAUSE`, `PI_VOICE_CAPTIONS`, `PI_VOICE_AEC`). `/talk check` shows every value, its source, and any value it ignored as invalid.
+### Breaking changes
+
+- **GPT-Live is the only voice provider.** ElevenLabs Eleven Realtime, the provider argument to `/talk start`, and `PI_VOICE_PROVIDER` have been removed.
+- **Pi is the backend.** GPT-Live now hands work to the Pi session itself (client delegation): what you said goes to Pi as a message, Pi works with its own model (`/model`), tools, and environment, its progress reaches the voice silently, and its result is spoken on the same delegation. The separate OpenAI-hosted backend model and its configuration (`backend.md`, `session.json` `backend`) have been removed.
+
+### Features
+
 - **Auto-pause.** GPT-Live bills per second while connected, so voice closes its connection after 15 s of silence while Pi works (`PI_VOICE_AUTOPAUSE`) and comes back by itself to say the result; after 60 s of silence with nothing running (`PI_VOICE_IDLE_PAUSE`) it pauses until `/talk start`. Measured live: a 56 s wait billed 31 s instead of 56 s.
 - **Results are never lost.** A talk session (`talk.ts`) owns the Pi bridge across voice connections: a result that arrives while voice is paused, connecting, or stopped by the user is said as soon as a connection is open. The consent prompt is shown once per Pi session.
-- Live scenarios `autopause` and `result-after-stop`; the harness runs through the shipped talk session and reports billed voice time.
-- **Requests carry the conversation.** A handoff sends your latest turn as the request together with everything said since the previous one (your earlier turns and the voice's replies), so a question like "does that single line addition work?" reaches Pi with the explanation it refers to. Pi's voice prompt explains the format.
-- The voice lets you think aloud and explain over several turns without handing off, and Pi answers questions about a change instead of making it unless asked.
-- **Live test scripts** (`scripts/live/`): real-life scenarios (quick answer, status and stop, restart memory, multi-turn explanation, correction mid-task) against real GPT-Live and a real Pi session, with checks, timing, model comparison (`--model`), and three audio modes.
-- **One agent, one voice.** The voice speaks about the work in the first person ("I'm running the tests", "I stopped it"), never as "Pi" or a backend: the voice prompt, every update it receives (results, progress, status, cancellation), and Pi's own voice-mode prompt now treat the voice and the Pi session as one agent.
 - **Memory across voice sessions.** Each `/talk start` briefs the new voice session from the Pi session: the latest compaction summary, recent spoken and typed requests with the answers, and any task still running, so after restarting voice mid-task it knows what it is doing. A task still running when voice starts is adopted, so its result is announced in the new session.
-- **Pi is the backend.** GPT-Live now hands work to the Pi session itself (client delegation): what you said goes to Pi as a message, Pi works with its own model (`/model`), tools, and environment, its progress reaches the voice silently, and its result is spoken on the same delegation. No separate backend model runs in between, so the backend model is whatever Pi uses.
+- **Requests carry the conversation.** A handoff sends your latest turn as the request together with everything said since the previous one (your earlier turns and the voice's replies), so a question like "does that single line addition work?" reaches Pi with the explanation it refers to. Pi's voice prompt explains the format. The voice lets you think aloud and explain over several turns without handing off, and Pi answers questions about a change instead of making it unless asked.
+- **Settings.** `autoPause`, `idlePause`, `captions`, and `echoCancellation` can be set in a `"pi-voice"` object in Pi's `settings.json` (global or per project), each overridable by its environment variable (`PI_VOICE_AUTOPAUSE`, `PI_VOICE_IDLE_PAUSE`, `PI_VOICE_CAPTIONS`, `PI_VOICE_AEC`). `/talk check` shows every value, its source, and any value it ignored as invalid.
+
+### Improvements and fixes
+
+- **One agent, one voice.** The voice speaks about the work in the first person ("I'm running the tests", "I stopped it"), never as "Pi" or a backend: the voice prompt, every update it receives (results, progress, status, cancellation), and Pi's own voice-mode prompt now treat the voice and the Pi session as one agent.
 - While Pi works, "stop"/"cancel" aborts it and "what's Pi doing?" is answered from Pi's state without interrupting it; anything else is added to the running task. Short replies ("yes, do that") carry what the voice had just said.
 - While a voice session runs, Pi's system prompt gets a voice section: requests are speech transcripts, and answers should end with a short, speakable summary.
 - Late transcript fragments of your own request no longer interrupt the voice's acknowledgement.
 - A handoff goes to Pi the moment its transcript is complete (the last fragment reaches the handoff point), instead of after a fixed 350 ms wait; the wait remains only for requests whose last words are still in flight.
 - A handoff takes only your latest turn: a question the voice answered by itself (e.g. a status question) no longer leaks into the next request, which had turned "stop that" into a status check. Short replies carry your previous turn and the voice's last words as context.
-- **Removed:** ElevenLabs Eleven Realtime, the provider argument to `/talk start`, `PI_VOICE_PROVIDER`, and the OpenAI-hosted backend model (`backend.md`, `session.json` `backend`).
+
+### Testing
+
+- **Live test scripts** (`scripts/live/`): real-life scenarios (quick answer, status and stop, restart memory, multi-turn explanation, correction mid-task) against real GPT-Live and a real Pi session, with checks, timing, model comparison (`--model`), and three audio modes.
+- Live scenarios `autopause` and `result-after-stop`; the harness runs through the shipped talk session and reports billed voice time.
 
 ## 0.1.4 (2026-10-24)
 
