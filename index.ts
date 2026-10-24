@@ -60,16 +60,16 @@ function measureBeam(beam: Beam, samples: number[], fresh: boolean, dt: number) 
   if (hz) beam.targetLogHz = Math.log(hz);
 }
 
-/** One centered line; a phrase wider than the bar shows the word chunk being spoken. */
 /** The Pi session's current model, as shown in /talk check and the consent prompt. */
 function modelName(ctx: ExtensionContext): string {
   const model = ctx.model as { provider?: string; id?: string; name?: string } | undefined;
   return model ? `${model.provider ? `${model.provider}/` : ""}${model.id ?? model.name ?? "model"}` : "no model selected";
 }
 
-function centered(caption: CaptionLine | undefined, width: number, paint: (text: string) => string): string {
-  const line = caption && width >= 4 ? formatCaption(caption, width, visibleWidth) : "";
-  return " ".repeat(Math.max(0, Math.floor((width - visibleWidth(line)) / 2))) + paint(line);
+/** The live line, left-aligned with the chat's text like a transcript; a phrase wider than the bar shows the word chunk being spoken. */
+function transcriptLine(caption: CaptionLine | undefined, width: number, paint: (text: string) => string): string {
+  const line = caption && width >= 5 ? formatCaption(caption, width - 1, visibleWidth) : "";
+  return ` ${paint(line)}`;
 }
 
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
@@ -183,9 +183,10 @@ export default function voicePreview(pi: ExtensionAPI) {
               }
               previousY = y;
             }
-            // Foreground only: no background fill or textual state labels. Below the
+            // Foreground only: no background fill or textual state labels. Above the
             // bar, the live line: what the user is saying or the voice's current phrase,
-            // centered, flipping in like a split-flap board; the row stays to avoid layout jumps.
+            // left-aligned like a transcript, flipping in like a split-flap board; the row
+            // stays to avoid layout jumps.
             const bar = dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
             if (state === "speaking") lastSpoke = now;
             const line = choice === "live"
@@ -196,7 +197,7 @@ export default function voicePreview(pi: ExtensionAPI) {
             const fg = line?.role === "user"
               ? { flip: theme.colors.dim, glow: theme.colors.accent, still: theme.colors.text }
               : { flip: theme.colors.dim, glow: theme.colors.success, still: theme.colors.muted };
-            return [...bar, centered(line, columns, text => board.tiles(text, now).map(tile => theme.style(tile.text, { fg: fg[tile.state] })).join(""))];
+            return [transcriptLine(line, columns, text => board.tiles(text, now).map(tile => theme.style(tile.text, { fg: fg[tile.state] })).join("")), ...bar];
           },
           dispose() {
             if (timer) clearInterval(timer);

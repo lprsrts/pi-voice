@@ -9,7 +9,7 @@ export type VoiceSettings = {
   autoPause: number;
   /** Seconds of silence while nothing runs before it pauses (0 = never). */
   idlePause: number;
-  /** Show the live line (what is being said, both ways) under the bar at start. */
+  /** Show the live line (what is being said, both ways) above the bar at start. */
   captions: boolean;
   /** Apple voice processing (echo cancellation); off only with headphones. */
   echoCancellation: boolean;
