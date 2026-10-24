@@ -18,6 +18,7 @@ import { resolveSettings, DEFAULT_SETTINGS } from '../settings.ts';
 import { providerFiles, userConfigDir } from '../config.ts';
 import { AudioPipes, parseRoute, pcmStats } from '../audio.ts';
 import { aecEnabled, helperPath } from '../native.ts';
+import { parseTalk, talkCompletions, talkHelp, TALK_COMMANDS, resolveShortcuts, loadShortcuts, keybindingsPath, DEFAULT_SHORTCUTS } from '../commands.ts';
 
 // No real credentials, network, microphone, speakers, or shell execution in tests.
 const originalKeyEnv = process.env.PI_VOICE_TEST_API_KEY;
@@ -807,7 +808,7 @@ test('override directory follows PI_VOICE_CONFIG_DIR, then Pi\'s agent directory
 
 // ---------- Talk session: auto-pause and results across voice connections ----------
 
-function fakeTalk({ idle = false, branch = [] } = {}) {
+function fakeTalk({ idle = false, branch = [], changed } = {}) {
   let clock = 0;
   const voices = [], toasts = [], sent = [];
   const control = { idle, isIdle() { return this.idle; }, abort() {}, hasPendingMessages() { return false; } };
@@ -828,6 +829,7 @@ function fakeTalk({ idle = false, branch = [] } = {}) {
     getKey: async () => 'test-key',
     notify: (message, level) => toasts.push([level, message]),
     pauseAfter: () => ({ busy: 15, idle: 60 }),
+    changed,
     now: () => clock,
   });
   return { talk, voices, toasts, sent, control, tick: ms => { clock += ms; talk.checkIdle(); } };
@@ -909,4 +911,68 @@ test('settings: env over "pi-voice" in Pi settings over defaults, with invalid v
   assert.equal(resolveSettings({ 'pi-voice': { autoPause: -3 } }, {}).values.autoPause, 15, 'negative seconds fall back');
   assert.equal(describePause({ busy: 0, idle: 0 }), 'never (auto-pause is off)');
   assert.equal(describePause({ busy: 20, idle: 0 }), '20 s of silence while I work');
+});
+
+// ---------- /talk command surface ----------
+
+test('/talk parses subcommands strictly and toggles with no argument', () => {
+  assert.deepEqual(parseTalk(''), { name: 'toggle' });
+  assert.deepEqual(parseTalk('  Start '), { name: 'start' });
+  assert.deepEqual(parseTalk('mute'), { name: 'mute', value: undefined });
+  assert.deepEqual(parseTalk('mute on'), { name: 'mute', value: true });
+  assert.deepEqual(parseTalk('captions off'), { name: 'captions', value: false });
+  assert.deepEqual(parseTalk('tone'), { name: 'tone', hz: 440 });
+  assert.deepEqual(parseTalk('tone 1000'), { name: 'tone', hz: 1000 });
+  assert.deepEqual(parseTalk('mic-test'), { name: 'mic-test', seconds: 3 });
+  assert.deepEqual(parseTalk('preview'), { name: 'preview', state: 'cycle' });
+  assert.deepEqual(parseTalk('preview speaking'), { name: 'preview', state: 'speaking' });
+  // Bad values are rejected with the usage, never silently replaced.
+  for (const bad of ['tone abc', 'tone 0', 'tone 440.5', 'tones', 'mic-test 99', 'mic-test 2.5', 'mute maybe', 'stop now', 'preview loud', 'captions on off']) {
+    assert.equal(parseTalk(bad).name, 'error', bad);
+  }
+  assert.match(parseTalk('tone 0').message, /Use \/talk tone \[20-20000\]/);
+  assert.match(parseTalk('strat').message, /Did you mean \/talk start\?/);
+  assert.match(parseTalk('xyzzy').message, /See \/talk help/);
+});
+
+test('/talk completes subcommands, then their values', () => {
+  assert.deepEqual(talkCompletions('').map(item => item.label), TALK_COMMANDS.map(command => command.name));
+  assert.deepEqual(talkCompletions('m').map(item => item.value), ['mute ', 'mic-test ']);
+  assert.deepEqual(talkCompletions('st').map(item => item.value), ['start', 'stop']);
+  assert.deepEqual(talkCompletions('captions ').map(item => item.value), ['captions on', 'captions off']);
+  assert.deepEqual(talkCompletions('preview sp').map(item => item.value), ['preview speaking']);
+  assert.equal(talkCompletions('stop '), null);
+  assert.equal(talkCompletions('zz'), null);
+});
+
+test('shortcuts come from pi-voice actions in Pi\'s keybindings.json', async () => {
+  assert.deepEqual(resolveShortcuts(undefined), DEFAULT_SHORTCUTS);
+  assert.deepEqual(resolveShortcuts({ 'pi-voice.toggle': 'Ctrl+Shift+V', 'pi-voice.mute': [] }), { toggle: ['ctrl+shift+v'], mute: [] });
+  assert.deepEqual(resolveShortcuts({ 'pi-voice.toggle': ['alt+v', 'f5'], 'pi-voice.mute': 7 }), { toggle: ['alt+v', 'f5'], mute: DEFAULT_SHORTCUTS.mute });
+  assert.equal(keybindingsPath({ PI_CODING_AGENT_DIR: '/x/pi' }), '/x/pi/keybindings.json');
+  const dir = await mkdtemp(join(tmpdir(), 'pi-voice-keys-'));
+  try {
+    await writeFile(join(dir, 'keybindings.json'), '﻿{"app.model.select": "ctrl+l", "pi-voice.mute": "alt+shift+m"}');
+    assert.deepEqual(loadShortcuts(join(dir, 'keybindings.json')), { toggle: DEFAULT_SHORTCUTS.toggle, mute: ['alt+shift+m'] });
+    await writeFile(join(dir, 'broken.json'), '{');
+    assert.deepEqual(loadShortcuts(join(dir, 'broken.json')), DEFAULT_SHORTCUTS);
+    assert.match(talkHelp(DEFAULT_SHORTCUTS), /alt\+v: start or stop voice \(pi-voice\.toggle\)/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('the talk session reports connection, pause, and results to say', async () => {
+  let changes = 0;
+  const { talk, voices, control, tick } = fakeTalk({ idle: false, changed: () => changes++ });
+  talk.open();
+  assert.equal(changes, 1, 'opened');
+  await voices[0].ready();
+  tick(15_000);
+  assert.equal(talk.isPaused, true);
+  const paused = changes;
+  assert.ok(paused >= 2, 'closed and paused');
+  control.idle = true;
+  talk.close();
+  talk.deliver('done');
+  assert.ok(changes > paused, 'a result waiting');
+  talk.end();
 });

@@ -8,10 +8,15 @@ import { fileURLToPath } from "node:url";
 // over the default (so `{"voice": "..."}` alone is enough); Markdown files
 // replace the default wholesale.
 
-/** PI_VOICE_CONFIG_DIR, else pi-voice/ in Pi's agent directory (PI_CODING_AGENT_DIR or ~/.pi/agent). */
+/** Pi's agent directory: PI_CODING_AGENT_DIR or ~/.pi/agent. */
+export function agentDir(env: NodeJS.ProcessEnv = process.env): string {
+  return env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+}
+
+/** PI_VOICE_CONFIG_DIR, else pi-voice/ in Pi's agent directory. */
 export function userConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   if (env.PI_VOICE_CONFIG_DIR?.trim()) return env.PI_VOICE_CONFIG_DIR.trim();
-  return join(env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent"), "pi-voice");
+  return join(agentDir(env), "pi-voice");
 }
 
 export type ProviderFiles = {

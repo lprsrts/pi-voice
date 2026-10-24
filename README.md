@@ -18,10 +18,7 @@ For local speech-to-text into the editor, use the official `@earendil-works/pi-v
    pi install npm:@lprsrts/pi-voice
    ```
 2. Add your OpenAI API key (see [API key](#api-key)).
-3. In Pi:
-   ```text
-   /talk start
-   ```
+3. In Pi, type `/talk` (or press <kbd>Alt</kbd>+<kbd>V</kbd>). The same again stops it.
 
 The first start takes a little longer (up to ~40 s) while the audio helper is built, and macOS asks once for microphone permission.
 
@@ -48,15 +45,37 @@ When GPT-Live decides your request needs real work, it hands it off, and pi-voic
 
 | Command | What it does |
 |---|---|
-| `/talk start` | Start a voice session with this Pi session as the backend. |
+| `/talk` | Start voice, or stop it if it is running. |
+| `/talk start` | Start a voice session with this Pi session as the backend, or resume it after a pause. |
 | `/talk stop` | End the voice connection. A Pi task keeps running; its result is said at the next `/talk start`. |
-| `/talk mute` / `/talk unmute` | Stop or resume the microphone. |
+| `/talk mute [on\|off]` | Stop or resume the microphone; no argument toggles. `/talk unmute` also resumes it. |
 | `/talk captions [on\|off]` | Show what the agent is saying, phrase by phrase, timed to the audio the speaker actually plays. Off by default; no argument toggles. |
-| `/talk check` | Show setup status: audio helper, devices, API key, Pi's backend model, settings. No network or microphone use. |
+| `/talk check` | Show setup status: audio helper, devices, API key, Pi's backend model, settings, shortcuts. No network or microphone use. |
 | `/talk devices` | Show the input and output in use (the macOS defaults). |
-| `/talk tone [hz]` | Play a test tone. |
-| `/talk mic-test [seconds]` | Record a short clip, report its level, and play it back. Nothing leaves your Mac. |
-| `/talk-preview [listening\|thinking\|speaking\|…\|off]` | Preview the voice bar without a session. |
+| `/talk tone [20-20000]` | Play a test tone (440 Hz by default). |
+| `/talk mic-test [1-10]` | Record a short clip (3 s by default), report its level, and play it back. Nothing leaves your Mac. |
+| `/talk preview [state\|off]` | Preview the voice bar without a session: `cycle` (default), `idle`, `listening`, `thinking`, `speaking`, `error`. |
+| `/talk help` | List the commands and shortcuts. |
+
+<kbd>Tab</kbd> completes subcommands and their values. While voice is in use, Pi's footer shows `voice on`, `voice muted`, or `voice paused`, and how many results are waiting to be said.
+
+### Shortcuts
+
+| Action | Default | Does |
+|---|---|---|
+| `pi-voice.toggle` | `alt+v` | Start or stop voice, like `/talk`. |
+| `pi-voice.mute` | `alt+m` | Mute or unmute the microphone. |
+
+Change them in Pi's `keybindings.json` (`~/.pi/agent/keybindings.json`), next to Pi's own actions, then run `/reload`. Use a key or a list of keys; `[]` turns a shortcut off:
+
+```json
+{
+  "pi-voice.toggle": "ctrl+shift+v",
+  "pi-voice.mute": []
+}
+```
+
+On macOS, <kbd>Alt</kbd> shortcuts need your terminal to send Option as Meta (iTerm2: Profiles → Keys → Left Option key: Esc+; Terminal: Settings → Profiles → Keyboard → Use Option as Meta key; Ghostty: `macos-option-as-alt = true`). Otherwise Option+V types `√`.
 
 ## API key
 

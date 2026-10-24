@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- `/talk-preview` is now `/talk preview [state|off]`.
+
+### Command interface
+
+- **`/talk` alone starts voice, or stops it if it is running.** `/talk mute` toggles the microphone (`/talk mute on|off` sets it), and `/talk help` lists every command and shortcut.
+- **Shortcuts:** <kbd>Alt</kbd>+<kbd>V</kbd> starts or stops voice and <kbd>Alt</kbd>+<kbd>M</kbd> mutes it. They are the actions `pi-voice.toggle` and `pi-voice.mute` in Pi's `keybindings.json`, where you can change or turn them off; `/talk check` shows them.
+- **Footer status:** while voice is in use, Pi's footer shows `voice on`, `voice muted`, or `voice paused`, and how many results are waiting to be said.
+- <kbd>Tab</kbd> completes `/talk` subcommands and their values.
+- Arguments are checked: `/talk tone abc`, `/talk mic-test 99`, or `/talk stop now` show the usage instead of quietly using a default, and a mistyped subcommand suggests the closest one (`/talk strat` → "Did you mean /talk start?").
+- `/talk stop` confirms that voice stopped (and that a running task continues), or says voice was not running.
+
 ## 0.2.0 (2026-10-24)
 
 ### Breaking changes

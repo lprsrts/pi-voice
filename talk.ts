@@ -25,6 +25,8 @@ export type TalkHost = {
     samples?(source: "input" | "output", samples: number[]): void;
     caption?(line: CaptionLine): void;
   };
+  /** The connection, pause, or results-to-say changed (for a status indicator). */
+  changed?(): void;
   /** Seconds of silence before auto-pause, while Pi works and while nothing runs (0 = never). */
   pauseAfter?(): { busy: number; idle: number };
   now?(): number;
@@ -71,6 +73,7 @@ export class TalkSession {
     if (this.ended) return;
     if (this.voice && this.ready) { this.voice.notify(text); return; }
     this.pending = [...this.pending.slice(-(PENDING_LIMIT - 1)), text];
+    this.host.changed?.();
     if (this.voice) return; // still connecting: said once it is ready
     // Auto-paused: come back to say it. Closed by the user: it waits for the next open().
     if (this.paused) { this.paused = false; this.open(); }
@@ -94,7 +97,7 @@ export class TalkSession {
       samples: (source, samples) => view.samples?.(source, samples),
       error: message => this.host.notify(message, "error"),
       caption: line => view.caption?.(line),
-      closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); } },
+      closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
       tool: (name, args) => bridge.call(name, args),
       busy: () => !this.host.control.isIdle(),
       briefing: () => sessionBriefing(this.host.branch(), { cwd: this.host.cwd(), status: bridge.status() }),
@@ -109,13 +112,16 @@ export class TalkSession {
       const said = this.pending;
       this.pending = [];
       for (const text of said) voice.notify(text);
+      if (said.length) this.host.changed?.();
     }).catch(error => {
       voice.stop();
       if (this.voice !== voice) return; // closed meanwhile; no error banner
       this.voice = undefined;
       view.state?.("error");
+      this.host.changed?.();
       this.host.notify(error instanceof Error ? error.message : "Voice failed to start.", "error");
     });
+    this.host.changed?.();
     if (!this.timer) { this.timer = setInterval(() => this.checkIdle(), 1000); this.timer.unref?.(); }
   }
 
@@ -129,6 +135,7 @@ export class TalkSession {
     this.paused = false;
     voice?.stop();
     this.host.view?.state?.(this.host.control.isIdle() ? "idle" : "thinking");
+    this.host.changed?.();
   }
 
   /** Auto-pause: nobody has talked for a while, so stop paying for an open connection. */
@@ -140,6 +147,7 @@ export class TalkSession {
     if (!limit || this.now() - this.lastActivity < limit) return;
     this.close();
     this.paused = working; // only Pi's result brings voice back by itself
+    this.host.changed?.();
     this.host.notify(working
       ? "Voice paused while I work; it comes back with the result. /talk start to speak sooner."
       : "Voice paused after a quiet stretch. /talk start to talk again.", "info");
