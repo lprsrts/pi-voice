@@ -9,7 +9,8 @@
 // voice, so its answers are heard rather than read.
 export const VOICE_PROMPT = [
   "You are speaking with the user right now: a live voice (GPT-Live) is your own voice and ears in this session. It hears the user, passes their requests to you, and speaks your final answer aloud in your name, possibly paraphrased. You and the voice are one agent, not two.",
-  "Messages that start with \"Voice request\" are speech transcripts: they can contain recognition errors, missing punctuation, or half-finished phrases. The first line is the request; it can be followed by what was said since the previous request (the user's earlier turns and what you said by voice), which is what the request refers to: read it before acting. Interpret sensibly; ask only if you truly cannot act.",
+  "Messages that start with \"Voice request\" are speech transcripts: they can contain recognition errors, missing punctuation, or half-finished phrases. The first line is the request; it can be followed by what was said aloud that this conversation does not have yet (said while you worked), which the request may refer to: read it before acting. Interpret sensibly; ask only if you truly cannot act.",
+  "Messages that start with \"Voice conversation\" are what the user and you said aloud between requests: context for what follows, never requests themselves.",
   "Do the work exactly as you would for typed requests, with your usual tools and care. When the user is thinking aloud, describing a plan, or asking a question about a change (\"would this work?\", \"do we need anything else?\"), look and answer the question; do not change files until they ask you to make the change.",
   "End with a short answer meant to be spoken: the outcome first, one to three sentences, no code, paths, tables, or long lists unless asked. Details stay in the terminal.",
 ].join("\n");
@@ -25,7 +26,8 @@ export type PiControl = {
 };
 
 /** An update the voice model should tell the user about at the next quiet moment. */
-export type Notice = (text: string) => void;
+/** Something to say aloud; `answer` names the chat placeholder a result's read-out plays into. */
+export type Notice = (text: string, answer?: string) => void;
 /** Silent background context (only providers with such a channel, e.g. GPT-Live thinking). */
 export type Progress = (text: string) => void;
 
@@ -37,6 +39,11 @@ export const VOICE_REQUEST = "Voice request (speech transcript; may contain reco
 export const CONVERSATION_MARK = "\n\nWhat we said since my last request, oldest first:\n";
 /** The user's words of a request, without the voice framing, for status and notices. */
 export const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split(CONVERSATION_MARK)[0] : request;
+
+/** Text for the voice to say: Markdown links as their text, bare URLs as "(link)" (never read out, and token-heavy). */
+export function forSpeech(text: string): string {
+  return text.replace(/\[([^\]]+)\]\((?:[^()\s]|\([^)\s]*\))+\)/g, "$1").replace(/<?https?:\/\/[^\s>)]+>?/g, "(link)");
+}
 
 /** One-line, bounded description of a tool call for pi_status. */
 export function describeTool(name: string, args: unknown): string {
@@ -65,9 +72,29 @@ function userText(message: any): string {
 
 const BRIEFING_CHARS = 4000;
 
-/** Session entries (not sent to the model) holding what was said aloud: the user's words and the voice's replies. */
+/** Session entries (not sent to the model) holding what was said aloud, as written by 0.3.0; still drawn when resumed. */
 export const SPOKEN_ENTRY = "pi-voice-spoken";
 export type SpokenEntry = { role: "user" | "voice"; text: string; interrupted?: boolean };
+
+/**
+ * What was said aloud: a placeholder entry (SPOKEN_TURN) holds the
+ * turn's place in the chat, and a hidden custom message (SPOKEN_MESSAGE) carries
+ * the kept text into Pi's conversation, where the model sees it as context.
+ */
+export const SPOKEN_TURN = "pi-voice-turn";
+export const SPOKEN_MESSAGE = "pi-voice-said";
+/** A placeholder; `answer` (hashes of its text blocks) when it stands in for Pi's answer to a voice request. */
+export type SpokenTurn = { id: string; role: "user" | "voice"; answer?: string[] };
+/** The voice's read-out of Pi's answer, kept for the chat only: Pi already has its answer. */
+export const SPOKEN_READOUT = "pi-voice-readout";
+export type SpokenReadout = { id: string; text: string; interrupted?: boolean };
+export type SpokenSaid = SpokenTurn & { text: string; interrupted?: boolean };
+
+/** How a kept spoken turn reads to Pi's model: context, never a request (requests arrive as "Voice request" messages). */
+export function spokenContent(role: "user" | "voice", text: string, interrupted = false): string {
+  const said = role === "user" ? `the user said: ${text}` : `I said: ${text}${interrupted ? " (the user cut me off here)" : ""}`;
+  return `Voice conversation (context, not a request), ${said}`;
+}
 
 /**
  * What a new voice session should know, in the first person: the voice starts
@@ -81,10 +108,12 @@ export function sessionBriefing(entries: readonly any[], options: { cwd?: string
   const spokenRequests = new Set<string>();
   for (const entry of entries) {
     if (entry?.type === "compaction" && typeof entry.summary === "string") { summary = entry.summary; turns.length = 0; spokenRequests.clear(); continue; }
-    if (entry?.type === "custom" && entry.customType === SPOKEN_ENTRY && typeof entry.data?.text === "string") {
+    const said = entry?.type === "custom" && entry.customType === SPOKEN_ENTRY ? entry.data
+      : entry?.type === "custom_message" && entry.customType === SPOKEN_MESSAGE ? entry.details : undefined;
+    if (typeof said?.text === "string") {
       // What was said aloud. A request handed to Pi is already in the conversation as its message.
-      const text = entry.data.text.replace(/\s+/g, " ").trim();
-      if (entry.data.role === "voice") turns.push(`- Me (said aloud): ${clip(text, 300)}`);
+      const text = said.text.replace(/\s+/g, " ").trim();
+      if (said.role === "voice") turns.push(`- Me (said aloud): ${clip(text, 300)}`);
       else if (!spokenRequests.has(text)) turns.push(`- The user (said to me): ${clip(text, 300)}`);
       continue;
     }
@@ -241,8 +270,11 @@ export class PiBridge {
     this.approval = undefined;
   }
 
-  /** The run fully settled (no retries or queued continuations left). */
-  settled(aborted: boolean) {
+  /** Whether the run in progress was asked for by voice (its answer is read out). */
+  get voiceRun() { return this.voiceInRun && this.active; }
+
+  /** The run fully settled (no retries or queued continuations left); `answer` is where its read-out plays in the chat. */
+  settled(aborted: boolean, answer?: string) {
     const announce = this.voiceInRun && this.active && !(aborted && this.cancelledByVoice);
     this.cancelledByVoice = false;
     const task = this.task;
@@ -253,10 +285,9 @@ export class PiBridge {
     this.queued = [];
     if (!announce) return;
     const subject = task ? `the task "${clip(task.replace(/[.!?\s]+$/, ""), 300)}"` : "its task";
-    const result = this.lastText ? clip(this.lastText, 1500) : "(no text answer)";
-    this.notice(aborted
-      ? `I stopped ${subject} before finishing. My last output: ${result}`
-      : `I finished ${subject}. My answer: ${result}`);
+    const result = this.lastText ? clip(forSpeech(this.lastText), 1500) : "(no text answer)";
+    if (aborted) this.notice(`I stopped ${subject} before finishing. My last output: ${result}`);
+    else this.notice(`I finished ${subject}. My answer: ${result}`, answer);
   }
 
   /** The voice session ended: stop emitting notices (Pi keeps running). */

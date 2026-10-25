@@ -27,6 +27,9 @@ const CONTEXT_CHARS = 3000;
 // reply) is written once the voice has been quiet this long, or at once when
 // the user starts a new turn or voice stops.
 const TRANSCRIPT_QUIET_MS = 1200;
+// ...unless the transcript is still ahead of the audio (the reply goes on after
+// a pause), up to this long.
+const TRANSCRIPT_WAIT_MS = 8000;
 const TRANSCRIPT_CHARS = 4000;
 // GPT-Live can start replying before the transcript of the user's last words
 // arrives. A fragment that lands this soon after the reply began, before this
@@ -108,8 +111,18 @@ type Hooks = {
   activity?: () => void;
   /** The phrase the agent is saying now and how much of it is spoken, in step with playback. */
   caption?: (line: CaptionLine) => void;
-  /** A finished turn for the spoken history: the user's words, or the voice's reply (cut where the user interrupted it). */
-  transcript?: (role: "user" | "voice", text: string, interrupted: boolean) => void;
+  /**
+   * What is being said right now, for the chat: the user's words as they are
+   * recognized, or the voice's reply as far as it has played; `answer` when it
+   * reads out a Pi result that the chat shows in its place.
+   */
+  live?: (role: "user" | "voice", text: string, answer?: string) => void;
+  /**
+   * A turn is over: what to keep of it (the user's words, or the voice's reply cut
+   * where the user interrupted it). Empty when nothing is kept: a request handed
+   * to Pi, or what was said while Pi works.
+   */
+  transcript?: (role: "user" | "voice", text: string, interrupted: boolean, answer?: string) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -158,15 +171,25 @@ export class LiveVoice {
   private committedFrom = -Infinity;
   private commitTimer?: ReturnType<typeof setTimeout>;
   private heardAt = 0; // when the user's last words arrived (wall clock)
-  private readout = false; // the next reply reads out a Pi result, which the chat already shows
-  private working = false; // the reply came while Pi works (progress, acknowledgements): the live line shows it
+  // Until the user speaks again, the voice is reading out a Pi result, or talking
+  // while Pi works: neither is shown or kept, except a read-out that stands in
+  // for Pi's answer in the chat (`readout` is then that answer's placeholder).
+  private readout: boolean | string = false;
+  private working = false;
+  private waitingSince = 0; // when a pending commit first found the reply still going
+  // Whether the current turn's words and the voice's reply joined Pi's conversation;
+  // only what did not goes with the next request as context.
+  private keptUser = false;
+  private keptVoice = false;
+  private voiceSaid = "";    // the voice's current turn as far as it has played
+  private voiceShown = 0;    // how much of it earlier (settled) replies already took
   private replyAt = 0;       // when the voice's current reply began (wall clock)
   private replyHeardMs = 0;  // voiced audio of the current reply played so far
 
   constructor(hooks: Hooks, audioFactory: AudioFactory) {
     this.hooks = hooks;
     this.audioFactory = audioFactory;
-    this.captions = new Captions(line => this.hooks.caption?.(line));
+    this.captions = new Captions(line => this.hooks.caption?.(line), said => this.voiceSpoken(said));
   }
 
   /** getKey runs before the network deadline so a keychain dialog or helper build is not cut off. */
@@ -229,7 +252,7 @@ export class LiveVoice {
   }
 
   /** A Pi update GPT-Live should say aloud (it paraphrases commentary), tied to the delegation Pi is answering. */
-  notify(text: string) { this.readout = true; this.commentary(text, this.delegation ?? null); }
+  notify(text: string, answer?: string) { this.readout = answer ?? true; this.commentary(text, this.delegation ?? null); }
 
   /** Silent context GPT-Live can use when asked, without speaking it now. */
   context(text: string) { this.thinking(text, this.delegation ?? null); }
@@ -256,6 +279,7 @@ export class LiveVoice {
           this.hooks.activity?.();
           if (!this.playing) { this.playing = true; this.hooks.state("speaking"); }
           this.cancelCommit();
+          this.waitingSince = 0;
           this.hooks.samples("output", waveform(frame));
         } else if (this.playing && Date.now() - this.lastAudible > 250) {
           this.playing = false;
@@ -321,30 +345,33 @@ export class LiveVoice {
         // The session clock says so when it can; otherwise the reply has barely started.
         if (!this.userTurn && typeof event.start_ms === "number" && this.voiceFrom !== undefined && event.start_ms < this.voiceFrom) break;
         const replyPending = this.playing || this.replyHeardMs === 0 || this.replyQueuedMs - this.replyPlayedMs > 50;
-        if (!this.userTurn && replyPending && Date.now() - this.replyAt < LATE_WORDS.ms && this.replyHeardMs < LATE_WORDS.playedMs) break;
+        if (!this.userTurn && replyPending && Date.now() - this.replyAt < LATE_WORDS.ms && this.replyHeardMs < LATE_WORDS.playedMs) { this.userWords(); break; }
         // The previous exchange is finished: write it before this turn's words.
-        if (!this.userTurn) this.commit(typeof event.start_ms === "number" ? event.start_ms : this.heard.at(-1)?.start);
+        if (!this.userTurn) {
+          this.commit(typeof event.start_ms === "number" ? event.start_ms : this.heard.at(-1)?.start);
+          this.readout = this.working = false;
+        }
         // GPT-Live decides when to yield; while the user talks over playback, drop the
         // locally queued audio so the model's own stop is not delayed by our buffer.
         if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); }
         if (!this.userTurn) {
           this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
-          // A new user turn. The finished one and the voice's reply become the
-          // conversation the next request is part of (a turn already sent as a
-          // request is not repeated); the request itself is only the new turn's words.
+          // A new user turn. What Pi's conversation lacks of the finished one and the
+          // voice's reply (said while Pi worked) goes with the next request as context
+          // (a turn already sent as a request is not repeated); the request itself is
+          // only the new turn's words.
           const from = typeof event.start_ms === "number" ? event.start_ms : (this.heard.at(-1)?.start ?? -Infinity);
           const previous = this.turnWords(this.turnFrom, from);
-          if (previous && this.turnFrom !== this.delegatedFrom) this.conversation.push({ role: "user", text: previous });
-          if (this.said.trim()) this.conversation.push({ role: "voice", text: this.said.trim() });
+          if (previous && this.turnFrom !== this.delegatedFrom && !this.keptUser) this.conversation.push({ role: "user", text: previous });
+          if (this.said.trim() && !this.keptVoice) this.conversation.push({ role: "voice", text: this.said.trim() });
           this.conversation = this.conversation.slice(-40);
+          this.keptUser = this.keptVoice = false;
           this.said = "";
           this.turnFrom = from;
         }
         this.userTurn = true;
         this.hooks.state("listening");
-        // The user's words so far, live on the caption line.
-        const said = this.turnWords(this.turnFrom, Infinity);
-        if (said) this.hooks.caption?.({ phrase: said, spoken: said.length, continues: false, open: true, role: "user" });
+        this.userWords();
         break;
       }
       case "session.delegation.created": {
@@ -384,8 +411,12 @@ export class LiveVoice {
     this.cancelCommit();
     this.commitTimer = setTimeout(() => {
       this.commitTimer = undefined;
-      // Still saying it, or the user is still talking: wait.
-      if (this.playing || this.replyQueuedMs - this.replyPlayedMs > 50 || Date.now() - this.heardAt < TRANSCRIPT_QUIET_MS) this.commitSoon();
+      // Still saying it, or the user is still talking: wait. A transcript ahead of
+      // the audio means the reply goes on after a pause: wait for it too, a while.
+      const unsaid = this.reply.replace(/\s+/g, "").length - this.voiceSaid.slice(this.voiceShown).replace(/\s+/g, "").length > 3;
+      this.waitingSince ||= Date.now();
+      if (this.playing || this.replyQueuedMs - this.replyPlayedMs > 50 || Date.now() - this.heardAt < TRANSCRIPT_QUIET_MS
+        || (unsaid && Date.now() - this.waitingSince < TRANSCRIPT_WAIT_MS)) this.commitSoon();
       else this.commit();
     }, TRANSCRIPT_QUIET_MS);
     this.commitTimer.unref?.();
@@ -400,18 +431,43 @@ export class LiveVoice {
    */
   private commit(until = Infinity) {
     this.cancelCommit();
+    this.waitingSince = 0;
     const words = this.heard.filter(fragment => fragment.start >= this.committedFrom && fragment.start < until);
-    const user = words.filter(fragment => !fragment.sent && !fragment.busy).map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    const join = (list: typeof words) => list.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    const user = join(words.filter(fragment => !fragment.sent && !fragment.busy));
+    const spokeAtAll = !!join(words);
     if (words.length) this.committedFrom = Math.max(...words.map(fragment => fragment.start)) + 0.001;
     const interrupted = this.replyQueuedMs - this.replyPlayedMs > 150; // unplayed audio was dropped
     const voice = heardPart(this.reply, interrupted && this.replyQueuedMs > 0 ? this.replyPlayedMs / this.replyQueuedMs : 1);
     this.reply = "";
     this.replyQueuedMs = this.replyPlayedMs = 0;
-    if (user) this.hooks.transcript?.("user", user, false);
+    if (spokeAtAll) this.hooks.transcript?.("user", user, false);
+    if (user) this.keptUser = true;
     // A read-out of Pi's result repeats the answer just above it in the chat, and
-    // what is said while Pi works (progress, acknowledgements) stays on the live line.
-    if (voice && !this.readout && !this.working) this.hooks.transcript?.("voice", voice, interrupted);
-    if (voice) this.readout = this.working = false;
+    // what is said while Pi works (progress, acknowledgements) is not kept.
+    const answer = typeof this.readout === "string" ? this.readout : undefined;
+    const shown = answer !== undefined || !(this.readout || this.working);
+    if (voice) this.hooks.transcript?.("voice", shown ? voice : "", interrupted, answer);
+    if (voice && shown) this.keptVoice = true; // in Pi's conversation, or Pi's own answer
+    this.voiceShown = this.voiceSaid.length; // the next reply in this turn starts after it
+  }
+
+  /** The user's words of the current turn so far, for the chat (not while Pi works, and not once handed to Pi). */
+  private userWords() {
+    const from = Math.max(this.turnFrom, this.committedFrom);
+    const words = this.heard.filter(fragment => fragment.start >= from && !fragment.sent && !fragment.busy);
+    const text = words.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    if (text) this.hooks.live?.("user", text);
+  }
+
+  /** The voice's reply as far as it has played, for the chat (not progress remarks or a read-out of Pi's result). */
+  private voiceSpoken(said: string) {
+    if (said.length < this.voiceSaid.length) this.voiceShown = 0; // a new turn
+    this.voiceSaid = said;
+    const text = said.slice(this.voiceShown).trim();
+    const answer = typeof this.readout === "string" ? this.readout : undefined;
+    if (!text || (answer === undefined && (this.readout || this.working || this.hooks.busy()))) return;
+    this.hooks.live?.("voice", text, answer);
   }
 
   /** Keeps the user's recent words on the session clock (fragments without timing go at the end). */
@@ -466,6 +522,7 @@ export class LiveVoice {
     const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${conversationContext(this.conversation)}`, when: "now" }) as { status?: string; error?: string };
     if (result.error) { this.commentary(`I couldn't take that request: ${result.error}`, id); return; }
     for (const fragment of fresh) fragment.sent = true; // Pi's message shows these words; the spoken history skips them
+    this.hooks.transcript?.("user", "", false); // Pi's own message takes over from the live line
     this.working = true; // the acknowledgement that follows is about the work
     this.conversation = [];
     this.delegatedFrom = this.turnFrom;

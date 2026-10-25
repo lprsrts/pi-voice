@@ -24,8 +24,10 @@ export type TalkHost = {
     state?(state: VoiceState): void;
     samples?(source: "input" | "output", samples: number[]): void;
     caption?(line: CaptionLine): void;
-    /** A finished spoken turn, for the chat history. */
-    transcript?(role: "user" | "voice", text: string, interrupted: boolean): void;
+    /** What is being said right now, for the chat; `answer` when it reads out a result into its placeholder. */
+    live?(role: "user" | "voice", text: string, answer?: string): void;
+    /** A spoken turn is over: what to keep of it ("" when nothing is). */
+    transcript?(role: "user" | "voice", text: string, interrupted: boolean, answer?: string): void;
   };
   /** The connection, pause, or results-to-say changed (for a status indicator). */
   changed?(): void;
@@ -42,7 +44,7 @@ export class TalkSession {
   private voice?: VoiceSession;
   private ready = false;   // the open connection's session has started
   private paused = false;  // closed by auto-pause while Pi works; reopens for its result
-  private pending: string[] = [];
+  private pending: { text: string; answer?: string }[] = [];
   private lastActivity = 0;
   private speaking = false;
   private timer?: ReturnType<typeof setInterval>;
@@ -51,7 +53,7 @@ export class TalkSession {
   constructor(host: TalkHost) {
     this.host = host;
     const now = host.now ?? (() => Date.now());
-    this.bridge = new PiBridge(host.pi, host.control, text => this.deliver(text), now, text => { if (this.ready) this.voice?.context?.(text); });
+    this.bridge = new PiBridge(host.pi, host.control, (text, answer) => this.deliver(text, answer), now, text => { if (this.ready) this.voice?.context?.(text); });
     // Voice started mid-task: keep announcing the running task, and know the last answer.
     const branch = host.branch() as any[];
     const lastOf = (pick: (message: any) => string) => {
@@ -71,10 +73,10 @@ export class TalkSession {
   get waiting() { return this.pending.length; }
 
   /** A result or prompt notice from Pi: said now, or when voice is next open. */
-  deliver(text: string) {
+  deliver(text: string, answer?: string) {
     if (this.ended) return;
-    if (this.voice && this.ready) { this.voice.notify(text); return; }
-    this.pending = [...this.pending.slice(-(PENDING_LIMIT - 1)), text];
+    if (this.voice && this.ready) { this.voice.notify(text, answer); return; }
+    this.pending = [...this.pending.slice(-(PENDING_LIMIT - 1)), { text, answer }];
     this.host.changed?.();
     if (this.voice) return; // still connecting: said once it is ready
     // Auto-paused: come back to say it. Closed by the user: it waits for the next open().
@@ -99,7 +101,8 @@ export class TalkSession {
       samples: (source, samples) => view.samples?.(source, samples),
       error: message => this.host.notify(message, "error"),
       caption: line => view.caption?.(line),
-      transcript: (role, text, interrupted) => view.transcript?.(role, text, interrupted),
+      live: (role, text, answer) => view.live?.(role, text, answer),
+      transcript: (role, text, interrupted, answer) => view.transcript?.(role, text, interrupted, answer),
       closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
       tool: (name, args) => bridge.call(name, args),
       busy: () => !this.host.control.isIdle(),
@@ -114,7 +117,7 @@ export class TalkSession {
       // Results that arrived while voice was closed or connecting, oldest first.
       const said = this.pending;
       this.pending = [];
-      for (const text of said) voice.notify(text);
+      for (const { text, answer } of said) voice.notify(text, answer);
       if (said.length) this.host.changed?.();
     }).catch(error => {
       voice.stop();

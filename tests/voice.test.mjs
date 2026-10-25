@@ -6,8 +6,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
-import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions, FlapBoard, FLAP_SETTLE_MS, FLAP_GLOW_MS } from '../protocol.ts';
-import { PiBridge, describeTool, VOICE_REQUEST, CONVERSATION_MARK, sessionBriefing, SPOKEN_ENTRY } from '../pi-bridge.ts';
+import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions, FlapBoard, FLAP_SETTLE_MS, FLAP_GLOW_MS, wrapWords } from '../protocol.ts';
+import { PiBridge, describeTool, forSpeech, VOICE_REQUEST, CONVERSATION_MARK, sessionBriefing, SPOKEN_ENTRY, SPOKEN_MESSAGE, SPOKEN_TURN, SPOKEN_READOUT, spokenContent } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
@@ -20,6 +20,11 @@ import { resolveSettings, DEFAULT_SETTINGS } from '../settings.ts';
 import { providerFiles, userConfigDir } from '../config.ts';
 import { AudioPipes, parseRoute, pcmStats } from '../audio.ts';
 import { aecEnabled, helperPath } from '../native.ts';
+import { SpokenChat, answerBlocks, answerHash, speakable } from '../chat.ts';
+// What a turn kept (a turn that keeps nothing still closes, with "").
+const kept = transcripts => transcripts.filter(([, text]) => text);
+// Hook calls as recorded: a trailing `answer` only when there is one.
+const trim = args => args.at(-1) === undefined ? args.slice(0, -1) : args;
 import { parseTalk, talkCompletions, talkHelp, TALK_COMMANDS, resolveShortcuts, loadShortcuts, keybindingsPath, DEFAULT_SHORTCUTS } from '../commands.ts';
 
 // No real credentials, network, microphone, speakers, or shell execution in tests.
@@ -159,12 +164,12 @@ class FakeSocket extends EventTarget {
 
 // ---------- OpenAI GPT-Live session (fake socket, no network or audio) ----------
 
-async function startLive({ tool = () => ({ ok: true }), busy = () => false, transcripts = [] } = {}) {
+async function startLive({ tool = () => ({ ok: true }), busy = () => false, transcripts = [], lives = [] } = {}) {
   const audio = { enqueued: [], interrupts: 0, muted: [], stopped: 0 };
   const errors = [], captions = [];
   let audioHooks;
   globalThis.WebSocket = FakeSocket;
-  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), transcript: (...t) => transcripts.push(t), closed() {}, tool, busy }, hooks => {
+  const voice = new LiveVoice({ state() {}, samples() {}, error: e => errors.push(e), caption: l => captions.push(l.phrase), live: (...l) => lives.push(trim(l)), transcript: (...t) => transcripts.push(trim(t)), closed() {}, tool, busy }, hooks => {
     audioHooks = hooks;
     return { start: (i, o) => assert.deepEqual([i, o], [24000, 24000]), enqueue: b => audio.enqueued.push(b), finish() {},
       interrupt: () => audio.interrupts++, mute: v => audio.muted.push(v), stop: () => audio.stopped++ };
@@ -440,11 +445,11 @@ test('a complete request goes to Pi at once; an incomplete one waits briefly for
   } finally { globalThis.WebSocket = originalWS; }
 });
 
-test('an explanation over several turns reaches Pi with the question that refers to it', async () => {
+test('an explanation over several turns is in Pi\'s conversation before the question that refers to it', async () => {
   const originalWS = globalThis.WebSocket;
   try {
-    const calls = [];
-    const { voice, socket } = await startLive({ tool: (name, args) => { calls.push(args.request); return { status: 'started' }; } });
+    const calls = [], transcripts = [];
+    const { voice, socket } = await startLive({ transcripts, tool: (name, args) => { calls.push(args.request); return { status: 'started' }; } });
     // Reported live: a long explanation with pauses, the voice answering in between, then the question.
     const user = (delta, start) => socket.event({ type: 'session.input_transcript.delta', delta, start_ms: start, end_ms: start + 1000 });
     const voiceSays = (delta, start) => socket.event({ type: 'session.output_transcript.delta', delta, start_ms: start, end_ms: start + 800 });
@@ -455,14 +460,15 @@ test('an explanation over several turns reaches Pi with the question that refers
     user('. Does that single line addition work in this current structure? Do we need anything else?', 7000);
     socket.event({ type: 'session.delegation.created', offset_ms: 8000, delegation: { id: 'd1' } });
     assert.equal(calls.length, 1);
-    const [request, context] = calls[0].split(CONVERSATION_MARK);
-    assert.match(request, /: \. Does that single line addition work in this current structure\? Do we need anything else\?$/);
-    assert.equal(context, [
-      '- User: In live.ts the delegate method should also log the delegation id',
-      '- You (voice): Got it, logging the id.',
-      '- User: Just one line, next to where the thinking update is sent',
-      '- You (voice): Mm-hm.',
-    ].join('\n'));
+    // The explanation joined Pi's conversation as it went; the request is just the question.
+    assert.deepEqual(kept(transcripts), [
+      ['user', 'In live.ts the delegate method should also log the delegation id', false],
+      ['voice', 'Got it, logging the id.', false],
+      ['user', 'Just one line, next to where the thinking update is sent', false],
+      ['voice', 'Mm-hm.', false],
+    ]);
+    assert.match(calls[0], /: \. Does that single line addition work in this current structure\? Do we need anything else\?$/);
+    assert.ok(!calls[0].includes(CONVERSATION_MARK), 'nothing repeated');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
@@ -476,16 +482,25 @@ test('conversation context keeps the newest lines within its budget', () => {
   assert.doesNotMatch(text, /line 0 /);
 });
 
-test('a short reply reaches Pi with what the voice had just said', async () => {
+test('a short reply reaches Pi with what the voice had just said, when Pi\'s conversation lacks it', async () => {
   const originalWS = globalThis.WebSocket;
   try {
+    let busy = false;
     const calls = [];
-    const { voice, socket } = await startLive({ tool: (name, args) => { calls.push([name, args]); return { status: 'started' }; } });
-    socket.event({ type: 'session.output_transcript.delta', delta: 'The build fails on a missing import. Shall Pi fix it?', start_ms: 0, end_ms: 2000 });
+    const { voice, socket } = await startLive({ busy: () => busy, tool: (name, args) => { calls.push([name, args]); return { status: 'started' }; } });
+    // Said while Pi is idle: the question is already in Pi's conversation, so the reply goes alone.
+    socket.event({ type: 'session.output_transcript.delta', delta: 'The build fails on a missing import. Shall I fix it?', start_ms: 0, end_ms: 2000 });
     socket.event({ type: 'session.input_transcript.delta', delta: 'Yes, do it.', start_ms: 2500, end_ms: 3000 });
     socket.event({ type: 'session.delegation.created', offset_ms: 3100, delegation: { id: 'd1' } });
     await settle();
-    assert.match(calls[0][1].request, /Yes, do it\.\n\nWhat we said since my last request, oldest first:\n- You \(voice\): The build fails on a missing import\. Shall Pi fix it\?$/);
+    assert.match(calls[0][1].request, /: Yes, do it\.$/);
+    // Said while Pi works (not kept): the reply carries it.
+    busy = true;
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Want me to run the linter as well?', start_ms: 4000, end_ms: 5000 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Sure.', start_ms: 5500, end_ms: 6000 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 6100, delegation: { id: 'd2' } });
+    await settle();
+    assert.match(calls[1][1].request, /Sure\.\n\nWhat we said since my last request, oldest first:\n- You \(voice\): Want me to run the linter as well\?$/);
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
@@ -900,15 +915,15 @@ test('a talk session adopts a task already running and briefs each connection', 
 
 test('settings: env over "pi-voice" in Pi settings over defaults, with invalid values reported', () => {
   assert.deepEqual(resolveSettings(undefined, {}).values, DEFAULT_SETTINGS);
-  assert.deepEqual(DEFAULT_SETTINGS, { autoPause: 15, idlePause: 60, captions: true, echoCancellation: true });
-  const settings = { 'pi-voice': { autoPause: 30, idlePause: 0, captions: true, echoCancellation: 'nope' }, defaultModel: 'x' };
+  assert.deepEqual(DEFAULT_SETTINGS, { autoPause: 15, idlePause: 60, echoCancellation: true });
+  const settings = { 'pi-voice': { autoPause: 30, idlePause: 0, echoCancellation: 'nope' }, defaultModel: 'x' };
   const fromSettings = resolveSettings(settings, {});
-  assert.deepEqual(fromSettings.values, { autoPause: 30, idlePause: 0, captions: true, echoCancellation: true });
-  assert.deepEqual(fromSettings.sources, { autoPause: 'settings', idlePause: 'settings', captions: 'settings', echoCancellation: 'default' });
+  assert.deepEqual(fromSettings.values, { autoPause: 30, idlePause: 0, echoCancellation: true });
+  assert.deepEqual(fromSettings.sources, { autoPause: 'settings', idlePause: 'settings', echoCancellation: 'default' });
   assert.deepEqual(fromSettings.invalid, ['"pi-voice".echoCancellation: "nope"']);
-  const fromEnv = resolveSettings(settings, { PI_VOICE_AUTOPAUSE: '5', PI_VOICE_CAPTIONS: 'off', PI_VOICE_AEC: '0', PI_VOICE_IDLE_PAUSE: 'soon' });
-  assert.deepEqual(fromEnv.values, { autoPause: 5, idlePause: 0, captions: false, echoCancellation: false });
-  assert.deepEqual(fromEnv.sources, { autoPause: 'env', idlePause: 'settings', captions: 'env', echoCancellation: 'env' });
+  const fromEnv = resolveSettings(settings, { PI_VOICE_AUTOPAUSE: '5', PI_VOICE_AEC: '0', PI_VOICE_IDLE_PAUSE: 'soon' });
+  assert.deepEqual(fromEnv.values, { autoPause: 5, idlePause: 0, echoCancellation: false });
+  assert.deepEqual(fromEnv.sources, { autoPause: 'env', idlePause: 'settings', echoCancellation: 'env' });
   assert.deepEqual(fromEnv.invalid, ['PI_VOICE_IDLE_PAUSE=soon', '"pi-voice".echoCancellation: "nope"']);
   assert.equal(resolveSettings({ 'pi-voice': { autoPause: -3 } }, {}).values.autoPause, 15, 'negative seconds fall back');
   assert.equal(describePause({ busy: 0, idle: 0 }), 'never (auto-pause is off)');
@@ -922,14 +937,13 @@ test('/talk parses subcommands strictly and toggles with no argument', () => {
   assert.deepEqual(parseTalk('  Start '), { name: 'start' });
   assert.deepEqual(parseTalk('mute'), { name: 'mute', value: undefined });
   assert.deepEqual(parseTalk('mute on'), { name: 'mute', value: true });
-  assert.deepEqual(parseTalk('captions off'), { name: 'captions', value: false });
   assert.deepEqual(parseTalk('tone'), { name: 'tone', hz: 440 });
   assert.deepEqual(parseTalk('tone 1000'), { name: 'tone', hz: 1000 });
   assert.deepEqual(parseTalk('mic-test'), { name: 'mic-test', seconds: 3 });
   assert.deepEqual(parseTalk('preview'), { name: 'preview', state: 'cycle' });
   assert.deepEqual(parseTalk('preview speaking'), { name: 'preview', state: 'speaking' });
   // Bad values are rejected with the usage, never silently replaced.
-  for (const bad of ['tone abc', 'tone 0', 'tone 440.5', 'tones', 'mic-test 99', 'mic-test 2.5', 'mute maybe', 'stop now', 'preview loud', 'captions on off']) {
+  for (const bad of ['tone abc', 'tone 0', 'tone 440.5', 'tones', 'mic-test 99', 'mic-test 2.5', 'mute maybe', 'stop now', 'preview loud', 'captions', 'mute on off']) {
     assert.equal(parseTalk(bad).name, 'error', bad);
   }
   assert.match(parseTalk('tone 0').message, /Use \/talk tone \[20-20000\]/);
@@ -941,7 +955,7 @@ test('/talk completes subcommands, then their values', () => {
   assert.deepEqual(talkCompletions('').map(item => item.label), TALK_COMMANDS.map(command => command.name));
   assert.deepEqual(talkCompletions('m').map(item => item.value), ['mute ', 'mic-test ']);
   assert.deepEqual(talkCompletions('st').map(item => item.value), ['start', 'stop']);
-  assert.deepEqual(talkCompletions('captions ').map(item => item.value), ['captions on', 'captions off']);
+  assert.deepEqual(talkCompletions('mute ').map(item => item.value), ['mute on', 'mute off']);
   assert.deepEqual(talkCompletions('preview sp').map(item => item.value), ['preview speaking']);
   assert.equal(talkCompletions('stop '), null);
   assert.equal(talkCompletions('zz'), null);
@@ -1022,17 +1036,18 @@ test('a quiet moment after the voice speaks writes the exchange; a handoff and i
     socket.event({ type: 'session.input_transcript.delta', delta: 'yes profile it', start_ms: 800, end_ms: 1000 });
     assert.deepEqual(transcripts, [['user', 'the parser is slow', false], ['voice', 'Want me to profile it?', false]]);
     socket.event({ type: 'session.delegation.created', delegation: { id: 'del_1' }, offset_ms: 1000 });
+    assert.deepEqual(transcripts.at(-1), ['user', '', false], 'the request\'s live line closes as Pi\'s message takes over');
     mock.timers.tick(1300);
-    assert.equal(transcripts.length, 2, 'Pi\'s message shows the request; it is not written again');
+    assert.equal(kept(transcripts).length, 2, 'Pi\'s message shows the request; it is not written again');
     socket.event({ type: 'session.output_transcript.delta', delta: 'Fixing it now.', start_ms: 1100, end_ms: 1400 });
     socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
     for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
     mock.timers.tick(300);
     output(Buffer.alloc(960), true); // silence: playback has drained
     mock.timers.tick(1300);
-    assert.equal(transcripts.length, 2, 'the acknowledgement of a handoff stays on the live line');
+    assert.equal(kept(transcripts).length, 2, 'the acknowledgement of a handoff is not kept');
     voice.stop();
-    assert.equal(transcripts.length, 2, 'nothing is written later either');
+    assert.equal(kept(transcripts).length, 2, 'nothing is kept later either');
   } finally { mock.timers.reset(); globalThis.WebSocket = originalWS; }
 });
 
@@ -1091,27 +1106,85 @@ test('the voice reading out Pi\'s result is not written again under Pi\'s answer
     voice.notify('I finished the task "check the repo". My answer: four packages, no algorithms yet.');
     say('Four packages, no algorithms yet.', 0);
     socket.event({ type: 'session.input_transcript.delta', delta: 'what next', start_ms: 500, end_ms: 600 });
-    assert.deepEqual(transcripts, [], 'the read-out is skipped');
+    assert.deepEqual(transcripts, [['voice', '', false]], 'the read-out is not kept');
     say('A small working example.', 700);
     socket.event({ type: 'session.input_transcript.delta', delta: 'ok', start_ms: 1000, end_ms: 1100 });
-    assert.deepEqual(transcripts, [['user', 'what next', false], ['voice', 'A small working example.', false]], 'later replies are written');
+    assert.deepEqual(transcripts.slice(1), [['user', 'what next', false], ['voice', 'A small working example.', false]], 'later replies are kept');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });
 
-test('while Pi works, what is said stays on the live line: the user\'s words show there as they are heard', async () => {
+test('the user\'s words play in the chat as they are heard; nothing said while Pi works is shown or kept', async () => {
   const originalWS = globalThis.WebSocket;
   try {
-    const transcripts = [];
-    const { voice, socket, captions } = await startLive({ transcripts, busy: () => true });
+    let busy = false;
+    const transcripts = [], lives = [];
+    const { voice, socket, output, played } = await startLive({ transcripts, lives, busy: () => busy });
     socket.event({ type: 'session.input_transcript.delta', delta: 'how is it', start_ms: 0, end_ms: 100 });
     socket.event({ type: 'session.input_transcript.delta', delta: ' going', start_ms: 100, end_ms: 200 });
-    assert.equal(captions.at(-1), 'how is it going', 'the live line follows the user\'s words');
-    socket.event({ type: 'session.output_transcript.delta', delta: 'Still on the tests.', start_ms: 300, end_ms: 500 });
-    socket.event({ type: 'session.input_transcript.delta', delta: 'ok', start_ms: 700, end_ms: 800 });
+    assert.deepEqual(lives, [['user', 'how is it'], ['user', 'how is it going']]);
+    // The voice's reply plays in as its audio does.
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Fine.', start_ms: 300, end_ms: 400 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+    for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
+    assert.deepEqual(lives.at(-1), ['voice', 'Fine.']);
+    // Pi starts working: nothing more plays in the chat, and nothing more is kept.
+    busy = true;
+    lives.length = 0;
+    socket.event({ type: 'session.input_transcript.delta', delta: 'status?', start_ms: 700, end_ms: 800 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Still on the tests.', start_ms: 900, end_ms: 1100 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+    for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
     voice.stop();
-    assert.deepEqual(transcripts, [], 'nothing said while Pi works is written to the chat');
+    assert.deepEqual(lives, []);
+    assert.deepEqual(kept(transcripts), [['user', 'how is it going', false], ['voice', 'Fine.', false]]);
   } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the chat transcript: a turn plays in, settles, joins Pi\'s conversation, and redraws on resume', () => {
+  let clock = 1000;
+  const appended = [], sent = [];
+  const chat = new SpokenChat({ append: t => appended.push(t), send: m => sent.push(m) }, () => clock);
+  const theme = { fg: (_c, t) => t, bg: (_c, t) => t, italic: t => t };
+  chat.live('user', 'what is');
+  chat.live('user', 'what is next');
+  assert.equal(appended.length, 1, 'one placeholder per turn');
+  const placeholder = appended[0];
+  assert.equal(placeholder.role, 'user');
+  const live = chat.component(placeholder.id, theme);
+  assert.notEqual(live.render(40)[1].trimEnd(), ' what is next', 'new letters flip in first');
+  clock += 2000;
+  assert.deepEqual(live.render(40).map(l => l.trimEnd()), ['', ' what is next', ''], 'then settle, on the typed-message band');
+  chat.settle('user', 'what is next', false);
+  assert.deepEqual(sent, [{ customType: SPOKEN_MESSAGE, content: spokenContent('user', 'what is next'), display: false, details: { id: placeholder.id, role: 'user', text: 'what is next' } }]);
+  assert.match(sent[0].content, /^Voice conversation \(context, not a request\), the user said: what is next$/);
+  // A voice turn cut off by the user, wrapped to the width.
+  chat.live('voice', 'Start with a small working example');
+  chat.settle('voice', 'Start with a small…', true);
+  const voiceLines = chat.component(appended[1].id, theme).render(16);
+  assert.deepEqual(voiceLines, [' Start with a', ' small…'], 'like assistant text');
+  // A turn that keeps nothing (a request handed to Pi) is not drawn again and not sent.
+  chat.live('user', 'make it four');
+  chat.settle('user', '', false);
+  assert.equal(chat.component(appended[2].id, theme), undefined);
+  assert.equal(sent.length, 2);
+  // Resumed: placeholders redraw from their messages.
+  const resumed = new SpokenChat({ append() {}, send() {} });
+  resumed.load([{ type: 'custom_message', customType: SPOKEN_MESSAGE, details: sent[1].details }]);
+  assert.deepEqual(resumed.component(appended[1].id, theme).render(16), voiceLines);
+  assert.equal(resumed.component(appended[2].id, theme), undefined, 'a dropped turn stays hidden');
+});
+
+test('words wrap at spaces, and a word longer than the width is split', () => {
+  const text = 'the rhythm of the voice and the pace';
+  assert.deepEqual(wrapWords(text, 12).map(([a, b]) => text.slice(a, b)), ['the rhythm', 'of the voice', 'and the pace']);
+  assert.deepEqual(wrapWords('abcdefgh', 3).map(([a, b]) => 'abcdefgh'.slice(a, b)), ['abc', 'def', 'gh']);
+});
+
+test('the briefing reads spoken turns saved in Pi\'s conversation', () => {
+  const said = (role, text) => ({ type: 'custom_message', customType: SPOKEN_MESSAGE, details: { id: role + text, role, text } });
+  const text = sessionBriefing([said('user', 'is the parser slow?'), said('voice', 'A little, on big files.')], {});
+  assert.match(text, /- The user \(said to me\): is the parser slow\?\n- Me \(said aloud\): A little, on big files\./);
 });
 
 test('the user\'s last word arriving after the reply began joins the user\'s turn instead of splitting it', async () => {
@@ -1131,4 +1204,162 @@ test('the user\'s last word arriving after the reply began joins the user\'s tur
     voice.stop();
     assert.deepEqual(transcripts, [['user', "How's it going", false], ['voice', 'Quite well, thank you.', false]]);
   } finally { LATE_WORDS.ms = 0; globalThis.WebSocket = originalWS; }
+});
+
+test('a read-out of Pi\'s result that pauses mid-way stays hidden to the end; a reply that pauses settles once, whole', async () => {
+  const originalWS = globalThis.WebSocket;
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  try {
+    const transcripts = [], lives = [];
+    const live = startLive({ transcripts, lives });
+    mock.timers.tick(0);
+    const { voice, socket, output, played } = await live;
+    let at = 0;
+    const say = (text, frames = 5) => {
+      socket.event({ type: 'session.output_transcript.delta', delta: text, start_ms: at, end_ms: at + 100 * frames });
+      socket.event({ type: 'session.output_audio.delta', delta: voiced(frames).toString('base64') });
+      for (let i = 0; i < frames; i++) { output(voiced(1), true); played(voiced(1)); }
+      at += 100 * frames;
+    };
+    // A pause plays silence (the speaker keeps reporting frames), then nothing for a while.
+    const pause = ms => { for (let i = 0; i < 15; i++) { mock.timers.tick(20); output(Buffer.alloc(960), true); played(Buffer.alloc(960)); } mock.timers.tick(ms); };
+    voice.notify('I finished the task "check the repo". My answer: lots in motion.');
+    say('A lot is in motion,');
+    pause(1300); // a quiet stretch mid-read-out: the part so far closes, kept as nothing
+    say(' with spoken turns going into the app.');
+    pause(1300);
+    assert.deepEqual(lives.filter(([role]) => role === 'voice'), [], 'no part of the read-out plays in the chat');
+    assert.deepEqual(kept(transcripts), []);
+    // The user speaks: the next reply is shown again. Its transcript runs ahead of the audio over a pause.
+    socket.event({ type: 'session.input_transcript.delta', delta: 'give me a long sentence', start_ms: at, end_ms: at + 300 });
+    at += 400;
+    socket.event({ type: 'session.output_transcript.delta', delta: 'As the words arrive, one after another, you may notice the rhythm.', start_ms: at, end_ms: at + 600 });
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+    for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
+    pause(1300);
+    assert.equal(kept(transcripts).length, 0, 'the exchange waits: the reply is not over');
+    socket.event({ type: 'session.output_audio.delta', delta: voiced(25).toString('base64') });
+    for (let i = 0; i < 25; i++) { output(voiced(1), true); played(voiced(1)); }
+    pause(1300);
+    assert.deepEqual(kept(transcripts), [['user', 'give me a long sentence', false], ['voice', 'As the words arrive, one after another, you may notice the rhythm.', false]]);
+    voice.stop();
+  } finally { mock.timers.reset(); globalThis.WebSocket = originalWS; }
+});
+
+// ---------- The read-out stands in for Pi's answer ----------
+
+test('a short answer without code, lists, tables, or headings can be read out in its place', () => {
+  assert.equal(speakable('All 22 parser tests pass; tabs are four spaces now.'), true);
+  assert.equal(speakable('Changed `parser.ts`: tabs are **four** spaces.'), true);
+  for (const text of ['Run:\n```sh\nnpm test\n```', 'Two things:\n- the parser\n- the lexer', '| a | b |\n|---|---|', '## Summary\nDone.', 'x'.repeat(601), '']) {
+    assert.equal(speakable(text), false, JSON.stringify(text.slice(0, 20)));
+  }
+  const message = text => ({ role: 'assistant', stopReason: 'stop', content: [{ type: 'thinking', thinking: 'hm' }, { type: 'text', text }] });
+  assert.deepEqual(answerBlocks(message(' Done. ')), ['Done.']);
+  assert.equal(answerBlocks({ ...message('Checking.'), stopReason: 'toolUse' }), undefined, 'not while it calls tools');
+  assert.equal(answerBlocks({ role: 'user', content: 'hi' }), undefined);
+});
+
+test('the read-out plays in where Pi\'s answer was, under Pi\'s written answer collapsed like a thinking block', () => {
+  let clock = 1000, speaking = true;
+  const appended = [], saved = [], sent = [];
+  const chat = new SpokenChat({ append: t => appended.push(t), send: m => sent.push(m), save: r => saved.push(r), speaking: () => speaking }, () => clock);
+  const theme = { fg: (_c, t) => t, bg: (_c, t) => t, italic: t => t };
+  const blocks = ['Tabs are **four** spaces now; all 22 parser tests pass.'];
+  chat.hide(blocks);
+  assert.equal(chat.hidden(blocks[0]), true, 'Pi\'s text is hidden');
+  assert.equal(chat.hidden('Something else.'), false);
+  const id = chat.answer(blocks);
+  assert.deepEqual(appended, [{ id, role: 'voice', answer: [answerHash(blocks[0])] }]);
+  const component = chat.component(id, theme);
+  assert.deepEqual(component.render(80), [], 'the voice is about to say it');
+  clock += 9000;
+  assert.deepEqual(component.render(80), [' Tabs are four spaces now; all 22 parser tests pass.'], 'no read-out in time: Pi\'s text');
+  // The read-out plays in, pauses, goes on, and settles: saved for the chat only.
+  chat.live('voice', 'Tabs are four spaces now,', id);
+  chat.settle('voice', 'Tabs are four spaces now,', false, id);
+  chat.live('voice', 'and the tests pass.', id);
+  component.render(80); // the new words start flipping in
+  clock += 2000;
+  const readout = ' Tabs are four spaces now, and the tests pass.', written = ' Tabs are four spaces now; all 22 parser tests pass.';
+  assert.deepEqual(component.render(80), [' Written answer', '', readout]);
+  chat.settle('voice', 'and the tests pass.', false, id);
+  assert.deepEqual(saved.at(-1), { id, text: 'Tabs are four spaces now, and the tests pass.' });
+  assert.deepEqual(sent, [], 'not sent to Pi: it has its answer');
+  // A click on the label opens Pi's written answer; another closes it. Ctrl+O opens it too.
+  const click = y => component.handleMouse({ type: 'click', button: 'left', x: 2, y, screenX: 2, screenY: y, width: 80, height: 3, shift: false, alt: false, ctrl: false });
+  click(0);
+  assert.deepEqual(component.render(80), [written, '', readout]);
+  click(0);
+  assert.deepEqual(component.render(80), [' Written answer', '', readout]);
+  assert.deepEqual(chat.component(id, theme, true).render(80), [written, '', readout], 'Ctrl+O');
+  // An answer no read-out will come for (voice stopped) shows Pi's text.
+  speaking = false;
+  const unread = chat.answer(['Done.']);
+  assert.deepEqual(chat.component(unread, theme).render(80), [' Done.']);
+  // Resumed: the read-out redraws, Pi's text stays hidden; an answer never read shows Pi's text.
+  const resumed = new SpokenChat({ append() {}, send() {}, save() {}, speaking: () => false });
+  resumed.load([
+    { type: 'message', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: blocks[0] }] } },
+    { type: 'custom', customType: SPOKEN_TURN, data: appended[0] },
+    { type: 'custom', customType: SPOKEN_READOUT, data: saved.at(-1) },
+    { type: 'message', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Done.' }] } },
+    { type: 'custom', customType: SPOKEN_TURN, data: appended[1] },
+  ]);
+  assert.equal(resumed.hidden(blocks[0]), true);
+  assert.deepEqual(resumed.component(id, theme).render(80), [' Written answer', '', ' Tabs are four spaces now, and the tests pass.']);
+  assert.deepEqual(resumed.component(unread, theme).render(80), [' Done.']);
+});
+
+test('a read-out of Pi\'s answer plays in its placeholder and is not kept in Pi\'s conversation; other read-outs stay hidden', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const transcripts = [], lives = [];
+    const { voice, socket, output, played } = await startLive({ transcripts, lives });
+    const say = (text, from) => {
+      socket.event({ type: 'session.output_transcript.delta', delta: text, start_ms: from, end_ms: from + 100 });
+      socket.event({ type: 'session.output_audio.delta', delta: voiced(5).toString('base64') });
+      for (let i = 0; i < 5; i++) { output(voiced(1), true); played(voiced(1)); }
+    };
+    voice.notify('I finished the task "check". My answer: all good.', 'answer-1');
+    say('All good.', 0);
+    socket.event({ type: 'session.input_transcript.delta', delta: 'thanks', start_ms: 500, end_ms: 600 });
+    assert.deepEqual(lives.filter(([role]) => role === 'voice').at(-1), ['voice', 'All good.', 'answer-1']);
+    assert.deepEqual(transcripts, [['voice', 'All good.', false, 'answer-1']]);
+    // A notice without an answer (e.g. a stopped task) is still not shown.
+    voice.notify('I stopped the task before finishing.');
+    say('I stopped it.', 700);
+    socket.event({ type: 'session.input_transcript.delta', delta: 'ok', start_ms: 1000, end_ms: 1100 });
+    assert.ok(lives.every(([, text]) => !text.includes('stopped')), 'not shown');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the bridge hands the answer\'s placeholder to the read-out of a finished voice run, not a stopped one', () => {
+  const notices = [];
+  const bridge = new PiBridge({ sendUserMessage() {} }, { isIdle: () => true, abort() {}, hasPendingMessages: () => false }, (text, answer) => notices.push([text, answer]));
+  bridge.call('ask_pi', { request: `${VOICE_REQUEST}check the repo`, when: 'now' });
+  bridge.agentStart();
+  assert.equal(bridge.voiceRun, true);
+  bridge.messageEnd({ role: 'assistant', content: [{ type: 'text', text: 'All good.' }] });
+  bridge.settled(false, 'answer-1');
+  assert.equal(notices.at(-1)[1], 'answer-1');
+  assert.equal(bridge.voiceRun, false);
+  bridge.call('ask_pi', { request: `${VOICE_REQUEST}again`, when: 'now' });
+  bridge.settled(true, 'answer-2');
+  assert.equal(notices.at(-1)[1], undefined, 'a stopped run reads out no answer');
+});
+
+test('Pi\'s result reaches the voice without URLs, and IDs count as the dense tokens they are', () => {
+  const answer = 'Storm Luise: [ka-news reports disruptions](https://news.google.com/rss/articles/CBMi0gFBVV95cUx0OcDNFaE9jTF9HTWxNZnRyWEp0ZnZFT?oc=5); see https://ka-news.de/x and <https://bnn.de/y>.';
+  assert.equal(forSpeech(answer), 'Storm Luise: ka-news reports disruptions; see (link) and (link).');
+  const id = 'CBMi0gFBVV95cUx0OcDNFaE9jTF9HTWxNZnRyWEp0ZnZFTEhfNHFmZVN0TGdRdXpLeEFVTnJmNFdnOTB1Uk9ONkJVTzRHV0VGWXVOeldfZTVPTmZjbzFWZGhPYTE0dlB'.repeat(20);
+  assert.ok(clipTokens(id, 400).length < 1000, 'base64 is clipped long before 1,600 characters');
+  assert.equal(clipTokens('plain words stay cheap', 400), 'plain words stay cheap');
+});
+
+test('a read-out reaches its placeholder through the talk session hooks', () => {
+  const source = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
+  assert.match(source, /live: \(role, text, answer\) => chat\.live\(role, text, answer\)/);
+  assert.match(source, /transcript: \(role, text, interrupted, answer\) => chat\.settle\(role, text, interrupted, answer\)/);
 });

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- The `captions` setting, `PI_VOICE_CAPTIONS`, and `/talk captions` are removed: what is said now plays in the chat itself.
+
+### Spoken turns in the chat
+
+- **Spoken turns are part of the chat and of Pi's conversation.** What you and the voice say plays in the chat as it is said, flipping in like a split-flap board, and settles in place when the turn is over. They look like the rest of the conversation: your words like a typed message, the voice's like Pi's replies. Kept turns join Pi's conversation as context (Pi's model now sees them; they are never requests), and redraw when you resume. The separate spoken-history entries and the live line above the bar are gone; sessions saved by 0.3.0 show their spoken entries in the same style.
+- **The read-out is the answer.** When Pi finishes a voice request, the voice's read-out takes the place of Pi's written answer in the chat, playing in as it is said. Pi's written answer sits above it, collapsed like a thinking block; a click on *Written answer* (or <kbd>Ctrl</kbd>+<kbd>O</kbd>) opens it. Answers with code blocks, lists, tables, or headings, or longer than a few sentences, stay as Pi's text, and Pi's text shows until the read-out starts, or if it never does. Pi's conversation keeps Pi's own answer.
+- Pi's result reaches the voice without URLs (links are read as their text), so an answer full of links no longer exceeds GPT-Live's 500-token limit for updates.
+- Voice requests are leaner: they carry only what Pi's conversation lacks (what was said while Pi worked), not the whole conversation since the last request.
+- The voice reading out Pi's result stays hidden even when it pauses mid-way, and a reply that pauses settles once, whole, instead of in fragments that could land above your next request.
+
 ## 0.3.0 (2026-10-24)
 
 ### Spoken history

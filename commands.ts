@@ -15,7 +15,6 @@ export const TALK_COMMANDS: readonly Spec[] = [
   { name: "stop", usage: "stop", description: "End the voice connection; a running Pi task keeps going" },
   { name: "mute", usage: "mute [on|off]", description: "Stop or resume the microphone (no argument toggles)", values: ["on", "off"] },
   { name: "unmute", usage: "unmute", description: "Resume the microphone" },
-  { name: "captions", usage: "captions [on|off]", description: "Show what the voice says under the bar (no argument toggles)", values: ["on", "off"] },
   { name: "check", usage: "check", description: "Setup status, settings, and shortcuts; no network or microphone" },
   { name: "devices", usage: "devices", description: "The macOS input and output in use" },
   { name: "tone", usage: "tone [20-20000]", description: "Play a test tone (440 Hz by default)", values: ["220", "440", "1000"] },
@@ -26,7 +25,7 @@ export const TALK_COMMANDS: readonly Spec[] = [
 
 export type TalkCommand =
   | { name: "toggle" | "start" | "stop" | "unmute" | "check" | "devices" | "help" }
-  | { name: "mute" | "captions"; value?: boolean }
+  | { name: "mute"; value?: boolean }
   | { name: "tone"; hz: number }
   | { name: "mic-test"; seconds: number }
   | { name: "preview"; state: PreviewState }
@@ -58,7 +57,7 @@ export function parseTalk(args: string): TalkCommand {
   if (rest.length > 1 || (rest.length && !spec.values)) return { name: "error", message: usage(spec) };
   const [arg] = rest;
   switch (spec.name) {
-    case "mute": case "captions":
+    case "mute":
       if (arg !== undefined && arg !== "on" && arg !== "off") return { name: "error", message: usage(spec) };
       return { name: spec.name, value: arg === undefined ? undefined : arg === "on" };
     case "tone": {

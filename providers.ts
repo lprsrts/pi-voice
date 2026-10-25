@@ -20,8 +20,10 @@ export type VoiceHooks = {
   briefing?: () => string;
   /** Someone is talking (user speech or audible playback): resets the auto-pause timer. */
   activity?: () => void;
-  /** A finished turn for the spoken history; a reply the user cut off holds only what was heard. */
-  transcript?: (role: "user" | "voice", text: string, interrupted: boolean) => void;
+  /** What is being said right now, for the chat; `answer` when it reads out a result into its placeholder. */
+  live?: (role: "user" | "voice", text: string, answer?: string) => void;
+  /** A turn is over: what to keep of it ("" when nothing is); a reply the user cut off holds only what was heard. */
+  transcript?: (role: "user" | "voice", text: string, interrupted: boolean, answer?: string) => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -30,7 +32,7 @@ type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => 
 export type VoiceSession = {
   start(getKey: (signal: AbortSignal) => Promise<string> | string): Promise<void>;
   /** A Pi update to say aloud at the next quiet moment. */
-  notify(text: string): void;
+  notify(text: string, answer?: string): void;
   /** Silent context, e.g. Pi's progress. */
   context?(text: string): void;
   mute(value: boolean): void;

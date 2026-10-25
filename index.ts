@@ -1,28 +1,20 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { mixColors, Text, visibleWidth, type KeyId } from "@earendil-works/pi-tui";
+import { mixColors, type KeyId } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
-import { SPOKEN_ENTRY, spokenPart, VOICE_PROMPT, VOICE_REQUEST, type SpokenEntry } from "./pi-bridge.ts";
+import { SPOKEN_ENTRY, SPOKEN_READOUT, SPOKEN_TURN, spokenPart, VOICE_PROMPT, VOICE_REQUEST, type SpokenEntry, type SpokenReadout, type SpokenTurn } from "./pi-bridge.ts";
+import { answerBlocks, speakable, SpokenChat, spokenLines } from "./chat.ts";
 import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
 import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
 import { PROVIDER } from "./providers.ts";
-import { dominantFrequency, FlapBoard, formatCaption, type CaptionLine } from "./protocol.ts";
+import { dominantFrequency } from "./protocol.ts";
 import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, type ShortcutAction, type TalkCommand } from "./commands.ts";
 
 const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
-// The caption keeps the last phrase on screen this long after the agent stops talking.
-const CAPTION_HOLD_MS = 2500;
-const PREVIEW_CAPTIONS: CaptionLine[] = [
-  { phrase: "Twenty-two pass,", spoken: 0, continues: false, open: true },
-  { phrase: "none fail.", spoken: 0, continues: true, open: false },
-  { phrase: "Pi is still on the migration;", spoken: 0, continues: false, open: true },
-  { phrase: "two files to go.", spoken: 0, continues: true, open: false },
-];
-const PREVIEW_HEARD: CaptionLine = { phrase: "what's left on the migration", spoken: 28, continues: false, open: true, role: "user" };
 type State = (typeof states)[number];
 
 // Listening and speaking draw the same Gaussian beam as thinking. Loudness sets
@@ -66,12 +58,6 @@ function modelName(ctx: ExtensionContext): string {
   return model ? `${model.provider ? `${model.provider}/` : ""}${model.id ?? model.name ?? "model"}` : "no model selected";
 }
 
-/** The live line, left-aligned with the chat's text like a transcript; a phrase wider than the bar shows the word chunk being spoken. */
-function transcriptLine(caption: CaptionLine | undefined, width: number, paint: (text: string) => string): string {
-  const line = caption && width >= 5 ? formatCaption(caption, width - 1, visibleWidth) : "";
-  return ` ${paint(line)}`;
-}
-
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
 export default function voicePreview(pi: ExtensionAPI) {
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -82,12 +68,8 @@ export default function voicePreview(pi: ExtensionAPI) {
   let liveState: State = "idle";
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
-  let caption: CaptionLine | undefined, captionAt = 0;
   // Settings come from Pi's settings.json ("pi-voice"), overridable by env (settings.ts).
   useSettings(() => pi.getSettings());
-  // Caption row under the bar: the "captions" setting, unless /talk captions changed it this session.
-  let captionsChoice: boolean | undefined;
-  const captionsOn = () => captionsChoice ?? currentSettings().values.captions;
   let muted = false;
   let talking = false;   // between /talk start and /talk stop: Pi is told its answers are spoken
   let consented = false; // the consent prompt is shown once per Pi session
@@ -111,10 +93,8 @@ export default function voicePreview(pi: ExtensionAPI) {
       const started = Date.now();
       ctx.ui.setWidget("voice-preview", (tui, theme) => {
         let lastFrame = Date.now();
-        let lastSpoke = 0;
         let weights = states.map(state => state === "idle" ? 1 : 0);
         const input = newBeam(200), output = newBeam(200);
-        const board = new FlapBoard();
         timer = setInterval(() => tui.requestRender(), 33);
         timer.unref();
         return {
@@ -183,21 +163,9 @@ export default function voicePreview(pi: ExtensionAPI) {
               }
               previousY = y;
             }
-            // Foreground only: no background fill or textual state labels. Above the
-            // bar, the live line: what the user is saying or the voice's current phrase,
-            // left-aligned like a transcript, flipping in like a split-flap board; the row
-            // stays to avoid layout jumps.
-            const bar = dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
-            if (state === "speaking") lastSpoke = now;
-            const line = choice === "live"
-              ? (now - Math.max(captionAt, lastSpoke) < CAPTION_HOLD_MS ? caption : undefined)
-              : weights[3] > 0.5 ? PREVIEW_CAPTIONS[Math.floor(seconds / 1.6) % PREVIEW_CAPTIONS.length]
-              : weights[1] > 0.5 ? PREVIEW_HEARD : undefined;
-            if (!captionsOn()) return bar;
-            const fg = line?.role === "user"
-              ? { flip: theme.colors.dim, glow: theme.colors.accent, still: theme.colors.text }
-              : { flip: theme.colors.dim, glow: theme.colors.success, still: theme.colors.muted };
-            return [transcriptLine(line, columns, text => board.tiles(text, now).map(tile => theme.style(tile.text, { fg: fg[tile.state] })).join("")), ...bar];
+            // Foreground only: no background fill or textual state labels. What is
+            // said plays in the chat itself (chat.ts); this redraw keeps it moving.
+            return dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
           },
           dispose() {
             if (timer) clearInterval(timer);
@@ -222,7 +190,6 @@ export default function voicePreview(pi: ExtensionAPI) {
       `settings ("${SETTINGS_KEY}" in Pi's settings.json; env variables override):`,
       show("autoPause", values.autoPause ? `${values.autoPause} s of silence while I work` : "never"),
       show("idlePause", values.idlePause ? `${values.idlePause} s of silence when nothing runs` : "never"),
-      show("captions", `${values.captions ? "on" : "off"}${captionsChoice !== undefined ? ` (now ${captionsChoice ? "on" : "off"} via /talk captions)` : ""}`),
       show("echoCancellation", values.echoCancellation ? "on" : "off (headphones only)"),
       ...invalid.map(entry => `  ignored invalid value: ${entry}`),
     ];
@@ -238,7 +205,7 @@ export default function voicePreview(pi: ExtensionAPI) {
     if (!talk?.connected && !talking) { ctx.ui.notify("Voice is not running.", "info"); return; }
     // Pi keeps working; a result that arrives before the next /talk start is said then.
     talk?.close(); talking = false;
-    inputSamples = []; outputSamples = []; caption = undefined;
+    inputSamples = []; outputSamples = [];
     stop(); refreshStatus();
     ctx.ui.notify(ctx.isIdle() ? "Voice stopped." : "Voice stopped. I keep working; /talk start to hear the result.", "info");
   }
@@ -342,10 +309,6 @@ export default function voicePreview(pi: ExtensionAPI) {
         ctx.ui.notify(muted ? "Microphone muted." : "Microphone on.", "info");
         return;
       }
-      case "captions":
-        captionsChoice = command.value ?? !captionsOn();
-        ctx.ui.notify(`Captions ${captionsOn() ? "on" : "off"} for this session (the "captions" setting sets the default).`, "info");
-        return;
       case "check": return check(ctx);
       case "devices": return devices(ctx);
       case "tone": return tone(ctx, command.hz);
@@ -357,21 +320,37 @@ export default function voicePreview(pi: ExtensionAPI) {
     }
   }
 
-  // The spoken history: what was said aloud stays in the chat (and the session file)
-  // without reaching Pi's model, which gets each request as its own message.
+  // What is said aloud plays in the chat as it is said and settles into the
+  // conversation (chat.ts): your words and the voice's replies, while Pi is idle.
+  const chat = new SpokenChat({
+    // A turn can settle as the session shuts down; a closed session just drops it.
+    append: turn => { try { pi.appendEntry<SpokenTurn>(SPOKEN_TURN, turn); } catch {} },
+    send: message => { try { pi.sendMessage(message, { triggerTurn: false }); } catch {} },
+    save: readout => { try { pi.appendEntry<SpokenReadout>(SPOKEN_READOUT, readout); } catch {} },
+    speaking: () => !!talk?.connected,
+  });
+  pi.registerEntryRenderer<SpokenTurn>(SPOKEN_TURN, (entry, options, theme) => chat.component(entry.data?.id, theme, options.expanded));
+  pi.on("session_start", (_event, ctx) => { chat.load(ctx.sessionManager.getEntries()); });
+
+  // Spoken turns as 0.3.0 saved them (shown, never sent to the model).
   pi.registerEntryRenderer<SpokenEntry>(SPOKEN_ENTRY, (entry, _options, theme) => {
     const spoken = entry.data;
     if (!spoken?.text) return undefined;
-    if (spoken.role === "user") {
-      return new Text(`${theme.fg("accent", "›")} ${theme.fg("userMessageText", spoken.text)}`, 1, 1, text => theme.bg("userMessageBg", text));
-    }
-    return new Text(`${theme.fg("success", "•")} ${theme.italic(theme.fg("muted", spoken.text))}${spoken.interrupted ? theme.fg("dim", " (interrupted)") : ""}`, 1, 0);
+    const text = spoken.text;
+    return { invalidate() {}, render: (width: number) => spokenLines(text, spoken.role === "user", width, theme) };
   });
 
   // A spoken request Pi received shows as what was said; Pi's model still gets the
-  // transcript framing and the conversation it refers to (shown as spoken entries).
-  pi.registerMarkdownTransformer((markdown, context) =>
-    context.messageType === "user" && markdown.startsWith(VOICE_REQUEST) ? `› ${spokenPart(markdown).trim()}` : markdown);
+  // transcript framing. Pi's answer to it is read out, and the read-out stands in
+  // for it (chat.ts): its text is hidden, and so is a voice run's text while it
+  // streams (an answer that turns out to stay shows when it is finished).
+  pi.registerMarkdownTransformer((markdown, context) => {
+    if (context.messageType === "user" && markdown.startsWith(VOICE_REQUEST)) return spokenPart(markdown).trim();
+    if (context.messageType === "assistant" && (chat.hidden(markdown) || (context.isStreaming && talk?.bridge.voiceRun))) return "";
+    return markdown;
+  });
+  // The voice run's answer waiting for its read-out: Pi's last message so far, if speakable.
+  let answerBlocksPending: string[] | undefined;
 
   pi.registerCommand("talk", {
     description: "Realtime voice for Pi: no argument starts or stops it; /talk help lists the rest",
@@ -405,7 +384,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       branch: () => ctx.sessionManager.getBranch(),
       cwd: () => ctx.sessionManager.getCwd(),
       createVoice: hooks => {
-        muted = false; liveState = "thinking"; inputSamples = []; outputSamples = []; caption = undefined;
+        muted = false; liveState = "thinking"; inputSamples = []; outputSamples = [];
         show(ctx, "live");
         return PROVIDER.create(hooks, callbacks => new AudioPipes({
           ...callbacks,
@@ -422,8 +401,8 @@ export default function voicePreview(pi: ExtensionAPI) {
           else { outputSamples = samples; outputTime = Date.now(); }
         },
         // A voice-side clear never wipes the words the user is saying.
-        caption: line => { if (!line.phrase && caption?.role === "user") return; caption = line; captionAt = Date.now(); },
-        transcript: (role, text, interrupted) => pi.appendEntry<SpokenEntry>(SPOKEN_ENTRY, interrupted ? { role, text, interrupted } : { role, text }),
+        live: (role, text, answer) => chat.live(role, text, answer),
+        transcript: (role, text, interrupted, answer) => chat.settle(role, text, interrupted, answer),
       },
       pauseAfter: () => pauseAfterFromSettings(),
       changed: refreshStatus,
@@ -437,9 +416,25 @@ export default function voicePreview(pi: ExtensionAPI) {
   });
   pi.on("agent_start", () => { talk?.bridge.agentStart(); });
   pi.on("tool_execution_start", event => { talk?.bridge.toolStart(event.toolName, event.args); });
-  pi.on("message_end", event => { talk?.bridge.messageEnd(event.message); });
+  pi.on("message_end", event => {
+    talk?.bridge.messageEnd(event.message);
+    // Extensions hear this before Pi draws the finished message: hide a voice
+    // run's speakable answer now. A later message means it was not the last one:
+    // it keeps a placeholder that shows its text.
+    if (event.message.role !== "assistant" || !talk?.bridge.voiceRun) return;
+    if (answerBlocksPending) chat.answer(answerBlocksPending, false);
+    const blocks = answerBlocks(event.message);
+    answerBlocksPending = blocks && speakable(blocks.join("\n\n")) ? blocks : undefined;
+    if (answerBlocksPending) chat.hide(answerBlocksPending);
+  });
   pi.on("ui_prompt_start", event => { talk?.bridge.promptStart(event.title); });
   pi.on("ui_prompt_end", () => { talk?.bridge.promptEnd(); });
-  pi.on("agent_settled", event => { talk?.bridge.settled(event.aborted); });
+  pi.on("agent_settled", event => {
+    const blocks = answerBlocksPending;
+    answerBlocksPending = undefined;
+    // The answer's place in the chat, where its read-out plays (or Pi's text shows, if aborted).
+    const answer = blocks ? chat.answer(blocks, !event.aborted) : undefined;
+    talk?.bridge.settled(event.aborted, event.aborted ? undefined : answer);
+  });
   pi.on("session_shutdown", () => { talk?.end(); talk = undefined; talking = false; consented = false; stop(); statusOwner?.ui.setStatus("pi-voice", undefined); statusOwner = undefined; });
 }

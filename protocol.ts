@@ -111,9 +111,14 @@ export class Captions {
   private spoken = 0; // high-water mark of spoken characters in the current turn
   private charsPerMs = 1 / 70; // speaking-rate prior (~14 chars/s), calibrated from closed spans
   private readonly onLine: (line: CaptionLine) => void;
+  private readonly onSpoken?: (said: string) => void;
+  private said = "";
 
-  /** onLine gets the current phrase (empty to clear) and how much of it has been spoken. */
-  constructor(onLine: (line: CaptionLine) => void) { this.onLine = onLine; }
+  /**
+   * onLine gets the current phrase (empty to clear) and how much of it has been
+   * spoken; onSpoken gets everything spoken so far in the current turn.
+   */
+  constructor(onLine: (line: CaptionLine) => void, onSpoken?: (said: string) => void) { this.onLine = onLine; this.onSpoken = onSpoken; }
 
   /** Transcript text; GPT-Live fragments carry their range on the session clock. */
   text(delta: string, from?: number, to?: number) {
@@ -241,6 +246,8 @@ export class Captions {
     const line = phraseAt(text, this.spoken);
     const key = JSON.stringify(line);
     if (key !== this.shown) { this.shown = key; this.onLine(line); }
+    const said = text.slice(0, this.spoken);
+    if (said !== this.said) { this.said = said; this.onSpoken?.(said); }
   }
 }
 
@@ -248,8 +255,7 @@ export class Captions {
 const PHRASE = /[^,;:.!?…—–]*(?:[,;:.!?…]+["”’)]*|\s[—–])(?=\s|$)\s*|[^,;:.!?…—–]+$|[^\s]+\s*/g;
 
 /** A caption phrase: `continues` an unfinished sentence, and/or leaves it `open` for more. */
-/** A caption phrase; `role` is "user" for the user's own words as they are recognized (default: the voice). */
-export type CaptionLine = { phrase: string; spoken: number; continues: boolean; open: boolean; role?: "user" | "voice" };
+export type CaptionLine = { phrase: string; spoken: number; continues: boolean; open: boolean };
 
 const SENTENCE_END = /[.!?…]+["”’)]*$/;
 
@@ -356,6 +362,25 @@ export class FlapBoard {
   }
 }
 
+/** Word-wrapped lines of `text` as [start, end) offsets, each at most `width` wide (a longer word is split). */
+export function wrapWords(text: string, width: number): [number, number][] {
+  const lines: [number, number][] = [];
+  const max = Math.max(1, width);
+  let start = 0;
+  while (start < text.length) {
+    while (text[start] === " ") start++;
+    if (start >= text.length) break;
+    let end = Math.min(text.length, start + max);
+    if (end < text.length) {
+      const space = text.lastIndexOf(" ", end);
+      if (space > start) end = space;
+    }
+    lines.push([start, end]);
+    start = end;
+  }
+  return lines;
+}
+
 /**
  * Cuts text to at most `max` tokens by a deliberately pessimistic estimate, at a
  * piece boundary, marking the cut with "…". Code, paths, numbers, and non-Latin
@@ -366,7 +391,9 @@ export function clipTokens(text: string, max: number): string {
   let tokens = 0, end = 0;
   for (const piece of text.matchAll(/[A-Za-z]+|\s+|[\s\S]/g)) {
     const value = piece[0];
-    const cost = /^[A-Za-z]/.test(value) ? Math.ceil(value.length / 4) : /^\s+$/.test(value) ? (value.includes("\n") ? 1 : 0) : 1;
+    // Words run about four letters a token; IDs and base64 (case mixed mid-run) about two.
+    const letters = /[a-z][A-Z]/.test(value) ? 2 : 4;
+    const cost = /^[A-Za-z]/.test(value) ? Math.ceil(value.length / letters) : /^\s+$/.test(value) ? (value.includes("\n") ? 1 : 0) : 1;
     if (tokens + cost > max - 1) return `${text.slice(0, end).trimEnd()} …`; // one token left for the ellipsis
     tokens += cost;
     end = piece.index! + value.length;
