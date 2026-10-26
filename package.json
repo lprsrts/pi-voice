@@ -44,7 +44,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/lprsrts/pi-voice/main/assets/cover.png"
+    "image": "https://pi-voice.lprsrts.com/assets/hero.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

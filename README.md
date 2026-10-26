@@ -1,6 +1,6 @@
 # pi-voice
 
-![pi-voice: the voice bar listening, thinking, and speaking](https://raw.githubusercontent.com/lprsrts/pi-voice/main/assets/cover.png)
+![pi-voice: the voice bar in Pi, in a terminal window](https://pi-voice.lprsrts.com/assets/hero.png)
 
 **Talk to your coding agent.** Full-duplex voice for [Pi](https://pi.dev) on macOS. OpenAI GPT-Live is the voice; your Pi session is its backend. Say what you want and Pi does it with its own model, tools, and local environment, then the voice tells you the outcome.
 

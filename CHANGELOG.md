@@ -24,6 +24,10 @@
 - Voice requests are leaner: they carry only what Pi's conversation lacks (what was said while Pi worked), not the whole conversation since the last request.
 - The voice reading out Pi's result stays hidden even when it pauses mid-way, and a reply that pauses settles once, whole, instead of in fragments that could land above your next request.
 
+### Project
+
+- The README image and Pi's gallery image now load from the project page, [pi-voice.lprsrts.com](https://pi-voice.lprsrts.com), and the repo no longer carries image assets.
+
 ## 0.3.0 (2026-10-24)
 
 ### Spoken history
