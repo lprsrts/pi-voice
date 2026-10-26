@@ -6,7 +6,7 @@
 
 pi-voice lets you talk to [Pi](https://pi.dev), the terminal coding agent, out loud. You say what you want, Pi does the work in your terminal, and a voice tells you what happened. The goal is to use Pi without touching the keyboard. It runs on macOS. ([Why I built it.](https://pi-voice.lprsrts.com))
 
-The voice is OpenAI's GPT-Live, a realtime speech model. It listens while it talks, so you can cut in mid-sentence and it stops to hear you. When you ask for something that needs real work, GPT-Live passes what you said to your Pi session as an ordinary message. Pi handles it with the model you picked (`/model`), its tools and its permission prompts, the same as if you had typed it, and the request shows up in the session. When Pi is done, the voice reads you the result.
+The voice is OpenAI's GPT-Live, a realtime speech model. It listens while it talks, so you can cut in mid-sentence and it stops to hear you. When you ask for something that needs real work, GPT-Live passes what you said to your Pi session as an ordinary message. Pi handles it with the model you picked (`/model`), its tools and whatever extensions you run, the same as if you had typed it, and the request shows up in the session. When Pi is done, the voice reads you the result.
 
 While Pi works you can keep talking: add to the request, or say "stop" to cancel it. If you stop voice in the middle of a task, `/talk start` picks the session up where it is, and a result that came in while voice was off gets read out then.
 
@@ -107,7 +107,7 @@ Set `OPENAI_API_KEY`, or store the key in your login keychain as `openai-api-key
 security add-generic-password -U -s "openai-api-key" -a "$USER" -l "OpenAI API key" -w "$(pbpaste)" && pbcopy </dev/null
 ```
 
-Keys are read only when a session starts and are never logged. Audio and transcripts are not stored.
+Keys are read only when a session starts and are never logged. While voice is on, your microphone audio goes to OpenAI's GPT-Live. pi-voice never saves audio. What you and the voice say is kept in the Pi session, like typed messages, so it comes back when you resume; pi-voice writes nothing else.
 
 ## Settings
 
@@ -153,6 +153,7 @@ The defaults are in [`providers/openai-live/`](providers/openai-live).
 
 ```sh
 git clone https://github.com/lprsrts/pi-voice && cd pi-voice
+npm install   # Pi's packages (peer dependencies), needed by the tests
 npm test
 pi -e .   # run Pi with your checkout (pi remove the npm package first)
 node scripts/live/run.mjs all --quiet   # live scenarios: real GPT-Live and Pi (costs a little; see scripts/live)

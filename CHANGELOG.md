@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The voice's default instructions no longer mention Basic Memory notes, a tool from the author's own setup.
+- The README says plainly what is kept: audio goes to GPT-Live and is never saved, and spoken turns are saved in the Pi session like typed messages. It no longer claims Pi has permission prompts.
+- Development setup runs `npm install` before `npm test`, so the tests find Pi's packages in a fresh clone.
+
 ## 0.4.0 (2026-10-26)
 
 ### Breaking changes

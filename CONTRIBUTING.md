@@ -6,6 +6,7 @@ Bug reports, provider additions, and fixes are welcome.
 
 ```sh
 git clone https://github.com/lprsrts/pi-voice && cd pi-voice
+npm install              # Pi's packages (peer dependencies), needed by the tests
 npm test                 # offline: fake sockets, a fake Pi, a stand-in audio helper
 pi remove npm:@lprsrts/pi-voice   # if installed, so /talk is not registered twice
 pi -e .                  # run Pi with your checkout
