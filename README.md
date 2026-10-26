@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@lprsrts/pi-voice)](https://www.npmjs.com/package/@lprsrts/pi-voice) ![platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey?logo=apple)
 
-![pi-voice: the voice bar in Pi, in a terminal window](https://pi-voice.lprsrts.com/assets/hero.png)
+![pi-voice's voice bar above Pi's input, drawn by its own code (not a screenshot)](https://pi-voice.lprsrts.com/assets/hero.png)
 
 pi-voice lets you talk to [Pi](https://pi.dev), the terminal coding agent, out loud. You say what you want, Pi does the work in your terminal, and a voice tells you what happened. The goal is to use Pi without touching the keyboard. It runs on macOS. ([Why I built it.](https://pi-voice.lprsrts.com))
 
