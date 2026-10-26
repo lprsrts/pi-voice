@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 (2026-10-26)
+
 ### Breaking changes
 
 - The `captions` setting, `PI_VOICE_CAPTIONS`, and `/talk captions` are removed: what is said now plays in the chat itself.
