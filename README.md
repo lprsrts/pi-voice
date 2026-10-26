@@ -1,15 +1,18 @@
 # pi-voice
 
+[![npm](https://img.shields.io/npm/v/@lprsrts/pi-voice)](https://www.npmjs.com/package/@lprsrts/pi-voice) ![platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey?logo=apple)
+
 ![pi-voice: the voice bar in Pi, in a terminal window](https://pi-voice.lprsrts.com/assets/hero.png)
 
-**Talk to your coding agent.** Full-duplex voice for [Pi](https://pi.dev) on macOS. OpenAI GPT-Live is the voice; your Pi session is its backend. Say what you want and Pi does it with its own model, tools, and local environment, then the voice tells you the outcome.
+pi-voice lets you talk to [Pi](https://pi.dev), the terminal coding agent, out loud. You say what you want, Pi does the work in your terminal, and a voice tells you what happened. The goal is to use Pi without touching the keyboard. It runs on macOS. ([Why I built it.](https://pi-voice.lprsrts.com))
 
-- **Pi is the brain:** your words go straight to the Pi session in your terminal. It works with whatever model you picked (`/model`), all its tools, and its permission prompts, and every request shows up in the session.
-- **GPT-Live is the voice:** realtime, full-duplex speech. Ask what Pi is doing, add to the task, or say "stop" while it works.
-- **Use your speakers:** echo cancellation keeps the agent from hearing itself. Headphones are optional.
-- **Interrupt any time:** talk over the agent and it stops. Switching audio devices (e.g. AirPods connecting) mid-session just works.
+The voice is OpenAI's GPT-Live, a realtime speech model. It listens while it talks, so you can cut in mid-sentence and it stops to hear you. When you ask for something that needs real work, GPT-Live passes what you said to your Pi session as an ordinary message. Pi handles it with the model you picked (`/model`), its tools and its permission prompts, the same as if you had typed it, and the request shows up in the session. When Pi is done, the voice reads you the result.
 
-For local speech-to-text into the editor, use the official `@earendil-works/pi-voice` instead. The two install side by side; this package's command is `/talk`.
+While Pi works you can keep talking: add to the request, or say "stop" to cancel it. If you stop voice in the middle of a task, `/talk start` picks the session up where it is, and a result that came in while voice was off gets read out then.
+
+You can use your Mac's speakers. Echo cancellation keeps the voice from hearing itself, so headphones are optional, and switching audio devices mid-session (AirPods connecting, say) doesn't interrupt anything.
+
+If you only want local speech-to-text into Pi's editor, use the official `@earendil-works/pi-voice` instead. The two can be installed side by side; this package's command is `/talk`.
 
 ## Quick start
 
@@ -30,16 +33,13 @@ The first start takes a little longer (up to ~40 s) while the audio helper is bu
 
 ## Cost
 
-The package is free (MIT). Two things cost money:
-
-- **The voice:** GPT-Live, $0.05 per minute, billed to your OpenAI API key. A ChatGPT plan does not cover it (OpenAI rejects plan sign-ins for GPT-Live).
-- **The work:** whatever your Pi model costs, exactly as when you type. Pi uses your configured provider; no extra model runs in between.
+The package is free (MIT). Two things cost money. The voice is GPT-Live at $0.05 a minute, billed to your OpenAI API key. A ChatGPT plan doesn't cover it, because OpenAI rejects plan sign-ins for GPT-Live. The work costs whatever your Pi model costs, exactly as when you type: Pi uses your configured provider, and no extra model runs in between.
 
 GPT-Live bills per second while a voice connection is open, whether anyone speaks or not. To avoid paying for silence, voice **pauses by itself**: after 15 s of silence while Pi works (it comes back to say the result), or 60 s of silence when nothing is running (`/talk start` resumes); both are [settings](#settings). `/talk mute` keeps the connection open (and billable); `/talk stop` ends it. A result that arrives while voice is off is said at the next `/talk start`.
 
 ## How it works
 
-When GPT-Live decides your request needs real work, it hands it off, and pi-voice sends what you said to Pi as a message. While Pi works, its progress reaches the voice silently, so "what's Pi doing?" gets an answer without interrupting it. Saying something else adds to the running task, and "stop" or "cancel" stops it. When Pi finishes, the voice says the result. The voice and Pi are one agent: it talks about the work as its own ("I'm running the tests"), and each `/talk start` picks up where the session is (recent requests and answers, and any task still running, whose result it will announce), so you can stop and restart voice mid-task. While a voice session runs, Pi is told that its answers are spoken, so it ends with a short, speakable summary.
+When GPT-Live decides your request needs real work, it hands it off, and pi-voice sends what you said to Pi as a message. While Pi works, its progress reaches the voice silently, so the voice knows where the work stands without interrupting Pi. Saying something else adds to the running task, and "stop" or "cancel" stops it. When Pi finishes, the voice says the result. The voice and Pi are one agent: it talks about the work as its own ("I'm running the tests"), and each `/talk start` picks up where the session is (recent requests and answers, and any task still running, whose result it will announce), so you can stop and restart voice mid-task. While a voice session runs, Pi is told that its answers are spoken, so it ends with a short, speakable summary.
 
 While voice runs, a bar sits above the input; you can keep typing. What you say to the voice and what it says back play in the chat as they are said, flipping in like a split-flap board, and look like the rest of the conversation: your words like a typed message, as they are recognized, and its replies like Pi's, in step with the audio.
 
