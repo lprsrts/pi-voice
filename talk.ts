@@ -28,6 +28,8 @@ export type TalkHost = {
     live?(role: "user" | "voice", text: string, answer?: string): void;
     /** A spoken turn is over: what to keep of it ("" when nothing is). */
     transcript?(role: "user" | "voice", text: string, interrupted: boolean, answer?: string): void;
+    /** Moments the voice bar marks: a request handed to Pi, or the user talking over the voice. */
+    event?(event: "handoff" | "interrupt"): void;
   };
   /** The connection, pause, or results-to-say changed (for a status indicator). */
   changed?(): void;
@@ -69,6 +71,8 @@ export class TalkSession {
   private now() { return (this.host.now ?? Date.now)(); }
 
   get connected() { return !!this.voice; }
+  /** The open connection's session has started (else it is still connecting). */
+  get isReady() { return this.ready; }
   get isPaused() { return this.paused; }
   get waiting() { return this.pending.length; }
 
@@ -103,6 +107,7 @@ export class TalkSession {
       caption: line => view.caption?.(line),
       live: (role, text, answer) => view.live?.(role, text, answer),
       transcript: (role, text, interrupted, answer) => view.transcript?.(role, text, interrupted, answer),
+      event: event => view.event?.(event),
       closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
       tool: (name, args) => bridge.call(name, args),
       busy: () => !this.host.control.isIdle(),
@@ -120,8 +125,10 @@ export class TalkSession {
       for (const { text, answer } of said) voice.notify(text, answer);
       if (said.length) this.host.changed?.();
     }).catch(error => {
+      // Whether this voice is still the current one, before stop() fires closed() and clears it.
+      const current = this.voice === voice;
       voice.stop();
-      if (this.voice !== voice) return; // closed meanwhile; no error banner
+      if (!current) return; // closed meanwhile (by the user or a newer voice); no error banner
       this.voice = undefined;
       view.state?.("error");
       this.host.changed?.();

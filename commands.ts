@@ -5,7 +5,7 @@ import { agentDir } from "./config.ts";
 // The /talk command surface: parsing, argument completion, help, and the
 // keyboard shortcuts read from Pi's keybindings.json. index.ts runs the commands.
 
-export const PREVIEW_STATES = ["cycle", "idle", "listening", "thinking", "speaking", "error", "off"] as const;
+export const PREVIEW_STATES = ["story", "cycle", "connecting", "listening", "hearing", "working", "speaking", "muted", "error", "paused", "off"] as const;
 export type PreviewState = (typeof PREVIEW_STATES)[number];
 
 type Spec = { name: string; usage: string; description: string; values?: readonly string[] };
@@ -19,7 +19,7 @@ export const TALK_COMMANDS: readonly Spec[] = [
   { name: "devices", usage: "devices", description: "The macOS input and output in use" },
   { name: "tone", usage: "tone [20-20000]", description: "Play a test tone (440 Hz by default)", values: ["220", "440", "1000"] },
   { name: "mic-test", usage: "mic-test [1-10]", description: "Record a few seconds, report the level, play it back", values: ["3", "5", "10"] },
-  { name: "preview", usage: "preview [state|off]", description: "Preview the voice bar without a session", values: PREVIEW_STATES },
+  { name: "preview", usage: "preview [story|cycle|state|off]", description: "Preview the voice bar: the story of every state, a cycle, or one state", values: PREVIEW_STATES },
   { name: "help", usage: "help", description: "List the /talk commands and shortcuts" },
 ];
 
@@ -69,7 +69,7 @@ export function parseTalk(args: string): TalkCommand {
       return Number.isInteger(seconds) && seconds >= 1 && seconds <= 10 ? { name: "mic-test", seconds } : { name: "error", message: usage(spec) };
     }
     case "preview":
-      return (PREVIEW_STATES as readonly string[]).includes(arg ?? "cycle") ? { name: "preview", state: (arg ?? "cycle") as PreviewState } : { name: "error", message: usage(spec) };
+      return (PREVIEW_STATES as readonly string[]).includes(arg ?? "story") ? { name: "preview", state: (arg ?? "story") as PreviewState } : { name: "error", message: usage(spec) };
     default:
       return { name: spec.name } as TalkCommand;
   }

@@ -5,6 +5,16 @@
 ### Breaking changes
 
 - The `captions` setting, `PI_VOICE_CAPTIONS`, and `/talk captions` are removed: what is said now plays in the chat itself.
+- `/talk preview` states are now `story` (the default), `cycle`, `connecting`, `listening`, `hearing`, `working`, `speaking`, `muted`, `error`, `paused`, and `off` (`idle` and `thinking` are gone).
+
+### The voice bar's motion language
+
+- **Every property of the beam means one thing.** Colour is who owns the moment, height is energy, density is pitch, and drift (the carrier's phase velocity, in bar widths per second, so it reads the same at any pitch) is where things flow: leftward while you talk, rightward while the voice talks or Pi works.
+- **States that say what is happening:** connecting, listening (a breath that settles), hearing (you), working (Pi, with a beat per tool call), speaking (the voice), paused (flat, a slow pulse), and a short error flinch. Muting dashes the trace and freezes it, whatever the state. Connecting and Pi's work no longer look the same, and muted and paused no longer look like idle.
+- **Transitions with intent:** the voice yields to you in 80 ms, finishing a turn settles in 300 ms, a handoff sweeps toward the work, a turn landing in the chat ripples, and the result resolves from amber into the voice.
+- **Restraint:** the bar redraws only while something moves (it used to redraw 30 times a second always), and the `reducedMotion` setting (`PI_VOICE_REDUCED_MOTION`) keeps colours and shapes without motion, in the bar and in the chat.
+- `/talk preview story` plays every state and event with a line saying what it means.
+- A voice that cannot start (no API key, the audio helper failing to build) now says why instead of going quiet.
 
 ### Spoken turns in the chat
 

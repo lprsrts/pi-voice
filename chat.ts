@@ -38,6 +38,8 @@ export type ChatHost = {
   save(readout: SpokenReadout): void;
   /** Whether a voice connection is open to read a result out now. */
   speaking(): boolean;
+  /** Reduced motion: words appear without flipping in. */
+  still?(): boolean;
 };
 
 /** A short id for an answer's text block (the same text always gives the same id). */
@@ -111,6 +113,16 @@ export class SpokenChat {
         this.turns.set(turn.id, { id: turn.id, role: "voice", text: "", final: readout?.text, interrupted: readout?.interrupted, board: new FlapBoard(), answer: { text, spoken: false, at: 0 } });
       }
     }
+  }
+
+  /** Whether the chat is moving: words playing in, or an answer waiting to show Pi's text if no read-out comes. */
+  animating(now = this.now()): boolean {
+    if (this.open.user || this.open.voice) return true;
+    for (const turn of this.turns.values()) {
+      const a = turn.answer;
+      if (a?.spoken && !(turn.final ?? turn.text) && now - a.at < READOUT_WAIT_MS + 200) return true;
+    }
+    return false;
   }
 
   /** Whether Pi's answer text (one Markdown block) is hidden because its read-out stands in for it. */
@@ -217,7 +229,7 @@ export class SpokenChat {
     const user = turn.role === "user";
     // Each character as shown (flipping glyphs while live) and its state.
     const shown = [...text], state: FlapTile["state"][] = shown.map(() => "still");
-    if (turn.final === undefined) {
+    if (turn.final === undefined && !this.host.still?.()) {
       let i = 0;
       for (const tile of turn.board.tiles(text, this.now())) for (const char of tile.text) { shown[i] = char; state[i++] = tile.state; }
     }

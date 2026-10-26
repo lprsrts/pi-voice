@@ -47,6 +47,23 @@ When a turn is over, it settles in place and becomes part of Pi's conversation: 
 
 When Pi finishes a voice request, the voice reads the answer out, and the read-out takes the place of Pi's written answer in the chat, playing in as it is said. Pi's written answer sits above it, collapsed like a thinking block: click *Written answer* (or press <kbd>Ctrl</kbd>+<kbd>O</kbd>) to open it, and click again to close it. Answers that only work on screen (code blocks, lists, tables, headings, or more than a few sentences) stay as Pi's text. Until the read-out starts, or if it never does (voice stopped before the result was said), Pi's text shows in its place. Pi's model always keeps its own answer; the read-out is shown, not added to the conversation. Everything kept is saved in the Pi session, so it comes back when you resume.
 
+## The voice bar
+
+The bar above the input is one beam, and each of its properties means one thing: **colour** is who owns the moment (you, the voice, Pi), **height** is energy, **density** is pitch, and **drift** is where things are flowing: leftward while you talk (into the voice), rightward while the voice talks or Pi works (back to you). A sway is presence without flow; a frozen trace means nothing can go in.
+
+| State | When | Looks like |
+|---|---|---|
+| connecting | Opening a connection | The beam grows from flat and starts to move |
+| listening | Open and quiet | A faint breath that settles into stillness |
+| hearing | You are talking | Your voice drives it, drifting left |
+| working | Pi is working | Steady amber drift right, a beat for each tool call |
+| speaking | The voice is talking | Its audio drives it, drifting right |
+| muted | Microphone off | The trace breaks into dashes and holds still |
+| paused | Auto-paused (or idle) | Flat and dim, with a slow pulse |
+| error | Something failed | A short red flinch, then back to the state |
+
+Moments have their own motion: a request handed to Pi sweeps toward the work, a turn landing in the chat ripples at the centre, and when you talk over the voice it yields at once. The bar only redraws while something moves. `/talk preview story` plays it all; the `reducedMotion` setting keeps the colours and shapes but stops the motion.
+
 ## Commands
 
 | Command | What it does |
@@ -59,7 +76,7 @@ When Pi finishes a voice request, the voice reads the answer out, and the read-o
 | `/talk devices` | Show the input and output in use (the macOS defaults). |
 | `/talk tone [20-20000]` | Play a test tone (440 Hz by default). |
 | `/talk mic-test [1-10]` | Record a short clip (3 s by default), report its level, and play it back. Nothing leaves your Mac. |
-| `/talk preview [state\|off]` | Preview the voice bar without a session: `cycle` (default), `idle`, `listening`, `thinking`, `speaking`, `error`. |
+| `/talk preview [story\|cycle\|state\|off]` | Preview the voice bar without a session: `story` (default) plays every state and event with what it means; `cycle` steps through the states; or hold one: `connecting`, `listening`, `hearing`, `working`, `speaking`, `muted`, `error`, `paused`. |
 | `/talk help` | List the commands and shortcuts. |
 
 <kbd>Tab</kbd> completes subcommands and their values. While voice is in use, Pi's footer shows `voice on`, `voice muted`, or `voice paused`, and how many results are waiting to be said.
@@ -101,7 +118,8 @@ Put a `"pi-voice"` object in Pi's `settings.json` (`~/.pi/agent/settings.json`, 
   "pi-voice": {
     "autoPause": 15,
     "idlePause": 60,
-    "echoCancellation": true
+    "echoCancellation": true,
+    "reducedMotion": false
   }
 }
 ```
@@ -111,6 +129,7 @@ Put a `"pi-voice"` object in Pi's `settings.json` (`~/.pi/agent/settings.json`, 
 | `autoPause` | `PI_VOICE_AUTOPAUSE` | `15` | Seconds of silence while Pi works before voice pauses (it comes back with the result). `0` = never. |
 | `idlePause` | `PI_VOICE_IDLE_PAUSE` | `60` | Seconds of silence while nothing runs before voice pauses (`/talk start` resumes). `0` = never. |
 | `echoCancellation` | `PI_VOICE_AEC` | `true` | Apple's voice processing. Turn off only with headphones, or the agent hears itself. |
+| `reducedMotion` | `PI_VOICE_REDUCED_MOTION` | `false` | Still shapes and colours instead of motion: the bar does not drift or pulse, and words appear in the chat without flipping in. |
 
 `PI_VOICE_CONFIG_DIR` sets where your voice and persona overrides live (see below).
 

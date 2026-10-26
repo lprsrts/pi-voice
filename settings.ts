@@ -2,7 +2,7 @@
 // project's .pi/settings.json, which Pi merges over it), each overridable by an
 // environment variable, else the default.
 //
-//   "pi-voice": { "autoPause": 15, "idlePause": 60, "echoCancellation": true }
+//   "pi-voice": { "autoPause": 15, "idlePause": 60, "echoCancellation": true, "reducedMotion": false }
 
 export type VoiceSettings = {
   /** Seconds of silence while Pi works before the voice connection pauses (0 = never). */
@@ -11,9 +11,11 @@ export type VoiceSettings = {
   idlePause: number;
   /** Apple voice processing (echo cancellation); off only with headphones. */
   echoCancellation: boolean;
+  /** Still shapes and colours instead of motion: no drift, no impulses, no flipping text. */
+  reducedMotion: boolean;
 };
 
-export const DEFAULT_SETTINGS: VoiceSettings = { autoPause: 15, idlePause: 60, echoCancellation: true };
+export const DEFAULT_SETTINGS: VoiceSettings = { autoPause: 15, idlePause: 60, echoCancellation: true, reducedMotion: false };
 
 export const SETTINGS_KEY = "pi-voice";
 
@@ -21,6 +23,7 @@ const ENV: Record<keyof VoiceSettings, string> = {
   autoPause: "PI_VOICE_AUTOPAUSE",
   idlePause: "PI_VOICE_IDLE_PAUSE",
   echoCancellation: "PI_VOICE_AEC",
+  reducedMotion: "PI_VOICE_REDUCED_MOTION",
 };
 
 export type Source = "env" | "settings" | "default";

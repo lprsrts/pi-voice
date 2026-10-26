@@ -123,6 +123,8 @@ type Hooks = {
    * to Pi, or what was said while Pi works.
    */
   transcript?: (role: "user" | "voice", text: string, interrupted: boolean, answer?: string) => void;
+  /** Moments the voice bar marks: a request handed to Pi, or the user talking over the voice. */
+  event?: (event: "handoff" | "interrupt") => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
@@ -204,8 +206,10 @@ export class LiveVoice {
       key = String(await getKey(this.abort.signal));
       if (!key) throw new Error("No OpenAI API key available.");
     } catch (error) {
-      if (!this.stopped) this.stop();
-      throw error instanceof Error ? error : new Error("Voice failed to start.");
+      // Cancelled by stop(): quiet. Otherwise say why (no key, helper build failed), like any other startup failure.
+      if (this.stopped) return;
+      this.fail(error instanceof Error ? error.message : "Voice failed to start.");
+      return;
     }
     if (this.stopped) return;
     this.deadline = setTimeout(() => this.fail("Voice startup timed out."), 30000);
@@ -353,7 +357,7 @@ export class LiveVoice {
         }
         // GPT-Live decides when to yield; while the user talks over playback, drop the
         // locally queued audio so the model's own stop is not delayed by our buffer.
-        if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); }
+        if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); this.hooks.event?.("interrupt"); }
         if (!this.userTurn) {
           this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
           // A new user turn. What Pi's conversation lacks of the finished one and the
@@ -523,6 +527,7 @@ export class LiveVoice {
     if (result.error) { this.commentary(`I couldn't take that request: ${result.error}`, id); return; }
     for (const fragment of fresh) fragment.sent = true; // Pi's message shows these words; the spoken history skips them
     this.hooks.transcript?.("user", "", false); // Pi's own message takes over from the live line
+    this.hooks.event?.("handoff");
     this.working = true; // the acknowledgement that follows is about the work
     this.conversation = [];
     this.delegatedFrom = this.turnFrom;

@@ -24,6 +24,8 @@ export type VoiceHooks = {
   live?: (role: "user" | "voice", text: string, answer?: string) => void;
   /** A turn is over: what to keep of it ("" when nothing is); a reply the user cut off holds only what was heard. */
   transcript?: (role: "user" | "voice", text: string, interrupted: boolean, answer?: string) => void;
+  /** Moments the voice bar marks: a request handed to Pi, or the user talking over the voice. */
+  event?: (event: "handoff" | "interrupt") => void;
 };
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;

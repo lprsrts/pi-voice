@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { mixColors, type KeyId } from "@earendil-works/pi-tui";
+import { mixColors, truncateToWidth, type KeyId } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
@@ -11,46 +11,27 @@ import { answerBlocks, speakable, SpokenChat, spokenLines } from "./chat.ts";
 import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
 import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
 import { PROVIDER } from "./providers.ts";
-import { dominantFrequency } from "./protocol.ts";
+import type { VoiceState } from "./protocol.ts";
+import { BarMotion, HEARD_LEVEL, liveFacts, Meter, storyAt, syntheticVoice, type BarFacts } from "./motion.ts";
 import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, type ShortcutAction, type TalkCommand } from "./commands.ts";
 
-const states = ["idle", "listening", "thinking", "speaking", "error"] as const;
-type State = (typeof states)[number];
-
-// Listening and speaking draw the same Gaussian beam as thinking. Loudness sets
-// the beam height; the frame's dominant frequency (80 Hz-4 kHz, log scale) sets
-// the carrier from 4 to 20 cycles across the bar. Thinking sits at 8 cycles.
-const RATE = 24000;
-const LOW_HZ = 80, HIGH_HZ = 4000;
-const BEAM_WAIST = 0.16;
-const THINKING_CYCLES = 8, THINKING_SPEED = 3.5; // rad/s of carrier phase at 8 cycles
-
-type Beam = { level: number; logHz: number; phase: number; peak: number; frame?: number[]; target: number; targetLogHz: number };
-const newBeam = (hz: number): Beam => ({ level: 0, logHz: Math.log(hz), phase: 0, peak: 0, target: 0, targetLogHz: Math.log(hz) });
-const beamCycles = (beam: Beam) => 4 + 16 * Math.max(0, Math.min(1, Math.log(Math.exp(beam.logHz) / LOW_HZ) / Math.log(HIGH_HZ / LOW_HZ)));
-
-/** Eases a beam toward its targets: fast attack, slower release, ~90 ms frequency glide. */
-function advanceBeam(beam: Beam, dt: number) {
-  beam.level += (beam.target - beam.level) * (1 - Math.exp(-dt / (beam.target > beam.level ? 0.04 : 0.18)));
-  beam.logHz += (beam.targetLogHz - beam.logHz) * (1 - Math.exp(-dt / 0.09));
-  beam.phase += dt * THINKING_SPEED * beamCycles(beam) / THINKING_CYCLES;
-}
-
-/** Sets a beam's targets from the newest live frame (analysed once per frame). */
-function measureBeam(beam: Beam, samples: number[], fresh: boolean, dt: number) {
-  // Adaptive gain: normalize by the recent peak so quiet microphones still
-  // deflect; the floor keeps silence from amplifying noise.
-  beam.peak *= Math.pow(0.985, dt * 30);
-  if (!fresh || !samples.length) { beam.target = 0; return; }
-  if (samples === beam.frame) return;
-  beam.frame = samples;
-  let peak = 0;
-  for (const value of samples) peak = Math.max(peak, Math.abs(value));
-  beam.peak = Math.max(beam.peak, peak);
-  beam.target = Math.min(1, peak / Math.max(beam.peak, 0.06));
-  const hz = beam.target > 0.15 ? dominantFrequency(samples, RATE, LOW_HZ, HIGH_HZ) : undefined;
-  if (hz) beam.targetLogHz = Math.log(hz);
-}
+// The voice bar draws motion.ts's beam. What it shows follows from facts (the
+// connection, who is talking, Pi's work); events add impulses; it redraws only
+// while something moves. Previews play the story, cycle the states, or hold one.
+const CYCLE: PreviewStep[] = ["connecting", "listening", "hearing", "working", "speaking", "muted", "error", "paused"];
+type PreviewStep = "connecting" | "listening" | "hearing" | "working" | "speaking" | "muted" | "error" | "paused" | "off";
+const open: BarFacts = { connection: "open", paused: false, busy: false, speaking: false, hearing: false };
+const PREVIEW: Record<PreviewStep, { facts: BarFacts; muted?: boolean; voice?: "input" | "output" }> = {
+  connecting: { facts: { ...open, connection: "connecting" } },
+  listening: { facts: open },
+  hearing: { facts: { ...open, hearing: true }, voice: "input" },
+  working: { facts: { ...open, busy: true } },
+  speaking: { facts: { ...open, speaking: true }, voice: "output" },
+  muted: { facts: open, muted: true },
+  error: { facts: open },
+  paused: { facts: { ...open, connection: "closed", paused: true } },
+  off: { facts: { ...open, connection: "closed" } },
+};
 
 /** The Pi session's current model, as shown in /talk check and the consent prompt. */
 function modelName(ctx: ExtensionContext): string {
@@ -62,10 +43,9 @@ function modelName(ctx: ExtensionContext): string {
 export default function voicePreview(pi: ExtensionAPI) {
   let timer: ReturnType<typeof setInterval> | undefined;
   let owner: ExtensionContext | undefined;
-  let choice = "cycle";
-  let cycleStarted = Date.now();
+  let choice = "cycle"; // "live", or a preview: "story", "cycle", or a state
   let talk: TalkSession | undefined; // from the first /talk start until the Pi session ends
-  let liveState: State = "idle";
+  let liveState: VoiceState = "idle";
   let inputSamples: number[] = [], outputSamples: number[] = [];
   let inputTime = 0, outputTime = 0;
   // Settings come from Pi's settings.json ("pi-voice"), overridable by env (settings.ts).
@@ -82,90 +62,90 @@ export default function voicePreview(pi: ExtensionAPI) {
     owner = undefined;
   }
 
+  const motion = new BarMotion({ reducedMotion: () => currentSettings().values.reducedMotion });
+  const input = new Meter(), output = new Meter();
+  let facts: BarFacts & { muted?: boolean } = { ...PREVIEW.off.facts };
+  let lastHeardAt = -Infinity;
+  // After the voice speaks, its echo can linger in the mic: your voice counts again from a fresh onset.
+  let echoTail = false;
+  let previewFrom = 0, previewClock = 0, previewLabel = "", previewErrorAt = -Infinity;
+
+  /** Live facts from the talk session. */
+  const sessionFacts = (now: number) => liveFacts({
+    connected: !!talk?.connected, ready: !!talk?.isReady, talking, idle: !owner || owner.isIdle(),
+    voiceState: liveState, lastHeardAt, now, muted,
+  });
+
+  /** A preview's facts, synthetic voice, and events at `now`. */
+  function previewTick(now: number, dt: number) {
+    const ms = now - previewFrom;
+    let step: (typeof PREVIEW)[PreviewStep];
+    if (choice === "story") {
+      const { step: s, events } = storyAt(ms, previewClock);
+      for (const event of events) { motion.event(event, now); if (event === "interrupt") output.cut(now); }
+      step = s;
+      previewLabel = `story · ${s.label}: ${s.meaning}`;
+    } else {
+      const name = (choice === "cycle" ? CYCLE[Math.floor(ms / 3000) % CYCLE.length] : choice) as PreviewStep;
+      // An error flinches as it starts, and again every three seconds while held.
+      if (name === "error" && ms - previewErrorAt >= 3000) { motion.event("error", now); previewErrorAt = ms; }
+      if (name !== "error") previewErrorAt = -Infinity;
+      step = PREVIEW[name];
+      previewLabel = choice === "cycle" ? `cycle · ${name}` : name;
+    }
+    previewClock = ms;
+    const voice = (source: "input" | "output") => step.voice === source ? syntheticVoice(ms / 1000, source) : { level: 0, hz: 200 };
+    input.set(voice("input").level, voice("input").hz, dt, now);
+    output.set(voice("output").level, voice("output").hz, dt, now);
+    facts = { ...step.facts, muted: step.muted };
+  }
+
   function show(ctx: ExtensionContext, requested: string) {
       if (ctx.mode !== "tui") return;
       if (requested === "off") { stop(); return; }
       choice = requested;
-      cycleStarted = Date.now();
-      // Keep the mounted component and phase clock when changing preview state.
+      previewFrom = Date.now();
+      previewClock = 0;
+      previewErrorAt = -Infinity;
+      // Keep the mounted component and the beam when changing preview state.
       if (timer && owner) return;
       owner = ctx;
-      const started = Date.now();
       ctx.ui.setWidget("voice-preview", (tui, theme) => {
-        let lastFrame = Date.now();
-        let weights = states.map(state => state === "idle" ? 1 : 0);
-        const input = newBeam(200), output = newBeam(200);
-        timer = setInterval(() => tui.requestRender(), 33);
+        let lastTick = Date.now(), drawing = true;
+        // A new mount starts from rest, not from the last session's bar.
+        motion.reset();
+        lastHeardAt = -Infinity;
+        echoTail = false;
+        timer = setInterval(() => {
+          const now = Date.now(), dt = Math.min(0.25, (now - lastTick) / 1000);
+          lastTick = now;
+          if (choice === "live") {
+            input.update(inputSamples, now - inputTime <= 200, dt, now);
+            output.update(outputSamples, now - outputTime <= 200, dt, now);
+            // Your voice, not the voice's echo (an interruption counts: see the event hook).
+            if (liveState === "speaking") echoTail = true;
+            else if (input.level <= HEARD_LEVEL) echoTail = false;
+            else if (!echoTail) lastHeardAt = now;
+            facts = sessionFacts(now);
+          } else previewTick(now, dt);
+          // Redraw only while something moves: the beam, a voice (unless shapes are still), or words playing into the chat.
+          const voices = !currentSettings().values.reducedMotion && (input.level > 0.02 || output.level > 0.02);
+          const moving = choice !== "live" || motion.moving(now, facts) || voices || chat.animating(now);
+          if (moving || drawing) tui.requestRender(); // one more frame to come to rest
+          drawing = moving;
+        }, 33);
         timer.unref();
         return {
           invalidate() {}, // No cached output; theme and width are read on each render.
           render(width: number): string[] {
-            const seconds = (Date.now() - started) / 1000;
-            const now = Date.now();
-            const state = choice === "live" ? liveState : choice === "cycle" ? states[Math.floor((now - cycleStarted) / 4000) % states.length] : choice as State;
-            // Time-based easing: ~95% settled after 0.75s. Preserves continuity
-            // even when a new state arrives before the previous blend finishes.
-            const dt = Math.min(0.25, Math.max(0, now - lastFrame) / 1000);
-            const blend = 1 - Math.exp(-dt / 0.25);
-            lastFrame = now;
-            weights = weights.map((weight, i) => weight + ((states[i] === state ? 1 : 0) - weight) * blend);
-            const color = { idle: "dim", listening: "accent", thinking: "warning", speaking: "success", error: "error" } as const;
-            const columns = Math.max(0, Math.floor(width));
-            const time = seconds;
-            // Three braille rows give a 12-pixel-high trace: live frames in voice
-            // mode, a synthetic voice (syllable envelope, gliding pitch) in preview.
-            if (choice === "live") {
-              measureBeam(input, inputSamples, now - inputTime <= 200, dt);
-              measureBeam(output, outputSamples, now - outputTime <= 200, dt);
-            } else {
-              const syllables = 0.12 + 0.88 * Math.pow(0.5 + 0.5 * Math.sin(time * 4.3 + Math.sin(time * 1.7)), 2);
-              input.target = 0.7 * syllables;
-              output.target = syllables;
-              input.targetLogHz = Math.log(260 * Math.pow(2, 1.2 * Math.sin(time * 1.3) + 0.6 * Math.sin(time * 3.1)));
-              output.targetLogHz = Math.log(180 * Math.pow(2, 1.0 * Math.sin(time * 0.9 + 1) + 0.8 * Math.sin(time * 2.3)));
-            }
-            advanceBeam(input, dt);
-            advanceBeam(output, dt);
-            const inputCycles = beamCycles(input), outputCycles = beamCycles(output);
-            let tint = theme.colors[color.idle];
-            let accumulated = weights[0];
-            for (let i = 1; i < states.length; i++) {
-              const total = accumulated + weights[i];
-              if (total > 0) tint = mixColors(tint, theme.colors[color[states[i]]], weights[i] / total);
-              accumulated = total;
-            }
-            const dots = Array.from({ length: 3 }, () => new Array<number>(columns).fill(0));
-            const leftBits = [1, 2, 4, 64];
-            const rightBits = [8, 16, 32, 128];
-            function plot(sample: number, y: number) {
-              const row = Math.max(0, Math.min(11, Math.round(y)));
-              const col = Math.floor(sample / 2);
-              dots[Math.floor(row / 4)][col] |= (sample % 2 ? rightBits : leftBits)[row % 4];
-            }
-            let previousY: number | undefined;
-            for (let sample = 0; sample < columns * 2; sample++) {
-              const x = sample / Math.max(1, columns * 2 - 1);
-              // Fixed Gaussian beam waist: the envelope never travels or widens;
-              // only the carrier inside it changes (phase, and for audio, density).
-              const centered = x - 0.5;
-              const gaussian = Math.exp(-0.5 * (centered / BEAM_WAIST) ** 2);
-              const carrier = (cycles: number, phase: number) => Math.cos(centered * Math.PI * 2 * cycles - phase);
-              const amplitude = 0.85 * gaussian * (
-                weights[1] * input.level * carrier(inputCycles, input.phase) +
-                weights[2] * carrier(THINKING_CYCLES, time * THINKING_SPEED) +
-                weights[3] * output.level * carrier(outputCycles, output.phase)
-              );
-              const y = Math.round(5.5 - amplitude * 5.4);
-              // Join neighboring samples so steep peaks remain a continuous trace.
-              const from = previousY === undefined ? y : previousY;
-              for (let pixel = Math.min(from, y); pixel <= Math.max(from, y); pixel++) {
-                plot(sample, pixel);
-              }
-              previousY = y;
-            }
-            // Foreground only: no background fill or textual state labels. What is
-            // said plays in the chat itself (chat.ts); this redraw keeps it moving.
-            return dots.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
+            const frame = motion.frame(Date.now(), Math.max(0, Math.floor(width)), facts, input, output);
+            let tint = theme.colors[frame.tint[0]?.[0] ?? "dim"], total = frame.tint[0]?.[1] ?? 1;
+            for (const [token, weight] of frame.tint.slice(1)) { total += weight; tint = mixColors(tint, theme.colors[token], weight / total); }
+            if (frame.muted > 0) tint = mixColors(tint, theme.colors.dim, 0.6 * frame.muted);
+            // Foreground only: no background fill, and no labels in a live session.
+            const rows = frame.rows.map(row => theme.style(row.map(mask => mask ? String.fromCharCode(0x2800 + mask) : " ").join(""), { fg: tint }));
+            // The preview's label, cut to the width (Pi rejects lines wider than the terminal).
+            return choice === "live" ? rows : [...rows, truncateToWidth(` ${theme.style(previewLabel, { fg: theme.colors.dim })}`, Math.max(0, Math.floor(width)))];
           },
           dispose() {
             if (timer) clearInterval(timer);
@@ -191,6 +171,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       show("autoPause", values.autoPause ? `${values.autoPause} s of silence while I work` : "never"),
       show("idlePause", values.idlePause ? `${values.idlePause} s of silence when nothing runs` : "never"),
       show("echoCancellation", values.echoCancellation ? "on" : "off (headphones only)"),
+      show("reducedMotion", values.reducedMotion ? "on (still shapes, no flipping text)" : "off"),
       ...invalid.map(entry => `  ignored invalid value: ${entry}`),
     ];
   }
@@ -328,6 +309,7 @@ export default function voicePreview(pi: ExtensionAPI) {
     send: message => { try { pi.sendMessage(message, { triggerTurn: false }); } catch {} },
     save: readout => { try { pi.appendEntry<SpokenReadout>(SPOKEN_READOUT, readout); } catch {} },
     speaking: () => !!talk?.connected,
+    still: () => currentSettings().values.reducedMotion,
   });
   pi.registerEntryRenderer<SpokenTurn>(SPOKEN_TURN, (entry, options, theme) => chat.component(entry.data?.id, theme, options.expanded));
   pi.on("session_start", (_event, ctx) => { chat.load(ctx.sessionManager.getEntries()); });
@@ -384,7 +366,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       branch: () => ctx.sessionManager.getBranch(),
       cwd: () => ctx.sessionManager.getCwd(),
       createVoice: hooks => {
-        muted = false; liveState = "thinking"; inputSamples = []; outputSamples = [];
+        muted = false; liveState = "idle"; inputSamples = []; outputSamples = [];
         show(ctx, "live");
         return PROVIDER.create(hooks, callbacks => new AudioPipes({
           ...callbacks,
@@ -395,14 +377,23 @@ export default function voicePreview(pi: ExtensionAPI) {
       getKey: async signal => { helper = await nativeHelper(ctx, signal); return resolveApiKey(PROVIDER.key, signal); },
       notify: (message, level) => ctx.ui.notify(message, level),
       view: {
-        state: state => { liveState = state; },
+        state: state => { liveState = state; if (state === "error") motion.event("error", Date.now()); },
+        event: event => {
+          const now = Date.now();
+          motion.event(event, now);
+          // The voice yields: its audio drops at once, and the server heard you, so the bar is yours.
+          if (event === "interrupt") { output.cut(now); lastHeardAt = now; echoTail = false; }
+        },
         samples: (source, samples) => {
           if (source === "input") { inputSamples = samples; inputTime = Date.now(); }
           else { outputSamples = samples; outputTime = Date.now(); }
         },
         // A voice-side clear never wipes the words the user is saying.
         live: (role, text, answer) => chat.live(role, text, answer),
-        transcript: (role, text, interrupted, answer) => chat.settle(role, text, interrupted, answer),
+        transcript: (role, text, interrupted, answer) => {
+          chat.settle(role, text, interrupted, answer);
+          if (text) motion.event("settled", Date.now()); // a ripple as the turn lands in the chat
+        },
       },
       pauseAfter: () => pauseAfterFromSettings(),
       changed: refreshStatus,
@@ -415,7 +406,10 @@ export default function voicePreview(pi: ExtensionAPI) {
     if (talking) event.systemPromptOptions.sections.voice = VOICE_PROMPT;
   });
   pi.on("agent_start", () => { talk?.bridge.agentStart(); });
-  pi.on("tool_execution_start", event => { talk?.bridge.toolStart(event.toolName, event.args); });
+  pi.on("tool_execution_start", event => {
+    talk?.bridge.toolStart(event.toolName, event.args);
+    if (choice === "live" && talk?.connected) motion.event("tool", Date.now()); // a beat of Pi's work on the bar
+  });
   pi.on("message_end", event => {
     talk?.bridge.messageEnd(event.message);
     // Extensions hear this before Pi draws the finished message: hide a voice
