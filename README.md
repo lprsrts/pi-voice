@@ -37,6 +37,14 @@ The package is free (MIT). Two things cost money. The voice is GPT-Live at $0.05
 
 GPT-Live bills per second while a voice connection is open, whether anyone speaks or not. To avoid paying for silence, voice **pauses by itself**: after 15 s of silence while Pi works (it comes back to say the result), or 60 s of silence when nothing is running (`/talk start` resumes); both are [settings](#settings). `/talk mute` keeps the connection open (and billable); `/talk stop` ends it. A result that arrives while voice is off is said at the next `/talk start`.
 
+## Limits
+
+It runs on macOS only (14 or later), because the audio helper is built on Apple's voice processing. The voice is GPT-Live, so you need an OpenAI API key with billing, and what you say goes to OpenAI while voice is on.
+
+The microphone is open the whole time voice is connected. Mute it with <kbd>Alt</kbd>+<kbd>M</kbd> (or `/talk mute`) when you're not talking to it. Starting and stopping voice still takes the keyboard: `/talk` or <kbd>Alt</kbd>+<kbd>V</kbd>.
+
+The voice can't answer prompts in the terminal. When Pi or one of its extensions stops to ask you something, the voice says it is waiting for you, and you answer it at the keyboard.
+
 ## How it works
 
 When GPT-Live decides your request needs real work, it hands it off, and pi-voice sends what you said to Pi as a message. While Pi works, its progress reaches the voice silently, so the voice knows where the work stands without interrupting Pi. Saying something else adds to the running task, and "stop" or "cancel" stops it. When Pi finishes, the voice says the result. The voice and Pi are one agent: it talks about the work as its own ("I'm running the tests"), and each `/talk start` picks up where the session is (recent requests and answers, and any task still running, whose result it will announce), so you can stop and restart voice mid-task. While a voice session runs, Pi is told that its answers are spoken, so it ends with a short, speakable summary.
