@@ -71,6 +71,49 @@ export const SCENARIOS = {
     },
   },
 
+  "connection-drop": {
+    description: "The connection drops while Pi works: Pi keeps going, and its result is still spoken without the user restarting voice.",
+    sessions: [{ seconds: 40, turns: [
+      { at: 1.5, say: "Run sleep 15 in the shell, then tell me it finished." },
+      { at: 10, drop: true },
+    ] }],
+    checks: r => [
+      check("Pi kept working after the drop", !r.aborted && r.events.some(e => e.kind === "pi.settled" && e.data === ""), r.events.filter(e => e.kind === "pi.text").map(e => e.data).join(" | ").slice(0, 160)),
+      check("the result was spoken in the same talk, without a manual restart", r.voiceLines.some((l, i) => /finish|done|slept|complete/i.test(l)) && r.events.some(e => e.kind === "result.heard"), said(r)),
+      check("the drop was reported to the user", r.events.some(e => e.kind.startsWith("ui.")), r.events.filter(e => e.kind.startsWith("ui.")).map(e => e.data).join(" | ")),
+    ],
+  },
+
+  "silent-link-loss": {
+    description: "The link goes dead with no close (Wi-Fi gone, Mac asleep) while Pi works: voice notices within seconds and comes back for the result.",
+    sessions: [{ seconds: 40, turns: [
+      { at: 1.5, say: "Run sleep 15 in the shell, then tell me it finished." },
+      { at: 10, blackhole: true },
+    ] }],
+    checks: r => {
+      const lostAt = r.events.find(e => e.kind === "ui.warning")?.t;
+      const holeAt = r.events.find(e => e.kind === "net.blackhole")?.t;
+      return [
+        check("the dead link was noticed within 12 s", lostAt !== undefined && lostAt - holeAt < 12, lostAt === undefined ? "never" : `${(lostAt - holeAt).toFixed(1)} s`),
+        check("Pi kept working", !r.aborted && r.events.some(e => e.kind === "pi.settled" && e.data === "")),
+        check("the result was spoken without a manual restart", r.events.some(e => e.kind === "result.heard"), said(r)),
+      ];
+    },
+  },
+
+  "muted-quiet": {
+    description: "Muted for a while, then unmuted to ask something: muting must not look like a dead link.",
+    sessions: [{ seconds: 30, turns: [
+      { at: 1, mute: true },
+      { at: 13, mute: false },
+      { at: 14, say: "How many TypeScript files are in this repository? Just the number." },
+    ] }],
+    checks: r => [
+      check("no connection loss was reported while muted", !r.events.some(e => e.kind === "ui.warning" || e.kind === "ui.error"), r.events.filter(e => e.kind.startsWith("ui.")).map(e => e.data).join(" | ")),
+      check("the question after unmuting reached Pi", r.piRequests.some(q => /typescript/i.test(q))),
+    ],
+  },
+
   "restart-memory": {
     description: "Voice is stopped mid-task and restarted: it must know what it is doing and still report the result.",
     sessions: [

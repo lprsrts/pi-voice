@@ -108,6 +108,16 @@ export class TalkSession {
       live: (role, text, answer) => view.live?.(role, text, answer),
       transcript: (role, text, interrupted, answer) => view.transcript?.(role, text, interrupted, answer),
       event: event => view.event?.(event),
+      // A lost connection is handled like auto-pause: Pi keeps working, and its result brings voice back.
+      dropped: message => {
+        if (this.voice !== voice) return;
+        const working = !this.host.control.isIdle();
+        this.close();
+        this.paused = working;
+        this.host.notify(working
+          ? `${message} Voice comes back with the result. /talk start to speak sooner.`
+          : `${message} /talk start to talk again.`, "warning");
+      },
       closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
       tool: (name, args) => bridge.call(name, args),
       busy: () => !this.host.control.isIdle(),

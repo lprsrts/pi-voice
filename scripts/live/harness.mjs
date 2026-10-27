@@ -106,7 +106,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
   const r = {
     model: session.model ? `${session.model.provider}/${session.model.id}` : "none",
     events: [], piRequests: [], piTools: [], bridgeCalls: [], voiceLines: [], heard: [], errors: [], briefings: [], spoken: [],
-    aborted: false, results: [], turns: [], voiceSeconds: 0, cwd, t0: 0,
+    aborted: false, results: [], turns: [], voiceSeconds: 0, cwd, t0: 0, frameGaps: [],
   };
   r.t0 = t0;
   const mark = (kind, data = "") => { const t = (Date.now() - t0) / 1000; r.events.push({ t, kind, data }); log(t, kind, data); return t; };
@@ -176,12 +176,18 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
 
   // Watch GPT-Live's own events next to pi-voice's handling.
   const OrigWS = globalThis.WebSocket;
+  let socket;
   globalThis.WebSocket = class extends OrigWS {
     constructor(...args) {
       super(...args);
-      let line = "";
+      socket = this;
+      let line = "", last;
       this.addEventListener("message", message => {
         const e = JSON.parse(message.data);
+        // Gaps between server frames, to size a dead-connection watchdog.
+        const now = Date.now();
+        if (last !== undefined && !this.closeSent) r.frameGaps.push({ ms: now - last, after: e.type });
+        last = now;
         if (e.type === "session.output_transcript.delta") {
           line += e.delta;
           if (/[.!?]["”’)]*\s*$/.test(line)) { r.voiceLines.push(line.trim()); mark("voice.says", line.trim()); line = ""; }
@@ -194,7 +200,11 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
     }
     send(data) {
       if (typeof data === "string" && data.includes('"type":"session.close"')) this.closeSent = true;
-      super.send(data);
+      if (!this.blackholed) super.send(data);
+    }
+    // A black-holed link: the socket stays open, but nothing arrives and nothing leaves, as when Wi-Fi goes or the Mac sleeps.
+    addEventListener(type, listener, options) {
+      super.addEventListener(type, type === "message" ? event => { if (!this.blackholed) listener(event); } : listener, options);
     }
   };
 
@@ -202,13 +212,19 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
   const wall = Date.now();
   for (const [index, voiceSession] of scenario.sessions.entries()) {
     mark("talk.start", `${index + 1}/${scenario.sessions.length}`);
-    for (const turn of voiceSession.turns) turn.pcm = await speech(key, turn.say);
+    const speaking = voiceSession.turns.filter(turn => turn.say);
+    for (const turn of speaking) turn.pcm = await speech(key, turn.say);
     talk.open();
-    const timers = [];
+    // A scripted network drop: the socket closes abnormally, as a lost connection would.
+    const timers = voiceSession.turns.filter(turn => !turn.say).map(turn => setTimeout(() => {
+      if (turn.drop) { mark("net.drop"); socket?.close(4000, "scripted drop"); }
+      if (turn.blackhole) { mark("net.blackhole"); if (socket) socket.blackholed = true; }
+      if (turn.mute !== undefined) { mark(turn.mute ? "talk.mute" : "talk.unmute"); talk.mute(turn.mute); }
+    }, turn.at * 1000));
     let frameIndex = 0, feeding;
     if (audio === "acoustic") {
       const dir = mkdtempSync(join(tmpdir(), "pi-voice-wav-"));
-      for (const [i, turn] of voiceSession.turns.entries()) {
+      for (const [i, turn] of speaking.entries()) {
         const file = join(dir, `${i}.wav`);
         writeFileSync(file, wav(turn.pcm));
         timers.push(setTimeout(() => {
@@ -218,7 +234,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
         }, turn.at * 1000));
       }
     } else {
-      const schedule = voiceSession.turns.map(turn => ({ start: Math.round(turn.at * 50), turn }));
+      const schedule = speaking.map(turn => ({ start: Math.round(turn.at * 50), turn }));
       feeding = setInterval(() => {
         let out = Buffer.alloc(FRAME);
         for (const s of schedule) {

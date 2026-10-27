@@ -14,6 +14,8 @@ export type VoiceHooks = {
   /** The phrase the agent is saying now and how much of it is spoken, in step with playback ("" clears it). */
   caption?: (line: CaptionLine) => void;
   closed: () => void;
+  /** The connection was lost mid-session (not a configuration error); `closed` follows. */
+  dropped?: (message: string) => void;
   tool: (name: string, args: Record<string, unknown>) => object;
   busy: () => boolean;
   /** The agent's memory of the Pi session, given to each new voice session. */

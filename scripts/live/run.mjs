@@ -53,6 +53,11 @@ for (const name of names) {
     for (const c of checks) console.log(`    ${c.pass ? "PASS" : "FAIL"}  ${c.name}${c.detail && !c.pass ? `\n          ${String(c.detail).replace(/\s+/g, " ").slice(0, 300)}` : ""}`);
     const turns = r.turns.map(t => `"${t.say.slice(0, 32)}…" reply heard ${t.replyHeard?.toFixed(2) ?? "–"} s, result heard ${t.resultHeard?.toFixed(2) ?? "–"} s after it`);
     if (turns.length) console.log(`    timing:\n      ${turns.join("\n      ")}`);
+    if (r.frameGaps?.length) {
+      const gaps = r.frameGaps.map(g => g.ms).sort((a, b) => a - b);
+      const top = r.frameGaps.toSorted((a, b) => b.ms - a.ms).slice(0, 3).map(g => `${g.ms} ms before ${g.after}`).join(", ");
+      console.log(`    server frame gaps: n ${gaps.length}, p50 ${gaps[gaps.length >> 1]} ms, p99 ${gaps[Math.floor(gaps.length * 0.99)]} ms, max ${gaps.at(-1)} ms (${top})`);
+    }
     console.log(`    voice connected (billed): ${r.voiceSeconds.toFixed(1)} s of ${r.wallSeconds.toFixed(1)} s`);
     summary.push({ name, run, model: r.model, passed: checks.filter(c => c.pass).length, total: checks.length, latency: answerLatency(r) });
   }

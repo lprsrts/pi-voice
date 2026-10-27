@@ -388,7 +388,7 @@ async function startWire() {
   const calls = [];
   globalThis.WebSocket = FakeSocket;
   const on = name => (...args) => calls.push([name, ...args]);
-  const wire = new GptLiveWire({ started: on('started'), audio: on('audio'), outputText: on('outputText'), inputText: on('inputText'), delegation: on('delegation'), closed: on('closed'), error: on('error') });
+  const wire = new GptLiveWire({ started: on('started'), audio: on('audio'), outputText: on('outputText'), inputText: on('inputText'), delegation: on('delegation'), closed: on('closed'), lost: on('lost'), error: on('error') });
   const started = wire.start('test-not-a-real-key', { model: 'gpt-live-1' });
   const socket = FakeSocket.last;
   socket.dispatchEvent(new Event('open'));
@@ -434,7 +434,7 @@ test('the GPT-Live wire tags appends with their delegation, clips them, and clos
     assert.deepEqual(socket.types().slice(-2), ['session.input_audio.append', 'session.input_audio.mute']);
     socket.bufferedAmount = 600_000;
     wire.mute(false);
-    assert.deepEqual(calls.at(-1), ['error', 'Voice network upload stalled.', true]);
+    assert.deepEqual(calls.at(-1), ['lost', 'OpenAI GPT-Live connection lost (upload stalled).'], 'a live session whose upload stalls is lost, not misconfigured');
     socket.bufferedAmount = 0;
     wire.close();
     assert.equal(socket.sent.at(-1).type, 'session.close');
@@ -464,6 +464,58 @@ test('the GPT-Live wire reports a close before the session started, and close() 
     await assert.rejects(started, /Voice stopped/);
     assert.equal(socket.readyState, 3, 'not live: the socket closes at once, without session.close');
     assert.equal(socket.sent.length, 0);
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the GPT-Live wire tells a lost session (drop, hangup, duration limit) from a closed or refused one', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    for (const [event, expected] of [
+      [Object.assign(new Event('close'), { code: 1006, reason: '' }), ['lost', 'OpenAI GPT-Live connection lost (1006).']],
+      [new Event('error'), ['lost', 'OpenAI GPT-Live connection lost.']],
+      [Object.assign(new Event('close'), { code: 1008, reason: 'policy' }), ['error', 'OpenAI GPT-Live connection closed (1008: policy).', true]],
+      [Object.assign(new Event('close'), { code: 1000, reason: '' }), ['closed']],
+    ]) {
+      const { wire, socket, calls } = await startWire();
+      socket.dispatchEvent(event);
+      assert.deepEqual(calls.at(-1), expected);
+      wire.close();
+    }
+    for (const [reason, expected] of [['expired', 'lost'], ['connection_lost', 'lost'], ['close_requested', 'closed'], ['content', 'closed']]) {
+      const { wire, socket, calls } = await startWire();
+      socket.event({ type: 'session.closed', reason });
+      assert.equal(calls.at(-1)[0], expected, reason);
+      wire.close();
+    }
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the GPT-Live wire declares a live session lost after 10 s without a frame, even with no close', async t => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'] });
+    const { wire, socket, calls } = await startWire();
+    for (let i = 0; i < 8; i++) { t.mock.timers.tick(900); socket.event({ type: 'session.output_audio.delta', delta: 'AA==' }); }
+    t.mock.timers.tick(6000);
+    socket.event({ type: 'session.usage.updated' }); // a server stall of 6 s is not a dead link
+    assert.equal(calls.some(c => c[0] === 'lost'), false, 'frames keep it alive');
+    t.mock.timers.tick(11000);
+    assert.deepEqual(calls.find(c => c[0] === 'lost'), ['lost', 'OpenAI GPT-Live connection lost (no data for 10 s).']);
+    wire.close();
+    const n = calls.length;
+    t.mock.timers.tick(10000);
+    assert.equal(calls.length, n, 'the watchdog stops with the session');
+    // Muted, GPT-Live goes quiet: that is not a dead link, and unmuting starts the count afresh.
+    const muted = await startWire();
+    muted.wire.mute(true);
+    t.mock.timers.tick(30000);
+    assert.equal(muted.calls.some(c => c[0] === 'lost'), false, 'quiet while muted');
+    muted.wire.mute(false);
+    t.mock.timers.tick(9000);
+    assert.equal(muted.calls.some(c => c[0] === 'lost'), false, 'a fresh count after unmuting');
+    t.mock.timers.tick(2000);
+    assert.equal(muted.calls.at(-1)[0], 'lost');
+    muted.wire.close();
   } finally { globalThis.WebSocket = originalWS; }
 });
 
@@ -973,6 +1025,27 @@ test('while the voice speaks it is never paused; with nothing running the limit 
   assert.equal(talk.connected, true);
   tick(2_000);
   assert.deepEqual([talk.connected, talk.isPaused], [false, false], 'idle pause does not come back by itself');
+  talk.end();
+});
+
+test('a lost connection while Pi works pauses voice, and Pi\'s result brings it back; with nothing running it stays closed', async () => {
+  const { talk, voices, toasts, control } = fakeTalk({ idle: false });
+  talk.open();
+  await voices[0].ready();
+  voices[0].hooks.dropped('OpenAI GPT-Live connection lost (1006).');
+  assert.deepEqual([talk.connected, talk.isPaused, voices[0].stopped], [false, true, 1]);
+  assert.deepEqual(toasts.at(-1), ['warning', 'OpenAI GPT-Live connection lost (1006). Voice comes back with the result. /talk start to speak sooner.']);
+  control.idle = true;
+  talk.deliver('I finished the task "sleep 15". My answer: done.');
+  assert.equal(voices.length, 2);
+  await voices[1].ready();
+  assert.deepEqual(voices[1].said, ['I finished the task "sleep 15". My answer: done.']);
+  voices[1].hooks.state('speaking'); // the result was said
+  voices[1].hooks.dropped('OpenAI GPT-Live connection lost (1006).');
+  assert.deepEqual([talk.connected, talk.isPaused], [false, false], 'nothing to wait for: no reconnect');
+  assert.match(toasts.at(-1)[1], /\/talk start to talk again/);
+  voices[0].hooks.dropped('stale');
+  assert.equal(toasts.at(-1)[1].includes('stale'), false, 'an old connection is ignored');
   talk.end();
 });
 

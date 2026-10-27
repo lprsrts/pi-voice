@@ -100,6 +100,7 @@ type Hooks = {
   samples: (source: "input" | "output", samples: number[]) => void;
   error: (message: string) => void;
   closed: () => void;
+  dropped?: (message: string) => void;
   /** Pi bridge calls (ask_pi, pi_status, cancel_pi); return at once while Pi works in the background. */
   tool: (name: string, args: Record<string, unknown>) => object;
   /** Whether Pi is working, for the resting waveform state. */
@@ -210,6 +211,7 @@ export class LiveVoice {
       inputText: (delta, start, end) => this.inputText(delta, start, end),
       delegation: (id, offset) => this.delegated(id, offset),
       closed: () => this.stop(),
+      lost: message => this.lost(message),
       // Configuration problems are nonfatal on the live side; surface them, keep talking.
       error: (message, fatal) => fatal ? this.fail(message) : this.hooks.error(message),
     });
@@ -487,6 +489,14 @@ export class LiveVoice {
     this.stop();
     this.hooks.state("error");
     this.hooks.error(message);
+  }
+
+  /** The connection went away mid-session: the owner decides whether to come back, else it is an error. */
+  private lost(message: string) {
+    if (this.stopped) return;
+    if (!this.hooks.dropped) return this.fail(message);
+    this.hooks.dropped(message);
+    this.stop();
   }
 
   /** Closes gracefully once the session is live, so billing is finalized. */
