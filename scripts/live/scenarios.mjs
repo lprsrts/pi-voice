@@ -11,6 +11,42 @@ const check = (name, pass, detail = "") => ({ name, pass: !!pass, detail });
 const CONFUSED = /not (entirely )?sure (what|which)|could you clarify|what do you mean|which .{0,40} (are you )?referring|can you (be more specific|clarify)/i;
 
 export const SCENARIOS = {
+  // For a person (--audio human): cue cards instead of synthesized speech, voice processing on.
+  "talk-over": {
+    human: true,
+    description: "You ask for a long answer, then talk over it: the voice yields to you and never takes its own words for yours.",
+    sessions: [{ seconds: 35, turns: [
+      { at: 2, say: "Without checking anything, explain in five or six sentences what full-duplex voice means." },
+      { at: 14, say: "Wait, wait. Shorter, please, one sentence." },
+    ] }],
+    checks: r => {
+      const heard = r.heard.join("").toLowerCase().replace(/[^a-z' ]/g, " ");
+      const own = r.voiceLines.map(l => l.toLowerCase().replace(/[^a-z' ]/g, " ").split(/\s+/).filter(Boolean));
+      const echoes = own.flatMap(words => words.slice(0, Math.max(0, words.length - 4)).map((_, i) => words.slice(i, i + 5).join(" "))).filter(run => heard.includes(run));
+      return [
+        check("the voice answered at length", r.voiceLines.join(" ").split(/\s+/).length > 25, said(r)),
+        check("talking over it made it yield", r.events.some(e => e.kind === "voice.interrupt" && e.t > 10)),
+        check("the voice never took its own words for yours", echoes.length === 0, echoes.slice(0, 3).join(" | ")),
+        check("nothing was handed to Pi from its own speech", !r.piRequests.some(q => own.some(words => words.length > 4 && q.toLowerCase().includes(words.slice(0, 5).join(" "))))),
+      ];
+    },
+  },
+
+  "wifi-off": {
+    human: true,
+    description: "Wi-Fi goes off while Pi works and comes back: Pi finishes, and the voice still says the result.",
+    sessions: [{ seconds: 75, turns: [
+      { at: 2, say: "Run sleep 30 in the shell, then tell me it finished." },
+      { at: 14, cue: "Turn Wi-Fi OFF now (menu bar)." },
+      { at: 26, cue: "Turn Wi-Fi back ON now." },
+    ] }],
+    checks: r => [
+      check("Pi finished the task", !r.aborted && r.events.some(e => e.kind === "pi.settled" && e.data === "")),
+      check("the voice said the result", r.events.some(e => e.kind === "result.heard"), said(r)),
+      check("no error stopped voice for good", !r.events.some(e => e.kind === "ui.error"), r.events.filter(e => e.kind.startsWith("ui.")).map(e => e.data).join(" | ")),
+    ],
+  },
+
   "quick-answer": {
     description: "A one-step question about the project, answered by running a command.",
     // Long enough for acoustic timing (speech through the air is slower to hand off); the latency check is separate.

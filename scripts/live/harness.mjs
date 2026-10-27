@@ -80,7 +80,9 @@ function wav(pcm) {
  * each with scripted turns ({ at: seconds after the voice starts, say }).
  * audio: "inject" (default: real helper with voice processing and speaker
  * playback, scripted mic samples), "acoustic" (turns played aloud and heard by
- * the real mic; voice processing off), or "silent" (no audio devices).
+ * the real mic; voice processing off), "human" (a person says the turns from cue
+ * cards; real mic, voice processing as configured, as in the product), or
+ * "silent" (no audio devices).
  */
 export async function runScenario(scenario, { audio = "inject", cwd, model, record, log = () => {} } = {}) {
   const sdkDir = findPiSdk();
@@ -169,6 +171,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, reco
         tool: (name, args) => { r.bridgeCalls.push(name); mark(`bridge.${name}`); return hooks.tool(name, args); },
         briefing: () => { const text = hooks.briefing(); r.briefings.push(text); return text; },
         closed: () => { r.voiceSeconds += (Date.now() - connectedAt) / 1000; mark("voice.closed"); hooks.closed(); },
+        event: event => { mark(`voice.${event}`); hooks.event?.(event); },
       }, audioFactory);
       const notify = voice.notify.bind(voice);
       voice.notify = text => {
@@ -239,7 +242,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, reco
   for (const [index, voiceSession] of scenario.sessions.entries()) {
     mark("talk.start", `${index + 1}/${scenario.sessions.length}`);
     const speaking = voiceSession.turns.filter(turn => turn.say);
-    for (const turn of speaking) turn.pcm = await speech(key, turn.say);
+    if (audio !== "human") for (const turn of speaking) turn.pcm = await speech(key, turn.say);
     stuckOnResult = !!voiceSession.stuckOnResult;
     talk.open();
     // A scripted network drop: the socket closes abnormally, as a lost connection would.
@@ -247,9 +250,13 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, reco
       if (turn.drop) { mark("net.drop"); socket?.close(4000, "scripted drop"); }
       if (turn.blackhole) { mark("net.blackhole"); if (socket) socket.blackholed = true; }
       if (turn.mute !== undefined) { mark(turn.mute ? "talk.mute" : "talk.unmute"); talk.mute(turn.mute); }
+      if (turn.cue) mark("cue", turn.cue);
     }, turn.at * 1000));
     let frameIndex = 0, feeding;
-    if (audio === "acoustic") {
+    if (audio === "human") {
+      // Cue cards: the person says each line when it shows (their own timing; no end-of-speech mark).
+      for (const turn of speaking) timers.push(setTimeout(() => { mark("cue", `SAY: "${turn.say}"`); r.turns.push({ say: turn.say }); }, turn.at * 1000));
+    } else if (audio === "acoustic") {
       const dir = mkdtempSync(join(tmpdir(), "pi-voice-wav-"));
       for (const [i, turn] of speaking.entries()) {
         const file = join(dir, `${i}.wav`);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Runs live voice scenarios against real GPT-Live and a real Pi session.
 //
-//   node scripts/live/run.mjs [scenario ...|all] [--audio inject|acoustic|silent]
+//   node scripts/live/run.mjs [scenario ...|all] [--audio inject|acoustic|silent|human]
 //                             [--runs N] [--model provider/id] [--cwd DIR] [--record DIR] [--quiet]
 //
 // By default Pi works in a disposable copy of this repository, so it can edit
@@ -21,12 +21,14 @@ const cwdOption = option("cwd", undefined);
 const recordDir = option("record", undefined);
 const quiet = flag("quiet");
 if (flag("help") || flag("h")) {
-  console.log(`Scenarios:\n${Object.entries(SCENARIOS).map(([name, s]) => `  ${name.padEnd(22)}${s.description}`).join("\n")}\n\nOptions: --audio inject|acoustic|silent  --runs N  --model provider/id  --cwd DIR  --record DIR  --quiet`);
+  console.log(`Scenarios:\n${Object.entries(SCENARIOS).map(([name, s]) => `  ${name.padEnd(22)}${s.description}`).join("\n")}\n\nOptions: --audio inject|acoustic|silent|human  --runs N  --model provider/id  --cwd DIR  --record DIR  --quiet`);
   process.exit(0);
 }
-if (!["inject", "acoustic", "silent"].includes(audio)) throw new Error(`Unknown --audio ${audio}.`);
-const names = !args.length || args.includes("all") ? Object.keys(SCENARIOS) : args;
+if (!["inject", "acoustic", "silent", "human"].includes(audio)) throw new Error(`Unknown --audio ${audio}.`);
+// "all" means the scripted scenarios, or with --audio human the ones made for a person.
+const names = !args.length || args.includes("all") ? Object.keys(SCENARIOS).filter(name => !!SCENARIOS[name].human === (audio === "human")) : args;
 for (const name of names) if (!SCENARIOS[name]) throw new Error(`Unknown scenario "${name}". Run with --help for the list.`);
+if (audio === "human") console.log("Human mode: say each line when its cue card shows, in your own voice, with the Mac's speakers on (no headphones). Voice processing is on, as in the product.");
 if (audio === "acoustic") console.log("Acoustic mode: lines are played through the speakers and voice processing is off (it would cancel them). Use speakers, not headphones.");
 
 const summary = [];
@@ -37,7 +39,8 @@ for (const name of names) {
     console.log(`\n=== ${name}${runs > 1 ? ` (run ${run}/${runs})` : ""} — ${SCENARIOS[name].description}`);
     console.log(`    audio: ${audio}, working directory: ${cwd}`);
     const print = (t, kind, data) => {
-      if (quiet && !/^(user\.says|voice\.says|pi\.(prompt|steer|followUp|tool|abort)|result|delegation|bridge\.(pi_status|cancel_pi)|error|gpt-live\.error)/.test(kind)) return;
+      if (kind === "cue") { console.log(`\n  ▶▶ ${t.toFixed(0)}s  ${data}\n`); return; }
+      if (quiet && !/^(voice\.interrupt|ui\.|user\.says|voice\.says|pi\.(prompt|steer|followUp|tool|abort)|result|delegation|bridge\.(pi_status|cancel_pi)|error|gpt-live\.error)/.test(kind)) return;
       console.log(`${t.toFixed(2).padStart(7)}s  ${kind.padEnd(14)} ${String(data).replace(/\s+/g, " ").slice(0, 150)}`);
     };
     let r;
