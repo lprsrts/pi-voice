@@ -1,7 +1,8 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
 import { CONVERSATION_MARK, VOICE_REQUEST } from "./pi-bridge.ts";
-import { Captions, clipTokens, type CaptionLine, voicedMs, waveform, type VoiceState } from "./protocol.ts";
+import { GptLiveWire } from "./openai-live-wire.ts";
+import { Captions, type CaptionLine, voicedMs, waveform, type VoiceState } from "./protocol.ts";
 
 // OpenAI GPT-Live (wss://api.openai.com/v1/live/sessions) with client
 // delegation: the Pi session itself is the backend. When GPT-Live delegates,
@@ -10,9 +11,7 @@ import { Captions, clipTokens, type CaptionLine, voicedMs, waveform, type VoiceS
 // progress (thinking, silent) and results (commentary, spoken) go back tagged
 // with the delegation. Config lives in providers/openai-live/.
 
-const ENDPOINT = "wss://api.openai.com/v1/live/sessions";
 const RATE = 24000; // PCM16 mono both ways; the native helper runs unresampled at this rate
-const APPEND_TOKENS = 400; // commentary/thinking accept at most 500 tokens; the estimate is pessimistic, and this leaves margin
 const SPEECH_PEAK = 600;
 // A delegation's request is complete once a fragment reaches its offset_ms (measured
 // live: the last word's fragment arrived with or before the delegation every time);
@@ -129,22 +128,14 @@ type Hooks = {
 
 type AudioFactory = (callbacks: ConstructorParameters<typeof AudioPipes>[0]) => AudioPipes;
 
-/** Node's WebSocket (undici) accepts headers; the browser typings do not know that. */
-type HeaderSocket = new (url: string, init: { headers: Record<string, string> }) => WebSocket;
-
 export class LiveVoice {
   private hooks: Hooks;
   private audioFactory: AudioFactory;
-  private ws?: WebSocket;
+  private wire?: GptLiveWire;
   private audio?: AudioPipes;
   private abort = new AbortController();
   private stopped = false;
-  private closing = false;
   private muted = false;
-  private deadline?: ReturnType<typeof setTimeout>;
-  private resolveStart?: () => void;
-  private rejectStart?: (error: Error) => void;
-  private seq = 0;
   // Pi backend: what the user said (input transcript, session clock), how far
   // delegations have consumed it, and the delegation Pi is answering.
   private heard: { start: number; end: number; text: string; sent?: boolean; busy?: boolean }[] = [];
@@ -212,42 +203,23 @@ export class LiveVoice {
       return;
     }
     if (this.stopped) return;
-    this.deadline = setTimeout(() => this.fail("Voice startup timed out."), 30000);
+    this.wire = new GptLiveWire({
+      started: () => this.started(),
+      audio: pcm => { this.audio?.enqueue(pcm); this.captions.queued(pcm, RATE); this.replyQueuedMs += voicedMs(pcm, RATE); },
+      outputText: (delta, start, end) => this.outputText(delta, start, end),
+      inputText: (delta, start, end) => this.inputText(delta, start, end),
+      delegation: (id, offset) => this.delegated(id, offset),
+      closed: () => this.stop(),
+      // Configuration problems are nonfatal on the live side; surface them, keep talking.
+      error: (message, fatal) => fatal ? this.fail(message) : this.hooks.error(message),
+    });
     try {
-      await new Promise<void>((resolve, reject) => {
-        this.resolveStart = resolve;
-        this.rejectStart = reject;
-        // Server-side connection: the project key goes in the Authorization header, never in the URL.
-        const ws = this.ws = new (WebSocket as unknown as HeaderSocket)(ENDPOINT, { headers: { Authorization: `Bearer ${key}` } });
-        ws.addEventListener("open", () => this.send({ type: "session.start", session: config }));
-        ws.addEventListener("message", event => {
-          if (this.stopped) return;
-          try {
-            if (typeof event.data !== "string" || event.data.length > 8_000_000) throw new Error("Invalid WebSocket frame.");
-            this.handle(JSON.parse(event.data));
-          } catch (error) {
-            this.fail(`Invalid GPT-Live event: ${error instanceof Error ? error.message : "unknown"}. Voice stopped.`);
-          }
-        });
-        ws.addEventListener("error", () => this.fail("OpenAI GPT-Live connection failed (check the API key and project access)."));
-        ws.addEventListener("close", event => {
-          if (this.stopped) return;
-          if (!this.audio) this.fail(`OpenAI closed the connection before the session started (${event.code}${event.reason ? `: ${event.reason}` : ""}).`);
-          else if (this.closing || event.code === 1000) this.stop();
-          else this.fail(`OpenAI GPT-Live connection closed (${event.code}${event.reason ? `: ${event.reason}` : ""}).`);
-        });
-      });
+      await this.wire.start(key, config);
     } catch (error) {
       if (this.stopped) return;
       this.stop();
       throw error instanceof Error ? error : new Error("Voice startup failed.");
     }
-  }
-
-  private send(value: Record<string, unknown>) {
-    if (this.stopped || this.ws?.readyState !== WebSocket.OPEN) return;
-    if (this.ws.bufferedAmount > 512_000) { this.fail("Voice network upload stalled."); return; }
-    this.ws.send(JSON.stringify({ event_id: `pi_${++this.seq}`, ...value }));
   }
 
   private rest() {
@@ -256,25 +228,17 @@ export class LiveVoice {
   }
 
   /** A Pi update GPT-Live should say aloud (it paraphrases commentary), tied to the delegation Pi is answering. */
-  notify(text: string, answer?: string) { this.readout = answer ?? true; this.commentary(text, this.delegation ?? null); }
+  notify(text: string, answer?: string) { this.readout = answer ?? true; this.wire?.say(text, this.delegation ?? null, "result"); }
 
   /** Silent context GPT-Live can use when asked, without speaking it now. */
-  context(text: string) { this.thinking(text, this.delegation ?? null); }
-
-  private commentary(text: string, delegation: string | null) {
-    this.send({ type: "session.commentary.append", delegation_id: delegation, content: clipTokens(text, APPEND_TOKENS) });
-  }
-
-  private thinking(text: string, delegation: string | null) {
-    this.send({ type: "session.thinking.append", delegation_id: delegation, content: clipTokens(text, APPEND_TOKENS) });
-  }
+  context(text: string) { this.wire?.say(text, this.delegation ?? null, "context"); }
 
   private startAudio() {
     this.audio = this.audioFactory({
       input: frame => {
         if (this.stopped || this.muted) return;
         this.hooks.samples("input", waveform(frame));
-        this.send({ type: "session.input_audio.append", audio: frame.toString("base64") });
+        this.wire?.appendAudio(frame);
       },
       output: (frame, queued) => {
         if (this.stopped) return;
@@ -306,103 +270,76 @@ export class LiveVoice {
     if (this.muted) this.audio.mute(true);
   }
 
-  // Server events follow OpenAI's GPT-Live protocol (guides/voice-websockets, live-delegation).
-  private handle(event: any) {
-    switch (event.type) {
-      case "session.started":
-        if (this.audio) return;
-        try { this.startAudio(); }
-        catch (error) { this.fail(`Local audio failed to start: ${error instanceof Error ? error.message : "unknown error"}`); return; }
-        clearTimeout(this.deadline);
-        this.resolveStart?.();
-        this.resolveStart = this.rejectStart = undefined;
-        this.rest();
-        break;
-      case "session.output_audio.delta": {
-        const pcm = Buffer.from(event.delta, "base64");
-        if (pcm.length) { this.audio?.enqueue(pcm); this.captions.queued(pcm, RATE); this.replyQueuedMs += voicedMs(pcm, RATE); }
-        break;
-      }
-      case "session.output_transcript.delta": {
-        // GPT-Live times every fragment on its session clock (start_ms/end_ms);
-        // per the API docs these ranges replace packet arrival times for pacing.
-        const timed = typeof event.start_ms === "number" && typeof event.end_ms === "number";
-        if (this.userTurn) {
-          this.userTurn = false;
-          this.voiceFrom = timed ? event.start_ms : undefined;
-          this.replyAt = Date.now();
-          this.replyHeardMs = 0;
-          this.captions.turn(timed ? event.start_ms : undefined);
-        }
-        this.said = (this.said + String(event.delta ?? "")).slice(-600);
-        this.reply = (this.reply + String(event.delta ?? "").replace(/\[[^\]]*\]\s*/g, "")).slice(-TRANSCRIPT_CHARS);
-        if (this.hooks.busy()) this.working = true;
-        if (this.commitTimer) this.commitSoon();
-        this.captions.text(String(event.delta ?? ""), timed ? event.start_ms : undefined, timed ? event.end_ms : undefined);
-        break;
-      }
-      case "session.input_transcript.delta": {
-        this.hooks.activity?.();
-        this.hear(String(event.delta ?? ""), event.start_ms, event.end_ms);
-        // A late fragment of words spoken before the voice's current reply began is
-        // not new speech: it neither interrupts the reply nor starts a user turn.
-        // The session clock says so when it can; otherwise the reply has barely started.
-        if (!this.userTurn && typeof event.start_ms === "number" && this.voiceFrom !== undefined && event.start_ms < this.voiceFrom) break;
-        const replyPending = this.playing || this.replyHeardMs === 0 || this.replyQueuedMs - this.replyPlayedMs > 50;
-        if (!this.userTurn && replyPending && Date.now() - this.replyAt < LATE_WORDS.ms && this.replyHeardMs < LATE_WORDS.playedMs) { this.userWords(); break; }
-        // The previous exchange is finished: write it before this turn's words.
-        if (!this.userTurn) {
-          this.commit(typeof event.start_ms === "number" ? event.start_ms : this.heard.at(-1)?.start);
-          this.readout = this.working = false;
-        }
-        // GPT-Live decides when to yield; while the user talks over playback, drop the
-        // locally queued audio so the model's own stop is not delayed by our buffer.
-        if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); this.hooks.event?.("interrupt"); }
-        if (!this.userTurn) {
-          this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
-          // A new user turn. What Pi's conversation lacks of the finished one and the
-          // voice's reply (said while Pi worked) goes with the next request as context
-          // (a turn already sent as a request is not repeated); the request itself is
-          // only the new turn's words.
-          const from = typeof event.start_ms === "number" ? event.start_ms : (this.heard.at(-1)?.start ?? -Infinity);
-          const previous = this.turnWords(this.turnFrom, from);
-          if (previous && this.turnFrom !== this.delegatedFrom && !this.keptUser) this.conversation.push({ role: "user", text: previous });
-          if (this.said.trim() && !this.keptVoice) this.conversation.push({ role: "voice", text: this.said.trim() });
-          this.conversation = this.conversation.slice(-40);
-          this.keptUser = this.keptVoice = false;
-          this.said = "";
-          this.turnFrom = from;
-        }
-        this.userTurn = true;
-        this.hooks.state("listening");
-        this.userWords();
-        break;
-      }
-      case "session.delegation.created": {
-        this.hooks.state("thinking");
-        const id = event.delegation?.id;
-        this.commitSoon(); // the request shows even if the voice does not answer aloud
-        if (typeof id !== "string") break;
-        if (this.waiting) this.release(); // an earlier one still waiting goes first
-        const offset = typeof event.offset_ms === "number" ? event.offset_ms : Infinity;
-        if ((this.heard.at(-1)?.end ?? -Infinity) >= offset) { this.delegate(id); break; }
-        // The last words of the request are still in flight: wait for them, briefly.
-        const timer = setTimeout(() => this.release(), DELEGATION_SETTLE_MS);
-        timer.unref?.();
-        this.waiting = { id, offset, timer };
-        break;
-      }
-      case "session.closed":
-        this.stop();
-        break;
-      case "error": {
-        const error = event.error ?? {};
-        const message = String(error.message ?? error.code ?? "error").slice(0, 300);
-        // Configuration problems are nonfatal on the live side; surface them, keep talking.
-        this.hooks.error(`OpenAI GPT-Live: ${message}`);
-        break;
-      }
+  private started() {
+    if (this.audio) return;
+    try { this.startAudio(); }
+    catch (error) { this.fail(`Local audio failed to start: ${error instanceof Error ? error.message : "unknown error"}`); return; }
+    this.rest();
+  }
+
+  private outputText(delta: string, start?: number, end?: number) {
+    const timed = start !== undefined && end !== undefined;
+    if (this.userTurn) {
+      this.userTurn = false;
+      this.voiceFrom = timed ? start : undefined;
+      this.replyAt = Date.now();
+      this.replyHeardMs = 0;
+      this.captions.turn(timed ? start : undefined);
     }
+    this.said = (this.said + delta).slice(-600);
+    this.reply = (this.reply + delta.replace(/\[[^\]]*\]\s*/g, "")).slice(-TRANSCRIPT_CHARS);
+    if (this.hooks.busy()) this.working = true;
+    if (this.commitTimer) this.commitSoon();
+    this.captions.text(delta, timed ? start : undefined, timed ? end : undefined);
+  }
+
+  private inputText(delta: string, start?: number, end?: number) {
+    this.hooks.activity?.();
+    this.hear(delta, start, end);
+    // A late fragment of words spoken before the voice's current reply began is
+    // not new speech: it neither interrupts the reply nor starts a user turn.
+    // The session clock says so when it can; otherwise the reply has barely started.
+    if (!this.userTurn && start !== undefined && this.voiceFrom !== undefined && start < this.voiceFrom) return;
+    const replyPending = this.playing || this.replyHeardMs === 0 || this.replyQueuedMs - this.replyPlayedMs > 50;
+    if (!this.userTurn && replyPending && Date.now() - this.replyAt < LATE_WORDS.ms && this.replyHeardMs < LATE_WORDS.playedMs) { this.userWords(); return; }
+    // The previous exchange is finished: write it before this turn's words.
+    if (!this.userTurn) {
+      this.commit(start ?? this.heard.at(-1)?.start);
+      this.readout = this.working = false;
+    }
+    // GPT-Live decides when to yield; while the user talks over playback, drop the
+    // locally queued audio so the model's own stop is not delayed by our buffer.
+    if (this.playing) { this.audio?.interrupt(); this.captions.interrupt(); this.playing = false; this.hooks.samples("output", []); this.hooks.event?.("interrupt"); }
+    if (!this.userTurn) {
+      this.captions.userSpeech(); // the first fragment of the user's turn marks where they began
+      // A new user turn. What Pi's conversation lacks of the finished one and the
+      // voice's reply (said while Pi worked) goes with the next request as context
+      // (a turn already sent as a request is not repeated); the request itself is
+      // only the new turn's words.
+      const from = start ?? this.heard.at(-1)?.start ?? -Infinity;
+      const previous = this.turnWords(this.turnFrom, from);
+      if (previous && this.turnFrom !== this.delegatedFrom && !this.keptUser) this.conversation.push({ role: "user", text: previous });
+      if (this.said.trim() && !this.keptVoice) this.conversation.push({ role: "voice", text: this.said.trim() });
+      this.conversation = this.conversation.slice(-40);
+      this.keptUser = this.keptVoice = false;
+      this.said = "";
+      this.turnFrom = from;
+    }
+    this.userTurn = true;
+    this.hooks.state("listening");
+    this.userWords();
+  }
+
+  private delegated(id: string | undefined, offset = Infinity) {
+    this.hooks.state("thinking");
+    this.commitSoon(); // the request shows even if the voice does not answer aloud
+    if (id === undefined) return;
+    if (this.waiting) this.release(); // an earlier one still waiting goes first
+    if ((this.heard.at(-1)?.end ?? -Infinity) >= offset) { this.delegate(id); return; }
+    // The last words of the request are still in flight: wait for them, briefly.
+    const timer = setTimeout(() => this.release(), DELEGATION_SETTLE_MS);
+    timer.unref?.();
+    this.waiting = { id, offset, timer };
   }
 
   private cancelCommit() {
@@ -509,22 +446,22 @@ export class LiveVoice {
     if (fresh.length) this.consumedMs = Math.max(...fresh.map(fragment => fragment.end));
     const words = fresh.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
     const request = words || this.lastRequest;
-    if (!request) { this.thinking("No request was heard for this delegation; ask the user to repeat it.", id); return; }
+    if (!request) { this.wire?.say("No request was heard for this delegation; ask the user to repeat it.", id, "context"); return; }
     this.lastRequest = request;
     const busy = this.hooks.busy();
     if (busy && STOP_REQUEST.test(request)) {
       const result = this.hooks.tool("cancel_pi", {}) as { status?: string };
-      this.commentary(result.status === "cancelled" ? "I stopped the task." : "Nothing was running.", id);
+      this.wire?.say(result.status === "cancelled" ? "I stopped the task." : "Nothing was running.", id, "result");
       return;
     }
     if (busy && STATUS_REQUEST.test(request)) {
-      this.commentary(describeStatus(this.hooks.tool("pi_status", {})), id);
+      this.wire?.say(describeStatus(this.hooks.tool("pi_status", {})), id, "result");
       return;
     }
     // The request is the latest turn; what was said since the last request (an
     // explanation over several turns, the voice's questions) is what it refers to.
     const result = this.hooks.tool("ask_pi", { request: `${VOICE_REQUEST}${request}${conversationContext(this.conversation)}`, when: "now" }) as { status?: string; error?: string };
-    if (result.error) { this.commentary(`I couldn't take that request: ${result.error}`, id); return; }
+    if (result.error) { this.wire?.say(`I couldn't take that request: ${result.error}`, id, "result"); return; }
     for (const fragment of fresh) fragment.sent = true; // Pi's message shows these words; the spoken history skips them
     this.hooks.transcript?.("user", "", false); // Pi's own message takes over from the live line
     this.hooks.event?.("handoff");
@@ -532,15 +469,15 @@ export class LiveVoice {
     this.conversation = [];
     this.delegatedFrom = this.turnFrom;
     this.delegation = id;
-    this.thinking(result.status === "started"
+    this.wire?.say(result.status === "started"
       ? "I've started on it. The result arrives as an update; do not state any result before that."
-      : "I was already working; this was added to the running task. The result arrives as an update.", id);
+      : "I was already working; this was added to the running task. The result arrives as an update.", id, "context");
   }
 
   mute(value: boolean) {
     this.muted = value;
     this.audio?.mute(value);
-    this.send({ type: value ? "session.input_audio.mute" : "session.input_audio.unmute" });
+    this.wire?.mute(value);
     this.hooks.samples("input", []);
     this.rest();
   }
@@ -552,26 +489,16 @@ export class LiveVoice {
     this.hooks.error(message);
   }
 
-  /** Graceful close finalizes billing (session.closed); the socket is torn down after 3 s regardless. */
+  /** Closes gracefully once the session is live, so billing is finalized. */
   stop() {
     if (this.stopped) return;
-    if (!this.closing && this.ws?.readyState === WebSocket.OPEN && this.audio) {
-      this.closing = true;
-      this.send({ type: "session.close" });
-      this.audio.stop();
-      this.audio = undefined;
-      const ws = this.ws;
-      setTimeout(() => ws.close(), 3000).unref();
-    }
-    if (!this.stopped) this.commit();
+    this.wire?.close(!!this.audio);
+    this.commit();
     this.stopped = true;
     if (this.waiting) { clearTimeout(this.waiting.timer); this.waiting = undefined; }
     this.abort.abort();
-    clearTimeout(this.deadline);
     this.audio?.stop();
-    this.rejectStart?.(new Error("Voice stopped."));
-    this.resolveStart = this.rejectStart = undefined;
-    if (!this.closing) this.ws?.close();
+    this.audio = undefined;
     this.hooks.closed();
   }
 }

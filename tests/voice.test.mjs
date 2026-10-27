@@ -12,6 +12,7 @@ import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../ke
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
 import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext, heardPart, LATE_WORDS } from '../live.ts';
+import { GptLiveWire } from '../openai-live-wire.ts';
 // Scripted exchanges happen in no time; the late-words window gets its own test.
 LATE_WORDS.ms = 0;
 import { PROVIDER } from '../providers.ts';
@@ -378,6 +379,91 @@ test('GPT-Live authenticates with a header, starts the session, and streams audi
     voice.stop();
     assert.equal(socket.sent.at(-1).type, 'session.close', 'graceful close finalizes usage');
     assert.equal(audio.stopped, 1);
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+// ---------- GPT-Live wire alone: server events in, neutral callbacks out ----------
+
+async function startWire() {
+  const calls = [];
+  globalThis.WebSocket = FakeSocket;
+  const on = name => (...args) => calls.push([name, ...args]);
+  const wire = new GptLiveWire({ started: on('started'), audio: on('audio'), outputText: on('outputText'), inputText: on('inputText'), delegation: on('delegation'), closed: on('closed'), error: on('error') });
+  const started = wire.start('test-not-a-real-key', { model: 'gpt-live-1' });
+  const socket = FakeSocket.last;
+  socket.dispatchEvent(new Event('open'));
+  socket.event({ type: 'session.started', session: { id: 'sess_1' } });
+  await started;
+  return { wire, socket, calls };
+}
+
+test('the GPT-Live wire turns server events into callbacks that keep the session clock', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const { wire, socket, calls } = await startWire();
+    assert.deepEqual(socket.sent[0], { event_id: 'pi_1', type: 'session.start', session: { model: 'gpt-live-1' } });
+    socket.event({ type: 'session.output_audio.delta', delta: Buffer.from([1, 2]).toString('base64') });
+    socket.event({ type: 'session.output_audio.delta', delta: '' }); // empty audio is not passed on
+    socket.event({ type: 'session.output_transcript.delta', delta: 'On it.', start_ms: 100, end_ms: 300 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'run tests', start_ms: 50 }); // half-timed stays half-timed
+    socket.event({ type: 'session.delegation.created', offset_ms: 400, delegation: { id: 'd1' } });
+    socket.event({ type: 'session.delegation.created', delegation: {} });
+    socket.event({ type: 'error', error: { code: 'bad_voice' } });
+    socket.event({ type: 'session.closed' });
+    assert.deepEqual(calls, [['started'], ['audio', Buffer.from([1, 2])], ['outputText', 'On it.', 100, 300], ['inputText', 'run tests', 50, undefined],
+      ['delegation', 'd1', 400], ['delegation', undefined, undefined], ['error', 'OpenAI GPT-Live: bad_voice', false], ['closed']]);
+    socket.dispatchEvent(new MessageEvent('message', { data: 'not json' }));
+    assert.equal(calls.at(-1)[0], 'error');
+    assert.equal(calls.at(-1)[2], true, 'a malformed frame is fatal');
+    wire.close();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the GPT-Live wire tags appends with their delegation, clips them, and closes gracefully', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    const { wire, socket, calls } = await startWire();
+    wire.say('47 pass.', 'd1', 'result');
+    assert.deepEqual(socket.sent.at(-1), { event_id: 'pi_2', type: 'session.commentary.append', delegation_id: 'd1', content: '47 pass.' });
+    const log = 'npm notice 13.3kB README.md sha512-XosJ7wfxiYZWi9a3 '.repeat(80);
+    wire.say(log, null, 'context');
+    assert.deepEqual([socket.sent.at(-1).type, socket.sent.at(-1).delegation_id, socket.sent.at(-1).content], ['session.thinking.append', null, clipTokens(log, 400)]);
+    assert.ok(socket.sent.at(-1).content.endsWith(' …'));
+    wire.appendAudio(Buffer.from([7]));
+    wire.mute(true);
+    assert.deepEqual(socket.types().slice(-2), ['session.input_audio.append', 'session.input_audio.mute']);
+    socket.bufferedAmount = 600_000;
+    wire.mute(false);
+    assert.deepEqual(calls.at(-1), ['error', 'Voice network upload stalled.', true]);
+    socket.bufferedAmount = 0;
+    wire.close();
+    assert.equal(socket.sent.at(-1).type, 'session.close');
+    assert.equal(socket.readyState, 1, 'the socket stays open for session.closed');
+    const n = socket.sent.length;
+    wire.say('late', 'd1', 'result');
+    socket.event({ type: 'session.closed' });
+    assert.equal(socket.sent.length, n, 'nothing is sent after close');
+    assert.notDeepEqual(calls.at(-1), ['closed'], 'nothing is reported after close');
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('the GPT-Live wire reports a close before the session started, and close() ends a pending start', async () => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    globalThis.WebSocket = FakeSocket;
+    const errors = [];
+    const early = new GptLiveWire({ started() {}, audio() {}, outputText() {}, inputText() {}, delegation() {}, closed() {}, error: (...e) => errors.push(e) });
+    early.start('k', {}).catch(() => {});
+    FakeSocket.last.dispatchEvent(Object.assign(new Event('close'), { code: 1008, reason: 'bad key' }));
+    assert.deepEqual(errors, [['OpenAI closed the connection before the session started (1008: bad key).', true]]);
+    early.close();
+    const pending = new GptLiveWire({ started() {}, audio() {}, outputText() {}, inputText() {}, delegation() {}, closed() {}, error() {} });
+    const started = pending.start('k', {});
+    const socket = FakeSocket.last;
+    pending.close();
+    await assert.rejects(started, /Voice stopped/);
+    assert.equal(socket.readyState, 3, 'not live: the socket closes at once, without session.close');
+    assert.equal(socket.sent.length, 0);
   } finally { globalThis.WebSocket = originalWS; }
 });
 
