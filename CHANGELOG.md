@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.5.0 (2026-10-27)
+
+### Reliability
+
+- **A dropped connection no longer loses the result.** If the connection to GPT-Live drops while Pi works, voice closes with a warning, Pi keeps working, and voice comes back by itself to say the result, as auto-pause does. With nothing running, it stays closed until `/talk start`. Errors that mean a bad key or a refused session still stop voice with an error.
+- **A dead connection is noticed.** When Wi-Fi goes or the Mac sleeps, the socket may never close. Voice now treats 10 s without any data from GPT-Live as a lost connection (GPT-Live sends audio about every 100 ms, silence included), and rests this check while you are muted, when GPT-Live sends nothing.
+- **A stuck session is noticed, and its result is still said.** GPT-Live acknowledges every update in about a second. If one goes unacknowledged for 8 s, voice treats the session as lost; a result given to it but not yet spoken is said in a new session, once.
+- **Corrections said while Pi works reach Pi.** GPT-Live sometimes acknowledges a correction ("Noted", "I'll pivot to that") without handing it to Pi (measured: 8 of 28). Words it does not hand off within 3.5 s now go to the running task as a remark, framed so that Pi applies them only if they change the task and otherwise ignores them. Measured: 10 of 10 corrections delivered; small talk said while Pi works was ignored.
+- **The voice does not claim work that was not done.** If something you said while Pi worked never reached it (Pi finished first), the result is read out with a note, and the voice says which part was not done instead of claiming it ("I haven't listed the tests folder").
+- **A stop that did not reach Pi is not claimed.** If GPT-Live says it is stopping without handing the stop to Pi, the voice now says plainly that the task is still running and asks you to say stop again. pi-voice never cancels on its own.
+
+### Testing
+
+- `scripts/live` has scenarios for small talk, stopping a task that writes a file, a dropped connection, a dead connection, muting, a stuck session, small talk while Pi works, and corrections near the end of a task. The harness now passes spoken turns to Pi as the chat does, and keeps your working notes out of Pi's scratch copy.
+- `--record DIR` writes each live run as a tape of GPT-Live's frames (audio reduced to its length, no instructions or briefing), and `tests/replay.test.mjs` replays local tapes offline, skipping when there are none.
+- The GPT-Live wire protocol is in its own module (`openai-live-wire.ts`), separate from the timing and hand-off logic.
+
+### Project
+
 - The voice's default instructions no longer mention Basic Memory notes, a tool from the author's own setup.
 - The README says plainly what is kept: audio goes to GPT-Live and is never saved, and spoken turns are saved in the Pi session like typed messages. It no longer claims Pi has permission prompts.
 - Development setup runs `npm install` before `npm test`, so the tests find Pi's packages in a fresh clone.
