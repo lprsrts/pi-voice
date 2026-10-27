@@ -1,0 +1,3 @@
+# pi-voice never cancels on its own
+
+GPT-Live can say "Stopping it" without handing the stop to Pi, while the work goes on. pi-voice does not cancel Pi itself when that happens, even for an exact "stop that": only a stop GPT-Live hands off cancels. Instead, when a stop phrase said while Pi works is not handed off within 3.5 s, the voice is told to say plainly that the task is still running and to ask for the stop again; a late hand-off of the same words still stops it. A client-side cancel was built and worked, and was removed: a conversational "never mind" or a misheard phrase would cancel work the user wanted, and the voice claiming a stop that did not happen was the actual failure to fix.

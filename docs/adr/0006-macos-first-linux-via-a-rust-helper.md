@@ -1,0 +1,3 @@
+# macOS first; Linux through a Rust audio helper
+
+pi-voice launches on macOS only, where Apple's voice processing gives measured echo cancellation on laptop speakers. Linux will use a Rust helper (cpal for devices, sonora, a pure-Rust port of WebRTC's echo canceller) behind the same helper interface, Linux-only at first and headphones first, with macOS keeping its Swift helper. PipeWire's own echo-cancel module was rejected: its playback tools report no playout position and cannot flush on barge-in, which captions and the heard part of an interrupted reply depend on. The helper is built when Linux users ask (issue #1), and it must correct clock drift between playback and capture: in an offline test, 0.5 % drift cut echo cancellation from about 32 dB to 8.5 dB.
