@@ -2,7 +2,7 @@
 // Runs live voice scenarios against real GPT-Live and a real Pi session.
 //
 //   node scripts/live/run.mjs [scenario ...|all] [--audio inject|acoustic|silent]
-//                             [--runs N] [--model provider/id] [--cwd DIR] [--quiet]
+//                             [--runs N] [--model provider/id] [--cwd DIR] [--record DIR] [--quiet]
 //
 // By default Pi works in a disposable copy of this repository, so it can edit
 // files freely; --cwd points it at another project (which it may change).
@@ -18,9 +18,10 @@ const audio = option("audio", "inject");
 const runs = Number(option("runs", "1"));
 const model = option("model", undefined);
 const cwdOption = option("cwd", undefined);
+const recordDir = option("record", undefined);
 const quiet = flag("quiet");
 if (flag("help") || flag("h")) {
-  console.log(`Scenarios:\n${Object.entries(SCENARIOS).map(([name, s]) => `  ${name.padEnd(22)}${s.description}`).join("\n")}\n\nOptions: --audio inject|acoustic|silent  --runs N  --model provider/id  --cwd DIR  --quiet`);
+  console.log(`Scenarios:\n${Object.entries(SCENARIOS).map(([name, s]) => `  ${name.padEnd(22)}${s.description}`).join("\n")}\n\nOptions: --audio inject|acoustic|silent  --runs N  --model provider/id  --cwd DIR  --record DIR  --quiet`);
   process.exit(0);
 }
 if (!["inject", "acoustic", "silent"].includes(audio)) throw new Error(`Unknown --audio ${audio}.`);
@@ -41,7 +42,7 @@ for (const name of names) {
     };
     let r;
     try {
-      r = await runScenario(SCENARIOS[name], { audio, cwd, model, log: print });
+      r = await runScenario(SCENARIOS[name], { audio, cwd, model, log: print, record: recordDir && `${recordDir}/${name}-${run}.jsonl` });
     } catch (error) {
       console.log(`    FAILED TO RUN: ${error instanceof Error ? error.message : error}`);
       summary.push({ name, run, model: model ?? "default", passed: 0, total: 1, latency: undefined });

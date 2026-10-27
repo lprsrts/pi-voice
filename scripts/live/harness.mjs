@@ -82,7 +82,7 @@ function wav(pcm) {
  * playback, scripted mic samples), "acoustic" (turns played aloud and heard by
  * the real mic; voice processing off), or "silent" (no audio devices).
  */
-export async function runScenario(scenario, { audio = "inject", cwd, model, log = () => {} } = {}) {
+export async function runScenario(scenario, { audio = "inject", cwd, model, record, log = () => {} } = {}) {
   const sdkDir = findPiSdk();
   const sdk = await import(join(sdkDir, "dist/index.js"));
   const key = await resolveApiKey(OPENAI_KEY, AbortSignal.timeout(60000));
@@ -109,7 +109,25 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
     aborted: false, results: [], turns: [], voiceSeconds: 0, cwd, t0: 0, frameGaps: [],
   };
   r.t0 = t0;
-  const mark = (kind, data = "") => { const t = (Date.now() - t0) / 1000; r.events.push({ t, kind, data }); log(t, kind, data); return t; };
+  // A recording for offline replay (tests/replay): GPT-Live frames both ways and the
+  // harness's own marks, with audio reduced to its length (no speech is kept).
+  const tape = [];
+  const tapeEvent = (dir, data) => {
+    if (!record || typeof data !== "string") return;
+    const event = JSON.parse(data);
+    if (event.type === "session.input_audio.append") return; // the mic stream; replay does not need it
+    if (typeof event.delta === "string" && /audio/.test(event.type)) event.delta = { bytes: Buffer.from(event.delta, "base64").length };
+    if (typeof event.audio === "string") event.audio = { bytes: Buffer.from(event.audio, "base64").length };
+    if (event.session) event.session = { model: event.session.model }; // instructions and briefing are not kept (the server echoes them too)
+    tape.push({ t: Date.now() - t0, dir, event });
+  };
+  const mark = (kind, data = "") => {
+    const t = (Date.now() - t0) / 1000;
+    r.events.push({ t, kind, data });
+    if (record) tape.push({ t: Date.now() - t0, dir: "mark", kind, data: String(data).slice(0, 400) });
+    log(t, kind, data);
+    return t;
+  };
 
   // The shipped talk session (talk.ts): one bridge, voice connections under it,
   // auto-pause and resume. Only the Pi host and the audio are the harness's.
@@ -183,6 +201,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
       socket = this;
       let line = "", last;
       this.addEventListener("message", message => {
+        tapeEvent("in", message.data);
         const e = JSON.parse(message.data);
         // Gaps between server frames, to size a dead-connection watchdog.
         const now = Date.now();
@@ -201,7 +220,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
     send(data) {
       if (typeof data === "string" && data.includes('"type":"session.close"')) this.closeSent = true;
       if (typeof data === "string" && data.includes("did not reach this task")) mark("voice.not-done-note", JSON.parse(data).content.slice(0, 100));
-      if (!this.blackholed) super.send(data);
+      if (!this.blackholed) { tapeEvent("out", data); super.send(data); }
     }
     // A black-holed link: the socket stays open, but nothing arrives and nothing leaves, as when Wi-Fi goes or the Mac sleeps.
     addEventListener(type, listener, options) {
@@ -259,5 +278,6 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
   globalThis.WebSocket = OrigWS;
   if (!session.isIdle) { await session.abort(); mark("pi.abort", "end of scenario"); }
   session.dispose();
+  if (record) { mkdirSync(dirname(record), { recursive: true }); writeFileSync(record, tape.map(entry => JSON.stringify(entry)).join("\n") + "\n"); }
   return r;
 }
