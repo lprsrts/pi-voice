@@ -171,7 +171,12 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, reco
         closed: () => { r.voiceSeconds += (Date.now() - connectedAt) / 1000; mark("voice.closed"); hooks.closed(); },
       }, audioFactory);
       const notify = voice.notify.bind(voice);
-      voice.notify = text => { r.results.push(text); resultAt = Date.now(); mark("result", text.slice(0, 160)); notify(text); };
+      voice.notify = text => {
+        r.results.push(text); resultAt = Date.now(); mark("result", text.slice(0, 160));
+        // A stuck session (seen live): from the result on, nothing gets through, so the update is never acknowledged.
+        if (stuckOnResult) { stuckOnResult = false; mark("net.stuck"); if (socket) socket.blackholed = true; }
+        notify(text);
+      };
       return voice;
     },
     getKey: async () => key,
@@ -195,6 +200,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, reco
   // Watch GPT-Live's own events next to pi-voice's handling.
   const OrigWS = globalThis.WebSocket;
   let socket;
+  let stuckOnResult = false;
   globalThis.WebSocket = class extends OrigWS {
     constructor(...args) {
       super(...args);
@@ -234,6 +240,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, reco
     mark("talk.start", `${index + 1}/${scenario.sessions.length}`);
     const speaking = voiceSession.turns.filter(turn => turn.say);
     for (const turn of speaking) turn.pcm = await speech(key, turn.say);
+    stuckOnResult = !!voiceSession.stuckOnResult;
     talk.open();
     // A scripted network drop: the socket closes abnormally, as a lost connection would.
     const timers = voiceSession.turns.filter(turn => !turn.say).map(turn => setTimeout(() => {

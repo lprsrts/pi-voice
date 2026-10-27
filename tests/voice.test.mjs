@@ -519,6 +519,25 @@ test('the GPT-Live wire declares a live session lost after 10 s without a frame,
   } finally { globalThis.WebSocket = originalWS; }
 });
 
+test('the GPT-Live wire declares a session lost when an update goes unacknowledged for 8 s', async t => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    t.mock.timers.enable({ apis: ['setInterval', 'Date'] });
+    const { wire, socket, calls } = await startWire();
+    wire.say('started', 'd1', 'context');
+    t.mock.timers.tick(700);
+    socket.event({ type: 'session.thinking.appended', delegation_id: 'd1' });
+    for (let i = 0; i < 12; i++) { t.mock.timers.tick(900); socket.event({ type: 'session.output_audio.delta', delta: 'AA==' }); }
+    assert.equal(calls.some(c => c[0] === 'lost'), false, 'acknowledged: fine');
+    wire.say('I finished the task.', 'd1', 'result');
+    for (let i = 0; i < 8; i++) { t.mock.timers.tick(900); socket.event({ type: 'session.output_audio.delta', delta: 'AA==' }); }
+    assert.equal(calls.some(c => c[0] === 'lost'), false, 'not yet');
+    for (let i = 0; i < 2; i++) { t.mock.timers.tick(900); socket.event({ type: 'session.output_audio.delta', delta: 'AA==' }); }
+    assert.deepEqual(calls.find(c => c[0] === 'lost'), ['lost', 'OpenAI GPT-Live stopped taking updates (none acknowledged for 8 s).'], 'frames still arrive, but nothing is taken in');
+    wire.close();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
 const settle = () => new Promise(r => setTimeout(r, 400)); // trailing transcript fragments get 350 ms
 const lastOf = (socket, type) => socket.sent.filter(e => e.type === type).at(-1);
 
@@ -1185,6 +1204,33 @@ test('a lost connection while Pi works pauses voice, and Pi\'s result brings it 
   assert.match(toasts.at(-1)[1], /\/talk start to talk again/);
   voices[0].hooks.dropped('stale');
   assert.equal(toasts.at(-1)[1].includes('stale'), false, 'an old connection is ignored');
+  talk.end();
+});
+
+test('a connection lost before its result was said reconnects once to say it', async () => {
+  const { talk, voices, toasts, control } = fakeTalk({ idle: true });
+  talk.open();
+  await voices[0].ready();
+  talk.deliver('I finished the task "count files". My answer: 15.');
+  assert.deepEqual(voices[0].said, ['I finished the task "count files". My answer: 15.']);
+  voices[0].hooks.dropped('OpenAI GPT-Live stopped taking updates (none acknowledged for 8 s).');
+  assert.equal(voices.length, 2, 'reconnects at once, though Pi is idle');
+  assert.match(toasts.at(-1)[1], /Reconnecting to say the result\.$/);
+  await voices[1].ready();
+  assert.deepEqual(voices[1].said, ['I finished the task "count files". My answer: 15.']);
+  // Lost again before saying it: no second reconnect (a failing service must not loop or bill).
+  voices[1].hooks.dropped('OpenAI GPT-Live stopped taking updates (none acknowledged for 8 s).');
+  assert.deepEqual([voices.length, talk.connected], [2, false]);
+  assert.match(toasts.at(-1)[1], /\/talk start to talk again/);
+  // Once a result is heard, a later one gets its own retry.
+  talk.open();
+  await voices[2].ready();
+  talk.deliver('A later result.');
+  voices[2].hooks.state('speaking');
+  talk.deliver('Another result.');
+  voices[2].hooks.dropped('lost');
+  assert.equal(voices.length, 4);
+  control.idle = true;
   talk.end();
 });
 

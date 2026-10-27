@@ -51,6 +51,10 @@ export class TalkSession {
   private speaking = false;
   private timer?: ReturnType<typeof setInterval>;
   private ended = false;
+  // The last result given to the voice until it is heard (the voice speaks), and whether it
+  // was already given again after a lost connection: once, so a failing service cannot loop.
+  private unheard?: { text: string; answer?: string };
+  private redelivered = false;
 
   constructor(host: TalkHost) {
     this.host = host;
@@ -79,7 +83,7 @@ export class TalkSession {
   /** A result or prompt notice from Pi: said now, or when voice is next open. */
   deliver(text: string, answer?: string) {
     if (this.ended) return;
-    if (this.voice && this.ready) { this.voice.notify(text, answer); return; }
+    if (this.voice && this.ready) { this.voice.notify(text, answer); this.unheard = { text, answer }; return; }
     this.pending = [...this.pending.slice(-(PENDING_LIMIT - 1)), { text, answer }];
     this.host.changed?.();
     if (this.voice) return; // still connecting: said once it is ready
@@ -100,6 +104,7 @@ export class TalkSession {
         // Silence is counted from when the voice stops talking, not from before it spoke.
         if (this.speaking && state !== "speaking") this.lastActivity = this.now();
         this.speaking = state === "speaking";
+        if (this.speaking && this.unheard) { this.unheard = undefined; this.redelivered = false; }
         view.state?.(state);
       },
       samples: (source, samples) => view.samples?.(source, samples),
@@ -112,7 +117,16 @@ export class TalkSession {
       dropped: message => {
         if (this.voice !== voice) return;
         const working = !this.host.control.isIdle();
+        const unheard = this.unheard;
         this.close();
+        // A result given to the lost connection but not yet said: reconnect now and say it.
+        if (unheard && !this.redelivered) {
+          this.redelivered = true;
+          this.pending = [...this.pending, unheard];
+          this.host.notify(`${message} Reconnecting to say the result.`, "warning");
+          this.open();
+          return;
+        }
         this.paused = working;
         this.host.notify(working
           ? `${message} Voice comes back with the result. /talk start to speak sooner.`
@@ -132,7 +146,7 @@ export class TalkSession {
       // Results that arrived while voice was closed or connecting, oldest first.
       const said = this.pending;
       this.pending = [];
-      for (const { text, answer } of said) voice.notify(text, answer);
+      for (const { text, answer } of said) { voice.notify(text, answer); this.unheard = { text, answer }; }
       if (said.length) this.host.changed?.();
     }).catch(error => {
       // Whether this voice is still the current one, before stop() fires closed() and clears it.
@@ -153,6 +167,7 @@ export class TalkSession {
   /** Closes the voice connection; the talk session (bridge, results to say) stays. */
   close() {
     const voice = this.voice;
+    this.unheard = undefined;
     this.voice = undefined;
     this.ready = false;
     this.paused = false;

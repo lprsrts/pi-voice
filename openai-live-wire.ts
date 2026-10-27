@@ -10,6 +10,10 @@ const ENDPOINT = "wss://api.openai.com/v1/live/sessions";
 // dead even if no close came.
 // Muted, GPT-Live sends nothing at all, so the watchdog rests until unmuted.
 const SILENT_LINK_MS = 10000;
+// Every update (commentary/thinking append) is acknowledged with "*.appended", in 0.5–2.1 s
+// (28 recorded). A session that acknowledges none for this long is stuck, even if it still
+// sends the odd frame: measured once, audio stopped and no update was ever taken in.
+const UNACKED_MS = 8000;
 const APPEND_TOKENS = 400; // commentary/thinking accept at most 500 tokens; the estimate is pessimistic, and this leaves margin
 
 /** Node's WebSocket (undici) accepts headers; the browser typings do not know that. */
@@ -42,6 +46,7 @@ export class GptLiveWire {
   private watchdog?: ReturnType<typeof setInterval>;
   private lastFrame = 0;
   private muted = false;
+  private unacked: { kind: string; at: number }[] = [];
   private resolveStart?: () => void;
   private rejectStart?: (error: Error) => void;
 
@@ -89,13 +94,22 @@ export class GptLiveWire {
         this.live = true;
         clearTimeout(this.deadline);
         this.watchdog = setInterval(() => {
-          if (!this.closing && !this.muted && Date.now() - this.lastFrame > SILENT_LINK_MS) this.events.lost(`OpenAI GPT-Live connection lost (no data for ${SILENT_LINK_MS / 1000} s).`);
+          if (this.closing || this.muted) return;
+          if (Date.now() - this.lastFrame > SILENT_LINK_MS) this.events.lost(`OpenAI GPT-Live connection lost (no data for ${SILENT_LINK_MS / 1000} s).`);
+          else if (this.unacked.length && Date.now() - this.unacked[0].at > UNACKED_MS) this.events.lost(`OpenAI GPT-Live stopped taking updates (none acknowledged for ${UNACKED_MS / 1000} s).`);
         }, 1000);
         this.watchdog.unref?.();
         this.events.started();
         this.resolveStart?.();
         this.resolveStart = this.rejectStart = undefined;
         break;
+      case "session.thinking.appended":
+      case "session.commentary.appended": {
+        const kind = event.type.split(".")[1];
+        const i = this.unacked.findIndex(update => update.kind === kind);
+        if (i >= 0) this.unacked.splice(i, 1);
+        break;
+      }
       case "session.output_audio.delta": {
         const pcm = Buffer.from(event.delta, "base64");
         if (pcm.length) this.events.audio(pcm);
@@ -134,6 +148,7 @@ export class GptLiveWire {
 
   /** Tells the model about a delegation: a result it says aloud (it paraphrases), or context it keeps until asked. */
   say(text: string, delegationId: string | null, kind: "result" | "context") {
+    if (this.live && !this.closing) this.unacked.push({ kind: kind === "result" ? "commentary" : "thinking", at: Date.now() });
     this.send({ type: kind === "result" ? "session.commentary.append" : "session.thinking.append", delegation_id: delegationId, content: clipTokens(text, APPEND_TOKENS) });
   }
 

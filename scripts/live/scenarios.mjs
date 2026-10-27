@@ -104,6 +104,16 @@ export const SCENARIOS = {
     },
   },
 
+  "stuck-at-result": {
+    description: "GPT-Live gets stuck as Pi's result is sent (seen live): voice notices, reconnects once, and still says the result.",
+    sessions: [{ seconds: 45, stuckOnResult: true, turns: [{ at: 1.5, say: "How many TypeScript files are in this repository? Just the number." }] }],
+    checks: r => [
+      check("the stuck session was noticed", r.events.some(e => e.kind === "ui.warning" && /Reconnecting to say the result/.test(e.data)), r.events.filter(e => e.kind.startsWith("ui.")).map(e => e.data).join(" | ")),
+      check("the result was said after reconnecting", r.events.some(e => e.kind === "result.heard") && r.voiceLines.some(l => /\b(\d+|(thir|four|fif|six|seven|eigh|nine)teen|twelve|eleven|ten)\b/i.test(l)), said(r)),
+      check("Pi was asked once", r.piRequests.length === 1),
+    ],
+  },
+
   "muted-quiet": {
     description: "Muted for a while, then unmuted to ask something: muting must not look like a dead link.",
     sessions: [{ seconds: 30, turns: [
