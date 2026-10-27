@@ -6,7 +6,7 @@ import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, resolveApiKey } from "./keys.ts";
-import { SPOKEN_ENTRY, SPOKEN_READOUT, SPOKEN_TURN, spokenPart, VOICE_PROMPT, VOICE_REQUEST, type SpokenEntry, type SpokenReadout, type SpokenTurn } from "./pi-bridge.ts";
+import { SPOKEN_ENTRY, SPOKEN_READOUT, SPOKEN_TURN, isSpoken, spokenPart, VOICE_PROMPT, type SpokenEntry, type SpokenReadout, type SpokenTurn } from "./pi-bridge.ts";
 import { answerBlocks, speakable, SpokenChat, spokenLines } from "./chat.ts";
 import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
 import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
@@ -327,7 +327,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   // for it (chat.ts): its text is hidden, and so is a voice run's text while it
   // streams (an answer that turns out to stay shows when it is finished).
   pi.registerMarkdownTransformer((markdown, context) => {
-    if (context.messageType === "user" && markdown.startsWith(VOICE_REQUEST)) return spokenPart(markdown).trim();
+    if (context.messageType === "user" && isSpoken(markdown)) return spokenPart(markdown).trim();
     if (context.messageType === "assistant" && (chat.hidden(markdown) || (context.isStreaming && talk?.bridge.voiceRun))) return "";
     return markdown;
   });

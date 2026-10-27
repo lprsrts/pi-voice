@@ -38,7 +38,16 @@ export const VOICE_REQUEST = "Voice request (speech transcript; may contain reco
 /** Introduces the spoken conversation a voice request refers to. */
 export const CONVERSATION_MARK = "\n\nWhat we said since my last request, oldest first:\n";
 /** The user's words of a request, without the voice framing, for status and notices. */
-export const spokenPart = (request: string) => request.startsWith(VOICE_REQUEST) ? request.slice(VOICE_REQUEST.length).split(CONVERSATION_MARK)[0] : request;
+// Words said while Pi worked that GPT-Live did not hand off: Pi decides whether they change the task.
+// Measured: "ignore it and carry on" let a model reply to small talk after the task (1 of 3 on kimi-k3).
+export const VOICE_REMARK = "Said while you worked (speech transcript; the voice did not hand this off, so it may be only a remark). If it corrects or adds to the current task, apply it. Otherwise ignore it completely: no tools and no reply about it, and keep your final answer about the task. It was: ";
+const spokenPrefix = (text: string) => [VOICE_REQUEST, VOICE_REMARK].find(prefix => text.startsWith(prefix));
+/** A message the voice sent to Pi (a request, or a remark said while it worked). */
+export const isSpoken = (text: string) => !!spokenPrefix(text);
+export const spokenPart = (request: string) => {
+  const prefix = spokenPrefix(request);
+  return prefix ? request.slice(prefix.length).split(CONVERSATION_MARK)[0] : request;
+};
 
 /** Text for the voice to say: Markdown links as their text, bare URLs as "(link)" (never read out, and token-heavy). */
 export function forSpeech(text: string): string {
@@ -120,7 +129,7 @@ export function sessionBriefing(entries: readonly any[], options: { cwd?: string
     if (entry?.type !== "message") continue;
     const user = userText(entry.message);
     if (user) {
-      const spoken = user.startsWith(VOICE_REQUEST);
+      const spoken = isSpoken(user);
       if (spoken) spokenRequests.add(spokenPart(user).replace(/\s+/g, " ").trim());
       turns.push(`- The user (${spoken ? "spoken" : "typed"}): ${clip(spokenPart(user).replace(/\s+/g, " "), 300)}`);
       continue;

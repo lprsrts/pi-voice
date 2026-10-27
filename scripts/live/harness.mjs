@@ -200,6 +200,7 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
     }
     send(data) {
       if (typeof data === "string" && data.includes('"type":"session.close"')) this.closeSent = true;
+      if (typeof data === "string" && data.includes("did not reach this task")) mark("voice.not-done-note", JSON.parse(data).content.slice(0, 100));
       if (!this.blackholed) super.send(data);
     }
     // A black-holed link: the socket stays open, but nothing arrives and nothing leaves, as when Wi-Fi goes or the Mac sleeps.

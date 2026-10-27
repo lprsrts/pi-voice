@@ -7,7 +7,7 @@ import { join } from 'node:path';
 // Hermetic provider config: never pick up the developer's own overrides.
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
 import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions, FlapBoard, FLAP_SETTLE_MS, FLAP_GLOW_MS, wrapWords } from '../protocol.ts';
-import { PiBridge, describeTool, forSpeech, VOICE_REQUEST, CONVERSATION_MARK, sessionBriefing, SPOKEN_ENTRY, SPOKEN_MESSAGE, SPOKEN_TURN, SPOKEN_READOUT, spokenContent } from '../pi-bridge.ts';
+import { PiBridge, describeTool, forSpeech, VOICE_REQUEST, VOICE_REMARK, isSpoken, spokenPart, CONVERSATION_MARK, sessionBriefing, SPOKEN_ENTRY, SPOKEN_MESSAGE, SPOKEN_TURN, SPOKEN_READOUT, spokenContent } from '../pi-bridge.ts';
 import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
@@ -642,6 +642,118 @@ test('a short reply reaches Pi with what the voice had just said, when Pi\'s con
     assert.match(calls[1][1].request, /Sure\.\n\nWhat we said since my last request, oldest first:\n- You \(voice\): Want me to run the linter as well\?$/);
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('words GPT-Live does not delegate while Pi works are noted once with the result, so it is not read out as if they were done', async t => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let busy = false;
+    const calls = [];
+    const { voice, socket } = await startLive({ busy: () => busy, tool: (name, args) => { calls.push([name, args]); busy = true; return { status: 'started' }; } });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'List the providers folder.', start_ms: 0, end_ms: 1000 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 900, delegation: { id: 'd1' } });
+    const sent = socket.sent.length;
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Actually, list the tests folder instead.', start_ms: 2500, end_ms: 4000 });
+    t.mock.timers.tick(10000);
+    assert.equal(socket.sent.length, sent, 'nothing is sent for them before the result');
+    voice.notify('I finished the task "List the providers folder". My answer: one directory, openai-live.');
+    const [note, result] = socket.sent.slice(-2);
+    assert.equal(note.type, 'session.thinking.append');
+    assert.match(note.content, /^While I worked the user said "Actually, list the tests folder instead\.", and it did not reach this task/);
+    assert.equal(note.delegation_id, 'd1');
+    assert.deepEqual([result.type, result.content], ['session.commentary.append', 'I finished the task "List the providers folder". My answer: one directory, openai-live.']);
+    voice.notify('A second update.');
+    assert.equal(socket.sent.at(-1).type, 'session.commentary.append', 'noted once');
+    assert.equal(socket.sent.at(-2).type, 'session.commentary.append');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('a reply is not a hand-off: undelegated words go to Pi once as a remark; delegated, idle, stop and status words do not', async t => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let busy = true;
+    const asked = [];
+    const { voice, socket } = await startLive({ busy: () => busy, tool: (name, args) => { if (name === 'ask_pi') asked.push(args.request); return { status: 'steered' }; } });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Use the tests folder instead.', start_ms: 0, end_ms: 1000 });
+    socket.event({ type: 'session.output_transcript.delta', delta: "I'll pivot to that.", start_ms: 1500, end_ms: 1800 });
+    t.mock.timers.tick(3400);
+    assert.equal(asked.length, 0, 'GPT-Live gets its usual time to delegate');
+    t.mock.timers.tick(200);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0], `${VOICE_REMARK}Use the tests folder instead.`);
+    assert.match(VOICE_REMARK, /apply it\. Otherwise ignore it completely: no tools and no reply/);
+    assert.match(socket.sent.at(-1).content, /went to the running task as a remark/);
+    // GPT-Live delegates the same words late: they are not sent again.
+    socket.event({ type: 'session.delegation.created', offset_ms: 1000, delegation: { id: 'd2' } });
+    t.mock.timers.tick(400);
+    assert.equal(asked.length, 1, 'no double steer');
+    assert.deepEqual([socket.sent.at(-1).content, socket.sent.at(-1).delegation_id], ['Already added to the running task.', 'd2']);
+    // Delegated words, stop and status (GPT-Live's to handle), and words while Pi is idle are not remarked.
+    socket.event({ type: 'session.input_transcript.delta', delta: ' Also run the linter.', start_ms: 6000, end_ms: 7000 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 7000, delegation: { id: 'd3' } });
+    t.mock.timers.tick(400);
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Sure.', start_ms: 7500, end_ms: 7800 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Stop that.', start_ms: 9000, end_ms: 9500 });
+    t.mock.timers.tick(5000);
+    busy = false;
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Okay.', start_ms: 15000, end_ms: 15300 });
+    socket.event({ type: 'session.input_transcript.delta', delta: 'What a day.', start_ms: 16000, end_ms: 17000 });
+    t.mock.timers.tick(5000);
+    assert.deepEqual(asked.map(q => q.slice(0, 20)), ['Said while you worke', 'Voice request (speec']);
+    voice.notify('I finished the task. My answer: done.');
+    assert.match(socket.sent.at(-2).content, /^While I worked the user said "Stop that\.", and it did not reach this task/, 'only the unhandled stop is noted');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('remark edge cases: Pi finishing first, a status question after a correction, and no stale "already added"', async t => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let busy = true;
+    const asked = [];
+    const tool = (name, args) => {
+      if (name === 'pi_status') return { state: 'working', task: 'list providers', elapsed_s: 5 };
+      if (name === 'ask_pi') { asked.push(args.request); return { status: busy ? 'steered' : 'started' }; }
+      return {};
+    };
+    const { voice, socket } = await startLive({ busy: () => busy, tool });
+    // A correction, then a status question that GPT-Live delegates: the correction still goes to Pi.
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Use the tests folder instead.', start_ms: 0, end_ms: 1000 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Noted.', start_ms: 1200, end_ms: 1500 });
+    socket.event({ type: 'session.input_transcript.delta', delta: "How's it going?", start_ms: 2000, end_ms: 2600 });
+    socket.event({ type: 'session.delegation.created', offset_ms: 2600, delegation: { id: 'd1' } });
+    t.mock.timers.tick(4000);
+    assert.equal(asked.length, 1);
+    assert.equal(spokenPart(asked[0]), 'Use the tests folder instead.', 'the status question is not part of the remark');
+    // The result ends the remark: a later empty delegation with Pi idle is not swallowed.
+    voice.notify('I finished the task. My answer: one file.');
+    busy = false;
+    socket.event({ type: 'session.delegation.created', offset_ms: 2600, delegation: { id: 'd2' } });
+    t.mock.timers.tick(400);
+    assert.equal(asked.length, 2, 'the empty delegation is handled as before, not as "already added"');
+    // Pi finishes within the wait: the words are noted with the result, not lost silently.
+    busy = true;
+    socket.event({ type: 'session.input_transcript.delta', delta: ' And skip the docs folder.', start_ms: 9000, end_ms: 10000 });
+    busy = false;
+    t.mock.timers.tick(500);
+    voice.notify('I finished the task. My answer: done.');
+    assert.match(socket.sent.at(-2).content, /^While I worked the user said "And skip the docs folder\.", and it did not reach this task/);
+    t.mock.timers.tick(5000);
+    assert.equal(asked.length, 2, 'nothing is sent once Pi is idle');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('a remark shows in the chat and the briefing as what was said', () => {
+  const remark = `${VOICE_REMARK}Use the tests folder instead.`;
+  assert.equal(isSpoken(remark), true);
+  assert.equal(isSpoken(`${VOICE_REQUEST}List it.`), true);
+  assert.equal(isSpoken('typed text'), false);
+  assert.equal(spokenPart(remark), 'Use the tests folder instead.');
 });
 
 test('while Pi works, "stop" aborts it and a status question is answered without disturbing it', async () => {

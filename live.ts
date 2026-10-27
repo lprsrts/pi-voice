@@ -1,6 +1,6 @@
 import type { AudioPipes } from "./audio.ts";
 import { providerFiles, type ProviderFiles } from "./config.ts";
-import { CONVERSATION_MARK, VOICE_REQUEST } from "./pi-bridge.ts";
+import { CONVERSATION_MARK, VOICE_REMARK, VOICE_REQUEST } from "./pi-bridge.ts";
 import { GptLiveWire } from "./openai-live-wire.ts";
 import { Captions, type CaptionLine, voicedMs, waveform, type VoiceState } from "./protocol.ts";
 
@@ -20,6 +20,16 @@ const DELEGATION_SETTLE_MS = 350;
 // While Pi works, these are handled locally instead of being sent to Pi as messages.
 const STOP_REQUEST = /^(please\s+)?(stop|cancel|abort|halt|never\s?mind|forget it)(\s+(it|that|this|the task|the job|everything|pi|now))*(\s+please)?[.!]*$/i;
 const STATUS_REQUEST = /^(so\s+|and\s+|okay,?\s+|ok,?\s+)?(what('?s| is)\s+(pi|it|he|she)\s+doing|what('?re|\s+are)\s+you\s+(doing|working\s+on|up\s+to)|how('?s| is)\s+it\s+going|how far|(is|are)\s+(it|pi|you)\s+(done|finished)|any\s+(news|progress|update)|status|progress)\b[^.!?]{0,40}[.?!]*$/i;
+
+// GPT-Live sometimes does not delegate words said while Pi works, even a correction it
+// acknowledges ("Noted", "I'll pivot to that"; measured live: 8 of 28 mid-task corrections),
+// then reads out the result as if they were done. Words still not delegated this long after
+// they were said go to Pi as a remark, and Pi decides whether they change the task; its own
+// delegations came 0.8–2.2 s after the words ended (16 runs). Its acknowledgements cannot
+// tell a correction from small talk ("Noted", "Sure" for both), and reminding it drew no
+// delegation (0 of 2). If Pi has finished meanwhile, the result is read out with a note
+// that they were not done.
+const UNANSWERED_MS = 3500;
 
 const CONTEXT_CHARS = 3000;
 // The spoken history: a finished exchange (the user's words, then the voice's
@@ -139,7 +149,9 @@ export class LiveVoice {
   private muted = false;
   // Pi backend: what the user said (input transcript, session clock), how far
   // delegations have consumed it, and the delegation Pi is answering.
-  private heard: { start: number; end: number; text: string; sent?: boolean; busy?: boolean }[] = [];
+  private heard: { start: number; end: number; text: string; sent?: boolean; busy?: boolean; unanswered?: boolean; handled?: boolean }[] = [];
+  private unansweredTimer?: ReturnType<typeof setTimeout>;
+  private remarked = false; // the last words went to Pi as a remark; a late delegation of them is not sent again
   private consumedMs = -1;
   private lastRequest = "";
   private said = "";  // what the voice has said since the user last spoke
@@ -230,7 +242,39 @@ export class LiveVoice {
   }
 
   /** A Pi update GPT-Live should say aloud (it paraphrases commentary), tied to the delegation Pi is answering. */
-  notify(text: string, answer?: string) { this.readout = answer ?? true; this.wire?.say(text, this.delegation ?? null, "result"); }
+  notify(text: string, answer?: string) {
+    this.readout = answer ?? true;
+    // Words GPT-Live ignored that never reached Pi: the result must not be read out as if they were done.
+    clearTimeout(this.unansweredTimer);
+    this.remarked = false;
+    // Marked, or said too recently to be marked (Pi finished first).
+    const lost = this.heard.filter(fragment => fragment.busy && !fragment.sent && !fragment.handled);
+    for (const fragment of lost) fragment.handled = true; // noted once
+    const words = lost.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    if (words) this.wire?.say(`While I worked the user said "${words}", and it did not reach this task: the update that follows is all that was done. If those words asked for something to be done (a correction, an addition, a further step), say in one short sentence which part was not done. If they were thanks, an opinion, or thinking aloud, do not mention them.`, this.delegation ?? null, "context");
+    this.wire?.say(text, this.delegation ?? null, "result");
+  }
+
+  /** Words said while Pi worked that went nowhere: not delegated, not handled as stop or status, not yet marked. */
+  private pendingWords() {
+    return this.heard.filter(fragment => fragment.busy && !fragment.sent && !fragment.handled && !fragment.unanswered);
+  }
+
+  /** Words said while Pi works were not delegated: the next result must not be read out as if they were done. */
+  private unanswered() {
+    if (this.stopped || !this.hooks.busy()) return;
+    const fragments = this.pendingWords();
+    for (const fragment of fragments) fragment.unanswered = true;
+    const words = fragments.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    // Stop and status are GPT-Live's to delegate (handled locally); they are only noted.
+    if (!words || STOP_REQUEST.test(words) || STATUS_REQUEST.test(words)) return;
+    const result = this.hooks.tool("ask_pi", { request: `${VOICE_REMARK}${words}`, when: "now" }) as { status?: string };
+    if (result.status !== "steered") return;
+    for (const fragment of fragments) fragment.sent = true;
+    this.consumedMs = Math.max(this.consumedMs, ...fragments.map(fragment => fragment.end));
+    this.remarked = true;
+    this.wire?.say(`The user's words "${words}" went to the running task as a remark; it applies them only if they change the task. Do not say they were done unless the result says so.`, this.delegation ?? null, "context");
+  }
 
   /** Silent context GPT-Live can use when asked, without speaking it now. */
   context(text: string) { this.wire?.say(text, this.delegation ?? null, "context"); }
@@ -419,8 +463,14 @@ export class LiveVoice {
     this.heardAt = Date.now();
     const last = this.heard.at(-1)?.end ?? 0;
     const from = typeof start === "number" ? start : last, to = typeof end === "number" ? end : from + 1;
-    this.heard = [...this.heard.slice(-79), { start: from, end: to, text, busy: this.hooks.busy() }];
+    const busy = this.hooks.busy();
+    this.heard = [...this.heard.slice(-79), { start: from, end: to, text, busy }];
     if (this.waiting && to >= this.waiting.offset) this.release();
+    if (busy) {
+      clearTimeout(this.unansweredTimer);
+      this.unansweredTimer = setTimeout(() => this.unanswered(), UNANSWERED_MS);
+      this.unansweredTimer.unref?.();
+    }
   }
 
   /** What the user said between two session-clock positions. */
@@ -447,10 +497,13 @@ export class LiveVoice {
     const fresh = this.heard.filter(fragment => fragment.end > this.consumedMs && fragment.start >= this.turnFrom);
     if (fresh.length) this.consumedMs = Math.max(...fresh.map(fragment => fragment.end));
     const words = fresh.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
+    if (!words && this.remarked && this.hooks.busy()) { this.delegation = id; this.wire?.say("Already added to the running task.", id, "context"); return; }
+    this.remarked = false;
     const request = words || this.lastRequest;
     if (!request) { this.wire?.say("No request was heard for this delegation; ask the user to repeat it.", id, "context"); return; }
     this.lastRequest = request;
     const busy = this.hooks.busy();
+    if (busy && (STOP_REQUEST.test(request) || STATUS_REQUEST.test(request))) for (const fragment of fresh) fragment.handled = true;
     if (busy && STOP_REQUEST.test(request)) {
       const result = this.hooks.tool("cancel_pi", {}) as { status?: string };
       this.wire?.say(result.status === "cancelled" ? "I stopped the task." : "Nothing was running.", id, "result");
@@ -502,6 +555,7 @@ export class LiveVoice {
   /** Closes gracefully once the session is live, so billing is finalized. */
   stop() {
     if (this.stopped) return;
+    clearTimeout(this.unansweredTimer);
     this.wire?.close(!!this.audio);
     this.commit();
     this.stopped = true;

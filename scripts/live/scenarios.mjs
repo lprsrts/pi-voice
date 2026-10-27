@@ -114,6 +114,38 @@ export const SCENARIOS = {
     ],
   },
 
+  "chitchat-while-busy": {
+    description: "Small talk and thinking aloud while Pi works: Pi does not act on it, and the result is read out plainly.",
+    sessions: [{ seconds: 36, turns: [
+      { at: 1.5, say: "Run sleep 10 in the shell, then list the files in the providers folder." },
+      { at: 10, say: "Thanks, no rush." },
+      { at: 15, say: "I'm thinking we might also move the tests to vitest someday." },
+    ] }],
+    checks: r => [
+      // Undelegated words may reach Pi as a remark; Pi must not act on small talk.
+      check("no new task and no request steered from small talk", r.events.filter(e => e.kind === "pi.prompt").length === 1 && !r.events.some(e => e.kind === "pi.steer" && /^Voice request/.test(e.data)), r.events.filter(e => /^pi\.(prompt|steer)$/.test(e.kind)).map(e => e.data.slice(0, 50)).join(" | ")),
+      check("Pi did not act on the vitest musing", !r.piTools.some(t => /vitest/i.test(t)) && !r.events.some(e => e.kind === "pi.text" && /vitest/i.test(e.data)), r.events.filter(e => e.kind === "pi.text").map(e => e.data.slice(0, 80)).join(" | ")),
+      check("package.json untouched", !r.piTools.some(t => /^(edit|write)\b/.test(t))),
+      check("the result was read out", r.events.some(e => e.kind === "result.heard"), said(r)),
+      check("no \"not done\" note about small talk", !r.voiceLines.some(l => /vitest|not done|wasn'?t done|didn'?t (do|get)/i.test(l)), said(r)),
+    ],
+  },
+
+  "correction-at-finish": {
+    description: "A correction said just as Pi finishes: it cannot reach the task, so the voice must say that part was not done.",
+    sessions: [{ seconds: 34, turns: [
+      { at: 1.5, say: "Run sleep 6 in the shell, then list the files in the providers folder." },
+      { at: 14, say: "Actually, list the files in the tests folder instead." },
+    ] }],
+    checks: r => {
+      const done = r.results.some(t => /voice\.test|tests/i.test(t));
+      return [
+        check("the voice did not claim work Pi did not do", done || !r.voiceLines.some(l => /tests/i.test(l) && !/not|didn|wasn|haven|yet/i.test(l)), said(r)),
+        check("a missed correction was said to be not done", done || r.voiceLines.some(l => /tests/i.test(l) && /not|didn|wasn|haven|yet/i.test(l)), said(r)),
+      ];
+    },
+  },
+
   "restart-memory": {
     description: "Voice is stopped mid-task and restarted: it must know what it is doing and still report the result.",
     sessions: [
@@ -196,6 +228,8 @@ export const SCENARIOS = {
     checks: r => [
       check("the correction went into the running task", r.events.some(e => e.kind === "pi.steer" && /tests folder/i.test(e.data)), r.events.find(e => e.kind === "pi.steer")?.data?.slice(0, 120)),
       check("the answer follows the correction", r.results.some(t => /voice\.test|tests/i.test(t)), r.results.at(-1)?.slice(0, 200)),
+      // Never claim the correction was done when Pi did not do it.
+      check("the voice did not claim work Pi did not do", r.results.some(t => /voice\.test|tests/i.test(t)) || !r.voiceLines.some(l => /tests folder/i.test(l) && !/not|didn|wasn/i.test(l)), said(r)),
     ],
   },
 };
