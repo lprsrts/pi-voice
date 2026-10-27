@@ -3,6 +3,9 @@
 // checks over what happened: what Pi received and did, what the voice said,
 // and how fast. Every scenario also gets the common checks at the bottom.
 
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
 const said = r => r.voiceLines.join(" ");
 const check = (name, pass, detail = "") => ({ name, pass: !!pass, detail });
 const CONFUSED = /not (entirely )?sure (what|which)|could you clarify|what do you mean|which .{0,40} (are you )?referring|can you (be more specific|clarify)/i;
@@ -14,7 +17,7 @@ export const SCENARIOS = {
     checks: r => [
       check("Pi received the question", r.piRequests.some(q => /typescript/i.test(q))),
       check("Pi ran a tool to answer it", r.piTools.length > 0, r.piTools[0]),
-      check("the voice spoke the result", r.results.length > 0 && /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b/i.test(said(r)), said(r)),
+      check("the voice spoke the result", r.results.length > 0 && /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|(thir|four|fif|six|seven|eigh|nine)teen|(twen|thir|for|fif)ty)\b/i.test(said(r)), said(r)),
       check("answer heard within 6 s of the end of speech", r.turns[0]?.resultHeard !== undefined && answerLatency(r) < 6, `${answerLatency(r)?.toFixed(2)} s`),
     ],
   },
@@ -32,6 +35,40 @@ export const SCENARIOS = {
       check("the voice answered the status question", r.voiceLines.some(l => /sleep|wait|run|command|shell/i.test(l)), said(r)),
       check("\"stop\" aborted the task", r.aborted && r.bridgeCalls.includes("cancel_pi")),
     ],
+  },
+
+  "no-handoff-chitchat": {
+    description: "Thinking aloud and small talk that ask for nothing: none of it may reach Pi as a request.",
+    sessions: [{ seconds: 30, turns: [
+      { at: 1.5, say: "Okay. Hmm, give me a second, I'm just thinking." },
+      { at: 9, say: "I had way too much coffee this morning." },
+      { at: 17, say: "Right, that makes sense. Thanks." },
+    ] }],
+    checks: r => [
+      check("nothing was handed to Pi", r.piRequests.length === 0, r.piRequests.map(q => q.slice(0, 120)).join(" | ")),
+      check("Pi ran no tools", r.piTools.length === 0, r.piTools.join(" | ")),
+      check("the voice replied", r.voiceLines.length > 0, said(r)),
+    ],
+  },
+
+  "cancel-mid-write": {
+    description: "Stopping a task that is writing a file: the writes must stop when the voice says it stopped.",
+    sessions: [{ seconds: 34, turns: [
+      { at: 1.5, say: "Run a shell loop that appends the numbers one to forty to count.txt, one number per second." },
+      { at: 15, say: "Stop that." },
+    ] }],
+    checks: r => {
+      const file = join(r.cwd, "count.txt");
+      const lines = existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").length : 0;
+      const abortAt = r.events.find(e => e.kind === "pi.settled" && e.data === "aborted")?.t;
+      const lastWrite = existsSync(file) ? (statSync(file).mtimeMs - r.t0) / 1000 : undefined;
+      return [
+        check("the loop started writing", lines > 0, `${lines} lines`),
+        check("\"stop\" aborted the task", r.aborted && r.bridgeCalls.includes("cancel_pi")),
+        check("no write landed more than 2 s after the abort", abortAt !== undefined && lastWrite !== undefined && lastWrite - abortAt < 2, `abort ${abortAt?.toFixed(1)} s, last write ${lastWrite?.toFixed(1)} s, ${lines} lines`),
+        check("the loop did not run to the end", lines < 40, `${lines} lines`),
+      ];
+    },
   },
 
   "restart-memory": {
@@ -63,7 +100,7 @@ export const SCENARIOS = {
       return [
         check("no files were changed while the user was only explaining", earlyEdits.length === 0, earlyEdits.map(e => e.data).join(" | ")),
         check("the question reached Pi", !!asked),
-        check("with the explanation it refers to (or Pi already had it)", /delegate/i.test(asked) || r.piRequests.some(q => /delegate method/i.test(q) && !/single line/i.test(q)), asked.slice(0, 300)),
+        check("with the explanation it refers to (or Pi already had it)", /delegate/i.test(asked) || r.piRequests.some(q => /delegate method/i.test(q) && !/single line/i.test(q)) || r.spoken.some(line => /^user: .*delegate method/i.test(line)), asked.slice(0, 300)),
         // A missing answer is a timeout, reported by "the voice answered" below.
         check("Pi was not confused about what was meant", !CONFUSED.test(answer), answer.slice(0, 200)),
         check("a question about a change was answered, not acted on", !r.events.some(e => e.kind === "pi.tool" && /^(edit|write)\b/.test(e.data)), r.events.filter(e => e.kind === "pi.tool" && /^(edit|write)\b/.test(e.data)).map(e => e.data.slice(0, 80)).join(" | ")),

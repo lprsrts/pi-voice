@@ -17,7 +17,7 @@ const FRAME = 960; // 20 ms of PCM16 at 24 kHz
 
 const { resolveApiKey, OPENAI_KEY } = await import(`${REPO}/keys.ts`);
 const { LiveVoice, audibleFrame } = await import(`${REPO}/live.ts`);
-const { VOICE_PROMPT, assistantText } = await import(`${REPO}/pi-bridge.ts`);
+const { VOICE_PROMPT, SPOKEN_MESSAGE, assistantText, spokenContent } = await import(`${REPO}/pi-bridge.ts`);
 const { TalkSession } = await import(`${REPO}/talk.ts`);
 const { AudioPipes } = await import(`${REPO}/audio.ts`);
 const { ensureHelper } = await import(`${REPO}/native.ts`);
@@ -44,7 +44,7 @@ export function findPiSdk() {
 /** A disposable copy of a project, so Pi can change files freely. */
 export function scratchCopy(source) {
   const dir = mkdtempSync(join(tmpdir(), "pi-voice-live-"));
-  cpSync(source, dir, { recursive: true, filter: path => !/\/node_modules(\/|$)/.test(path) });
+  cpSync(source, dir, { recursive: true, filter: path => !/\/(node_modules|docs)(\/|$)/.test(path) });
   return dir;
 }
 
@@ -105,9 +105,10 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
   const t0 = Date.now();
   const r = {
     model: session.model ? `${session.model.provider}/${session.model.id}` : "none",
-    events: [], piRequests: [], piTools: [], bridgeCalls: [], voiceLines: [], heard: [], errors: [], briefings: [],
-    aborted: false, results: [], turns: [], voiceSeconds: 0,
+    events: [], piRequests: [], piTools: [], bridgeCalls: [], voiceLines: [], heard: [], errors: [], briefings: [], spoken: [],
+    aborted: false, results: [], turns: [], voiceSeconds: 0, cwd, t0: 0,
   };
+  r.t0 = t0;
   const mark = (kind, data = "") => { const t = (Date.now() - t0) / 1000; r.events.push({ t, kind, data }); log(t, kind, data); return t; };
 
   // The shipped talk session (talk.ts): one bridge, voice connections under it,
@@ -157,7 +158,13 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
     },
     getKey: async () => key,
     notify: (message, level) => mark(`ui.${level}`, message),
-    view: {},
+    // As the chat does (chat.ts settle): each kept spoken turn joins Pi's conversation as a hidden message.
+    view: { transcript: (role, text, interrupted, answer) => {
+      if (!text || answer) return;
+      r.spoken.push(`${role}: ${text}`);
+      mark("pi.spoken", `${role}: ${text}`);
+      session.sendCustomMessage({ customType: SPOKEN_MESSAGE, content: spokenContent(role, text, interrupted), display: false, details: { role, text } }, { triggerTurn: false }).catch(error => mark("pi.error", error.message));
+    } },
     pauseAfter: () => scenario.pauseAfter ?? { busy: 15, idle: 60 },
   });
   session.subscribe(event => {
@@ -181,8 +188,13 @@ export async function runScenario(scenario, { audio = "inject", cwd, model, log 
         }
         if (e.type === "session.input_transcript.delta") r.heard.push(e.delta);
         if (e.type === "session.delegation.created") mark("delegation", `offset_ms ${e.offset_ms}`);
-        if (e.type === "error") { r.errors.push(JSON.stringify(e.error)); mark("gpt-live.error", JSON.stringify(e.error)); }
+        // pi-voice ignores events once it has closed the session; so does the error check.
+        if (e.type === "error") { if (!this.closeSent) r.errors.push(JSON.stringify(e.error)); mark(this.closeSent ? "gpt-live.error.after-close" : "gpt-live.error", JSON.stringify(e.error)); }
       });
+    }
+    send(data) {
+      if (typeof data === "string" && data.includes('"type":"session.close"')) this.closeSent = true;
+      super.send(data);
     }
   };
 
