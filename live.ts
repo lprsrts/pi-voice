@@ -266,8 +266,17 @@ export class LiveVoice {
     const fragments = this.pendingWords();
     for (const fragment of fragments) fragment.unanswered = true;
     const words = fragments.map(fragment => fragment.text).join("").replace(/\s+/g, " ").trim();
-    // Stop and status are GPT-Live's to delegate (handled locally); they are only noted.
-    if (!words || STOP_REQUEST.test(words) || STATUS_REQUEST.test(words)) return;
+    if (!words) return;
+    // A stop GPT-Live acknowledged but did not delegate (measured acoustically: "Stopping it."
+    // while the work went on). Only GPT-Live stops the work; the voice must not claim it did.
+    // The words stay unconsumed, so a late delegation of them still stops it.
+    if (STOP_REQUEST.test(words)) {
+      for (const fragment of fragments) fragment.handled = true;
+      this.wire?.say(`The user said "${words}", but it did not reach the task: it is still running. Tell them plainly that it has not stopped, and to say stop again.`, this.delegation ?? null, "result");
+      return;
+    }
+    // A missed status question is harmless (the voice answers from its context); it is only noted.
+    if (STATUS_REQUEST.test(words)) return;
     const result = this.hooks.tool("ask_pi", { request: `${VOICE_REMARK}${words}`, when: "now" }) as { status?: string };
     if (result.status !== "steered") return;
     for (const fragment of fragments) fragment.sent = true;

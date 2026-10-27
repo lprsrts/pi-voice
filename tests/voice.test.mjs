@@ -676,7 +676,8 @@ test('a reply is not a hand-off: undelegated words go to Pi once as a remark; de
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     let busy = true;
     const asked = [];
-    const { voice, socket } = await startLive({ busy: () => busy, tool: (name, args) => { if (name === 'ask_pi') asked.push(args.request); return { status: 'steered' }; } });
+    const cancels = [];
+    const { voice, socket } = await startLive({ busy: () => busy, tool: (name, args) => { if (name === 'ask_pi') asked.push(args.request); if (name === 'cancel_pi') { cancels.push(1); return { status: 'cancelled' }; } return { status: 'steered' }; } });
     socket.event({ type: 'session.input_transcript.delta', delta: 'Use the tests folder instead.', start_ms: 0, end_ms: 1000 });
     socket.event({ type: 'session.output_transcript.delta', delta: "I'll pivot to that.", start_ms: 1500, end_ms: 1800 });
     t.mock.timers.tick(3400);
@@ -703,8 +704,34 @@ test('a reply is not a hand-off: undelegated words go to Pi once as a remark; de
     socket.event({ type: 'session.input_transcript.delta', delta: 'What a day.', start_ms: 16000, end_ms: 17000 });
     t.mock.timers.tick(5000);
     assert.deepEqual(asked.map(q => q.slice(0, 20)), ['Said while you worke', 'Voice request (speec']);
+    assert.equal(cancels.length, 0, 'a stop GPT-Live did not delegate is not carried out here');
+    assert.match(socket.sent.filter(e => e.type === 'session.commentary.append').at(-1).content, /^The user said "Stop that\.", but it did not reach the task/);
+    const before = socket.sent.length;
     voice.notify('I finished the task. My answer: done.');
-    assert.match(socket.sent.at(-2).content, /^While I worked the user said "Stop that\.", and it did not reach this task/, 'only the unhandled stop is noted');
+    assert.deepEqual(socket.sent.slice(before).map(e => e.type), ['session.commentary.append'], 'nothing left to note');
+    voice.stop();
+  } finally { globalThis.WebSocket = originalWS; }
+});
+
+test('a stop GPT-Live acknowledges but does not delegate is not carried out here: the voice says it has not stopped, and a late delegation still stops it', async t => {
+  const originalWS = globalThis.WebSocket;
+  try {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const calls = [];
+    const { voice, socket } = await startLive({ busy: () => true, tool: name => { calls.push(name); return { status: name === 'cancel_pi' ? 'cancelled' : 'steered' }; } });
+    t.mock.timers.tick(1000);
+    socket.event({ type: 'session.input_transcript.delta', delta: 'Stop that.', start_ms: 1000, end_ms: 1600 });
+    socket.event({ type: 'session.output_transcript.delta', delta: 'Stopping it.', start_ms: 1800, end_ms: 2400 });
+    t.mock.timers.tick(3400);
+    const before = socket.sent.length;
+    t.mock.timers.tick(200);
+    assert.deepEqual(calls, [], 'nothing is cancelled without GPT-Live');
+    assert.deepEqual(socket.sent.slice(before).map(e => [e.type, e.content]), [['session.commentary.append', 'The user said "Stop that.", but it did not reach the task: it is still running. Tell them plainly that it has not stopped, and to say stop again.']]);
+    socket.event({ type: 'session.delegation.created', offset_ms: 1600, delegation: { id: 'd9' } });
+    t.mock.timers.tick(400);
+    assert.deepEqual(calls, ['cancel_pi'], 'a late delegation of the stop still stops the work');
+    voice.notify('I stopped the task.');
+    assert.equal(socket.sent.at(-2).content.startsWith('While I worked'), false, 'the stop is not noted again');
     voice.stop();
   } finally { globalThis.WebSocket = originalWS; }
 });

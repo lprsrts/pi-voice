@@ -13,7 +13,8 @@ const CONFUSED = /not (entirely )?sure (what|which)|could you clarify|what do yo
 export const SCENARIOS = {
   "quick-answer": {
     description: "A one-step question about the project, answered by running a command.",
-    sessions: [{ seconds: 20, turns: [{ at: 1.5, say: "How many TypeScript files are in this repository? Just the number." }] }],
+    // Long enough for acoustic timing (speech through the air is slower to hand off); the latency check is separate.
+    sessions: [{ seconds: 30, turns: [{ at: 1.5, say: "How many TypeScript files are in this repository? Just the number." }] }],
     checks: r => [
       check("Pi received the question", r.piRequests.some(q => /typescript/i.test(q))),
       check("Pi ran a tool to answer it", r.piTools.length > 0, r.piTools[0]),
@@ -67,6 +68,8 @@ export const SCENARIOS = {
         check("\"stop\" aborted the task", r.aborted && r.bridgeCalls.includes("cancel_pi")),
         check("no write landed more than 2 s after the abort", abortAt !== undefined && lastWrite !== undefined && lastWrite - abortAt < 2, `abort ${abortAt?.toFixed(1)} s, last write ${lastWrite?.toFixed(1)} s, ${lines} lines`),
         check("the loop did not run to the end", lines < 40, `${lines} lines`),
+        // A stop GPT-Live did not hand off must not be claimed (seen acoustically: "Stopping it." while it kept writing).
+        check("the voice never claimed a stop that did not happen", r.aborted || !r.voiceLines.some(l => /\bstop(ped|ping)?\b/i.test(l) && !/\b(not|haven'?t|hasn'?t|didn'?t)\b/i.test(l)), said(r)),
       ];
     },
   },
@@ -150,7 +153,8 @@ export const SCENARIOS = {
     description: "Voice is stopped mid-task and restarted: it must know what it is doing and still report the result.",
     sessions: [
       { seconds: 12, turns: [{ at: 1.5, say: "Run sleep 25 in the shell, then tell me how long it took." }] },
-      { seconds: 30, turns: [{ at: 2, say: "What are you working on right now?" }] },
+      // Autopause may close it while Pi works; the result reopens it and needs time to be said.
+      { seconds: 40, turns: [{ at: 2, say: "What are you working on right now?" }] },
     ],
     checks: r => [
       check("the second voice session was briefed on the running task", /still working on "[^"]*sleep/i.test(r.briefings[1] ?? ""), (r.briefings[1] ?? "").split("\n").at(-1)),
