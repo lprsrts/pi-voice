@@ -8,7 +8,7 @@ import { join } from 'node:path';
 process.env.PI_VOICE_CONFIG_DIR = join(tmpdir(), 'pi-voice-test-no-overrides');
 import { PcmFramer, waveform, dominantFrequency, clipTokens, phraseAt, formatCaption, voicedMs, Captions, FlapBoard, FLAP_SETTLE_MS, FLAP_GLOW_MS, wrapWords } from '../protocol.ts';
 import { PiBridge, describeTool, forSpeech, VOICE_REQUEST, VOICE_REMARK, isSpoken, spokenPart, CONVERSATION_MARK, sessionBriefing, SPOKEN_ENTRY, SPOKEN_MESSAGE, SPOKEN_TURN, SPOKEN_READOUT, spokenContent } from '../pi-bridge.ts';
-import { resolveApiKey, apiKeyStatus, provisionCommand, OPENAI_KEY } from '../keys.ts';
+import { resolveApiKey, apiKeyStatus, provisionCommand, chatgptLoginHint, OPENAI_KEY } from '../keys.ts';
 // A neutral short key for the keychain tests (OpenAI keys are the long kind).
 const TEST_KEY = { service: 'test-api-key', env: 'PI_VOICE_TEST_API_KEY', label: 'Test API key' };
 import { LiveVoice, liveSessionConfig, audibleFrame, describeStatus, conversationContext, heardPart, LATE_WORDS } from '../live.ts';
@@ -123,6 +123,31 @@ test('status reports the source without ever reading the secret', async () => {
     return { stdout: '', stderr: '' };
   }}), /present/);
   assert.match(await apiKeyStatus(TEST_KEY, { platform: 'darwin', call: async () => { throw Object.assign(new Error('nf'), { code: 44 }); } }), /add-generic-password/);
+});
+
+// Pi's Sign in with ChatGPT login (provider openai, OAuth) is refused by GPT-Live (ADR-0007):
+// it is never used, but a missing key says why it is not.
+test('a Pi ChatGPT login is named when the key is missing, and never read', async () => {
+  const asked = [];
+  const registry = { isUsingOAuth: model => { asked.push(model.provider); return model.provider === 'openai'; }, getProviderAuth: () => { throw new Error('the token must not be read'); } };
+  const hint = chatgptLoginHint(registry);
+  assert.deepEqual(asked, ['openai']);
+  assert.match(hint, /Sign in with ChatGPT.*API key/);
+  assert.equal(chatgptLoginHint({ isUsingOAuth: () => false }), undefined); // API-key login or none
+  assert.equal(chatgptLoginHint(undefined), undefined);
+  assert.equal(chatgptLoginHint({ isUsingOAuth: () => { throw new Error('older Pi'); } }), undefined);
+  delete process.env.PI_VOICE_TEST_API_KEY;
+  const missing = async () => { throw Object.assign(new Error('nf'), { code: 44 }); };
+  await assert.rejects(() => resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: missing, hint }), error => /add-generic-password/.test(error.message) && error.message.endsWith(hint));
+  await assert.rejects(() => resolveApiKey(TEST_KEY, signal, { platform: 'linux', hint }), error => error.message.endsWith(hint));
+  assert.match(await apiKeyStatus(TEST_KEY, { platform: 'darwin', call: missing, hint }), /missing[\s\S]*Sign in with ChatGPT/);
+  // A key that is present wins; the hint is not shown.
+  assert.doesNotMatch(await apiKeyStatus(TEST_KEY, { platform: 'darwin', call: async () => ({ stdout: '', stderr: '' }), hint }), /ChatGPT/);
+  process.env.PI_VOICE_TEST_API_KEY = 'sk_env_override';
+  assert.equal(await resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: missing, hint }), 'sk_env_override');
+  delete process.env.PI_VOICE_TEST_API_KEY;
+  // A denied keychain read is not a missing key: no hint.
+  await assert.rejects(() => resolveApiKey(TEST_KEY, signal, { platform: 'darwin', call: async () => { throw Object.assign(new Error('x'), { stderr: 'User interaction is not allowed.' }); }, hint }), error => !error.message.includes('ChatGPT'));
 });
 
 test('long keys provision through the clipboard and a 128-character key is reported as truncated', async () => {

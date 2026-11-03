@@ -115,6 +115,8 @@ Set `OPENAI_API_KEY`, or store the key in your login keychain as `openai-api-key
 security add-generic-password -U -s "openai-api-key" -a "$USER" -l "OpenAI API key" -w "$(pbpaste)" && pbcopy </dev/null
 ```
 
+pi-voice reads the key only from these two places, not from Pi's own `/login`. Pi's Sign in with ChatGPT login (a choice under `/login openai`) does not replace the key: OpenAI refuses that login's token for GPT-Live ([ADR-0007](docs/adr/0007-pi-chatgpt-login-is-not-a-voice-credential.md)). If you have it and no key, `/talk check` and `/talk start` say so.
+
 Keys are read only when a session starts and are never logged. While voice is on, your microphone audio goes to OpenAI's GPT-Live. pi-voice never saves audio. What you and the voice say is kept in the Pi session, like typed messages, so it comes back when you resume; pi-voice writes nothing else.
 
 ## Settings

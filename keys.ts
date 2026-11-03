@@ -16,6 +16,25 @@ export type KeySpec = {
 
 export const OPENAI_KEY: KeySpec = { service: "openai-api-key", env: "OPENAI_API_KEY", label: "OpenAI API key", long: true };
 
+/** The part of Pi's model registry that says how a provider is signed in, without reading the secret. */
+export type LoginProbe = { isUsingOAuth(model: { provider: string }): boolean };
+
+/**
+ * Pi's "Sign in with ChatGPT" login (one choice under /login openai) cannot stand in for the API key: GPT-Live
+ * rejects its token (401 rejected_by_access_enforcement), the Realtime API takes the connection
+ * but fails every response, and the Responses API allows it only for Codex models (probed
+ * 2026-11-03; ADR-0007). When that login is set up, a missing key says so instead of leaving
+ * the user to wonder why it is not used.
+ */
+export function chatgptLoginHint(registry: LoginProbe | undefined): string | undefined {
+  try {
+    if (!registry?.isUsingOAuth({ provider: "openai" })) return undefined;
+  } catch {
+    return undefined;
+  }
+  return "Pi's Sign in with ChatGPT login (under /login openai) does not work for voice: OpenAI does not accept it for GPT-Live, so voice needs an API key here (a key saved with Pi's /login is not read).";
+}
+
 /** The interactive prompt truncates at 128 characters, so long keys go through the clipboard. */
 export function provisionCommand(spec: KeySpec): string {
   const base = `security add-generic-password -U -s "${spec.service}" -a "$USER" -l "${spec.label}" -w`;
@@ -40,13 +59,14 @@ function failDetail(error: unknown): { code?: number; stderr: string } {
 export async function resolveApiKey(
   spec: KeySpec,
   signal: AbortSignal,
-  options: { platform?: NodeJS.Platform; call?: SecurityCall } = {},
+  options: { platform?: NodeJS.Platform; call?: SecurityCall; hint?: string } = {},
 ): Promise<string> {
   const override = process.env[spec.env]?.trim();
   if (override) return override;
   const provision = provisionCommand(spec);
+  const hint = options.hint ? `\n${options.hint}` : "";
   if ((options.platform ?? process.platform) !== "darwin") {
-    throw new Error(`No ${spec.label}: no keychain on this platform. Set ${spec.env}.`);
+    throw new Error(`No ${spec.label}: no keychain on this platform. Set ${spec.env}.${hint}`);
   }
   const call = options.call ?? defaultCall;
   let stdout: string;
@@ -56,7 +76,7 @@ export async function resolveApiKey(
   } catch (error) {
     const { code, stderr } = failDetail(error);
     if (code === 44 || /could not be found/i.test(stderr)) {
-      throw new Error(`No ${spec.label}: add Keychain item "${spec.service}" by running this in your terminal (the key never enters shell history):\n${provision}`);
+      throw new Error(`No ${spec.label}: add Keychain item "${spec.service}" by running this in your terminal (the key never enters shell history):\n${provision}${hint}`);
     }
     if (/refused access|interaction is not allowed/i.test(stderr)) {
       throw new Error("Keychain read was denied or unavailable (headless or SSH session?). Retry from a GUI terminal and allow access.");
@@ -74,17 +94,18 @@ export async function resolveApiKey(
 }
 
 /** Reports the API-key source for /talk check without reading the secret. */
-export async function apiKeyStatus(spec: KeySpec, options: { platform?: NodeJS.Platform; call?: SecurityCall } = {}): Promise<string> {
+export async function apiKeyStatus(spec: KeySpec, options: { platform?: NodeJS.Platform; call?: SecurityCall; hint?: string } = {}): Promise<string> {
   const override = process.env[spec.env]?.trim();
   if (override) return `env override ${spec.env}`;
-  if ((options.platform ?? process.platform) !== "darwin") return `missing (no keychain on this platform; set ${spec.env})`;
+  const hint = options.hint ? `\n  ${options.hint}` : "";
+  if ((options.platform ?? process.platform) !== "darwin") return `missing (no keychain on this platform; set ${spec.env})${hint}`;
   const call = options.call ?? defaultCall;
   try {
     await call(["find-generic-password", "-s", spec.service], { timeout: 10000, signal: AbortSignal.timeout(10000), maxBuffer: 4096 });
     return `keychain "${spec.service}" present`;
   } catch (error) {
     const { code, stderr } = failDetail(error);
-    if (code === 44 || /could not be found/i.test(stderr)) return `missing — run in a terminal: ${provisionCommand(spec)}`;
+    if (code === 44 || /could not be found/i.test(stderr)) return `missing — run in a terminal: ${provisionCommand(spec)}${hint}`;
     return "unknown (keychain query failed; /talk start will surface the reason)";
   }
 }

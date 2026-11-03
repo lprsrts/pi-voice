@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
-import { apiKeyStatus, resolveApiKey } from "./keys.ts";
+import { apiKeyStatus, chatgptLoginHint, resolveApiKey, type LoginProbe } from "./keys.ts";
 import { SPOKEN_ENTRY, SPOKEN_READOUT, SPOKEN_TURN, isSpoken, spokenPart, VOICE_PROMPT, type SpokenEntry, type SpokenReadout, type SpokenTurn } from "./pi-bridge.ts";
 import { answerBlocks, speakable, SpokenChat, spokenLines } from "./chat.ts";
 import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
@@ -37,6 +37,11 @@ const PREVIEW: Record<PreviewStep, { facts: BarFacts; muted?: boolean; voice?: "
 function modelName(ctx: ExtensionContext): string {
   const model = ctx.model as { provider?: string; id?: string; name?: string } | undefined;
   return model ? `${model.provider ? `${model.provider}/` : ""}${model.id ?? model.name ?? "model"}` : "no model selected";
+}
+
+/** Why Pi's own OpenAI login is not used, when it is set up (keys.ts). */
+function loginHint(ctx: ExtensionContext): string | undefined {
+  return chatgptLoginHint(ctx.modelRegistry as unknown as LoginProbe | undefined);
 }
 
 /** Realtime voice front end for Pi, plus a visual preview. Nothing starts automatically. */
@@ -217,7 +222,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`,
       `voice: ${PROVIDER.label}`,
       `backend: this Pi session (${modelName(ctx)}; change it with /model)`,
-      `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key)}`,
+      `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key, { hint: loginHint(ctx) })}`,
       ...settingsLines(),
       `shortcuts (${keybindingsPath()}):`,
       ...shortcutLines(shortcuts),
@@ -374,7 +379,7 @@ export default function voicePreview(pi: ExtensionAPI) {
         }, helper!));
       },
       // The helper build runs before the network deadline, like the keychain read.
-      getKey: async signal => { helper = await nativeHelper(ctx, signal); return resolveApiKey(PROVIDER.key, signal); },
+      getKey: async signal => { helper = await nativeHelper(ctx, signal); return resolveApiKey(PROVIDER.key, signal, { hint: loginHint(ctx) }); },
       notify: (message, level) => ctx.ui.notify(message, level),
       view: {
         state: state => { liveState = state; if (state === "error") motion.event("error", Date.now()); },
