@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.1 (2026-11-03)
+
 - **A missing API key explains Pi's ChatGPT login.** If you signed in to Pi with ChatGPT (Sign in with ChatGPT under `/login openai`) and have no OpenAI API key, `/talk start` and `/talk check` now say that OpenAI does not accept that login for GPT-Live, so voice still needs a key. The login's token is never read or sent.
 
 ## 0.5.0 (2026-10-27)
