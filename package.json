@@ -44,7 +44,7 @@
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://pi-voice.lprsrts.com/assets/hero.png"
+    "image": "https://pi-voice.lprsrts.com/assets/thumb.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
