@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Pi 1.4 and 1.5.** The package now declares the Pi versions it is tested with (`>=1.4.0 <2`) instead of any version.
+
 ## 0.5.1 (2026-11-03)
 
 - **A missing API key explains Pi's ChatGPT login.** If you signed in to Pi with ChatGPT (Sign in with ChatGPT under `/login openai`) and have no OpenAI API key, `/talk start` and `/talk check` now say that OpenAI does not accept that login for GPT-Live, so voice still needs a key. The login's token is never read or sent.
