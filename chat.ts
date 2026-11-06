@@ -32,14 +32,16 @@ type Turn = {
 export type ChatHost = {
   /** Saves the placeholder entry; Pi draws it at once through `component`. */
   append(turn: SpokenTurn): void;
-  /** Adds the kept turn to Pi's conversation (hidden; the placeholder shows it). */
-  send(message: { customType: string; content: string; display: false; details: SpokenSaid }): void;
+  /** Adds the kept turn to Pi's conversation (hidden where a placeholder shows it; visible where the host draws the chat itself). */
+  send(message: { customType: string; content: string; display: boolean; details: SpokenSaid }): void;
   /** Saves a read-out of Pi's answer, for the chat only. */
   save(readout: SpokenReadout): void;
   /** Whether a voice connection is open to read a result out now. */
   speaking(): boolean;
   /** Reduced motion: words appear without flipping in. */
   still?(): boolean;
+  /** Whether the host's chat shows the settled turn itself: true where the host draws Pi's chat (mode "rpc", e.g. ThinkRail), so placeholder entries never render; the terminal shows them and keeps this false. */
+  shown?: () => boolean;
 };
 
 /** A short id for an answer's text block (the same text always gives the same id). */
@@ -177,7 +179,7 @@ export class SpokenChat {
     this.host.send({
       customType: SPOKEN_MESSAGE,
       content: spokenContent(role, text, interrupted),
-      display: false,
+      display: this.host.shown?.() ?? false,
       details: interrupted ? { id: turn.id, role, text, interrupted } : { id: turn.id, role, text },
     });
   }

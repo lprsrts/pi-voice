@@ -1,7 +1,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { VOICE_REQUEST } from '../pi-bridge.ts';
-import { describePause } from '../talk.ts';
+import { describePause, formatDuration } from '../talk.ts';
 import { resolveSettings, DEFAULT_SETTINGS } from '../settings.ts';
 import { fakeTalk } from './helpers.mjs';
 
@@ -132,3 +132,34 @@ test('settings: env over "pi-voice" in Pi settings over defaults, with invalid v
 });
 
 // ---------- /talk command surface ----------
+
+test('connected time counts only open, started connections', async () => {
+  const { talk, voices, tick } = fakeTalk();
+  talk.open();
+  await voices.at(-1).ready();
+  tick(5000);
+  talk.close();
+  assert.equal(talk.connectedMs, 5000);
+  tick(8000); // a pause between connections adds nothing
+  talk.open();
+  await voices.at(-1).ready();
+  tick(2000);
+  talk.close();
+  assert.equal(talk.connectedMs, 7000);
+});
+
+test('a connection closed before it started is no connected time', () => {
+  const { talk } = fakeTalk();
+  talk.open();
+  talk.close();
+  assert.equal(talk.connectedMs, 0);
+});
+
+test('durations format compactly', () => {
+  assert.equal(formatDuration(999), 'under a second');
+  assert.equal(formatDuration(45_000), '45 s');
+  assert.equal(formatDuration(60_000), '1 min');
+  assert.equal(formatDuration(200_000), '3 min 20 s');
+  assert.equal(formatDuration(3_600_000), '1 h');
+  assert.equal(formatDuration(3_840_000), '1 h 4 min');
+});

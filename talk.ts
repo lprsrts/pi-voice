@@ -51,6 +51,8 @@ export class TalkSession {
   private speaking = false;
   private timer?: ReturnType<typeof setInterval>;
   private ended = false;
+  private spanMs = 0;      // connected time this talk session has had an open, started connection (auto-pauses excluded)
+  private openedAt?: number;
   // The last result given to the voice until it is heard (the voice speaks), and whether it
   // was already given again after a lost connection: once, so a failing service cannot loop.
   private unheard?: { text: string; answer?: string };
@@ -75,6 +77,8 @@ export class TalkSession {
   private now() { return (this.host.now ?? Date.now)(); }
 
   get connected() { return !!this.voice; }
+  /** Total time a connection was open in this talk session (connecting time and auto-pauses excluded); voice is billed while connected. */
+  get connectedMs(): number { return this.spanMs; }
   /** The open connection's session has started (else it is still connecting). */
   get isReady() { return this.ready; }
   get isPaused() { return this.paused; }
@@ -132,7 +136,7 @@ export class TalkSession {
           ? `${message} Voice comes back with the result. /talk start to speak sooner.`
           : `${message} /talk start to talk again.`, "warning");
       },
-      closed: () => { if (this.voice === voice) { this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
+      closed: () => { if (this.voice === voice) { this.chargeConnected(); this.voice = undefined; this.ready = false; view.state?.(this.host.control.isIdle() ? "idle" : "thinking"); this.host.changed?.(); } },
       tool: (name, args) => bridge.call(name, args),
       busy: () => !this.host.control.isIdle(),
       briefing: () => sessionBriefing(this.host.branch(), { cwd: this.host.cwd(), status: bridge.status() }),
@@ -143,6 +147,7 @@ export class TalkSession {
     void voice.start(signal => this.host.getKey(signal)).then(() => {
       if (this.voice !== voice) return;
       this.ready = true;
+      this.openedAt = this.now();
       // Results that arrived while voice was closed or connecting, oldest first.
       const said = this.pending;
       this.pending = [];
@@ -164,9 +169,17 @@ export class TalkSession {
 
   mute(value: boolean) { this.voice?.mute(value); }
 
+  /** Adds the open connection's span to the talk session's connected time (voice is billed while connected). */
+  private chargeConnected() {
+    if (this.openedAt === undefined) return;
+    this.spanMs += this.now() - this.openedAt;
+    this.openedAt = undefined;
+  }
+
   /** Closes the voice connection; the talk session (bridge, results to say) stays. */
   close() {
     const voice = this.voice;
+    this.chargeConnected();
     this.unheard = undefined;
     this.voice = undefined;
     this.ready = false;
@@ -211,4 +224,13 @@ export function pauseAfterFromSettings(): { busy: number; idle: number } {
 export function describePause(after = pauseAfterFromSettings()): string {
   const part = (seconds: number, when: string) => seconds > 0 ? `${seconds} s of silence ${when}` : "";
   return [part(after.busy, "while I work"), part(after.idle, "when nothing runs")].filter(Boolean).join(" or ") || "never (auto-pause is off)";
+}
+
+/** Compact wall-clock duration: "under a second", "45 s", "3 min 20 s", "1 h 4 min". */
+export function formatDuration(ms: number): string {
+  const total = Math.floor(ms / 1000);
+  if (total < 1) return "under a second";
+  const seconds = total % 60, minutes = Math.floor(total / 60) % 60, hours = Math.floor(total / 3600);
+  if (hours) return minutes ? `${hours} h ${minutes} min` : `${hours} h`;
+  return seconds ? (minutes ? `${minutes} min ${seconds} s` : `${seconds} s`) : `${minutes} min`;
 }

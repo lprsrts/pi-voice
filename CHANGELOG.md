@@ -3,6 +3,8 @@
 ## Unreleased
 
 - **`/talk` runs in headless hosts that embed Pi and bridge its dialogs, such as ThinkRail.** ThinkRail runs its Pi sessions with mode `rpc`, where `/talk` used to be dispatched and silently do nothing. The command now acts there: the consent prompt arrives as a dialog in the host's chat (the wording now says where permission prompts appear), errors and `/talk check`/`devices`/`mic-test` report as chat notices, and spoken requests reach Pi as chat messages. The voice bar, the spoken-turn animation, and the read-out placeholder stay terminal-only — the host's chat shows Pi's full written answer instead — and `/talk preview` now says it needs the terminal instead of doing nothing. The mute/toggle keyboard shortcuts remain terminal-only, and `pi --mode print`/`--mode json` still ignore `/talk`.
+- **Hosts that draw Pi's chat themselves now show the spoken conversation.** In ThinkRail, a settled turn appears in the chat as the same context message Pi's model keeps (the terminal keeps its animated placeholder and hides the copy), and the voice bar's place is taken by a one-line text strip — `voice: listening`, `voice: working; 2 results to say`, `voice: muted` — sent as a plain text widget the host renders.
+- **`/talk stop` reports the connected time.** Voice is billed while a connection is open, so the stop notice now says how long one was (`Voice stopped. Connected 3 min 20 s.`); connecting time and auto-pauses are excluded.
 - **Pi 1.4 and 1.5.** The package now declares the Pi versions it is tested with (`>=1.4.0 <2`) instead of any version.
 
 ## 0.5.2 (2026-11-03)

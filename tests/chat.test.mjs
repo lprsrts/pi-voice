@@ -397,3 +397,15 @@ test('a read-out reaches its placeholder through the talk session hooks', () => 
 });
 
 // ---------- The voice bar's motion ----------
+
+test("hosts that draw Pi's chat themselves get settled turns as visible messages", () => {
+  const sent = [];
+  const shown = new SpokenChat({ append() {}, send: m => sent.push(m), shown: () => true }, () => 1);
+  shown.live('user', 'what is next');
+  shown.settle('user', 'what is next', false);
+  assert.equal(sent[0].display, true, 'visible where the host renders the chat');
+  const terminal = new SpokenChat({ append() {}, send: m => sent.push(m) }, () => 1);
+  terminal.live('user', 'make it four');
+  terminal.settle('user', 'make it four', false);
+  assert.equal(sent.at(-1).display, false, 'the terminal shows placeholder turns and hides the copy');
+});

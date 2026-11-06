@@ -1,4 +1,4 @@
-import { dominantFrequency } from "./protocol.ts";
+import { dominantFrequency, type VoiceState } from "./protocol.ts";
 
 // The voice bar's motion language. The bar is one Gaussian beam: a fixed
 // envelope with a carrier inside it. Every property of the beam means one thing:
@@ -45,6 +45,20 @@ export function barState(facts: BarFacts): BarState {
   if (facts.speaking) return "speaking";
   if (facts.busy) return "working";
   return "listening";
+}
+
+/** The voice bar in words, for hosts that draw Pi's chat themselves (mode "rpc"): one line, or nothing when voice leaves no trace. */
+export function hostStrip(state: { connected: boolean; ready: boolean; muted: boolean; live: VoiceState; talking: boolean; paused: boolean; waiting: number }): string[] | undefined {
+  const results = state.waiting === 1 ? "1 result to say" : state.waiting ? `${state.waiting} results to say` : "";
+  if (!state.connected) {
+    if (state.paused) return ["voice: paused while I work; comes back with the result"];
+    if (state.talking) return ["voice: paused; /talk start to speak sooner"];
+    return results ? [`voice: off; ${results}`] : undefined;
+  }
+  if (state.muted) return ["voice: muted"];
+  if (!state.ready) return ["voice: connecting"];
+  const live = state.live === "thinking" ? "working" : state.live === "idle" ? "listening" : state.live;
+  return [`voice: ${live}${results ? `; ${results}` : ""}`];
 }
 
 // ---------- Drift profiles: velocity (bar widths per second) over time ----------

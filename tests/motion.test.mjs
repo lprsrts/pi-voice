@@ -2,7 +2,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { LiveVoice } from '../live.ts';
 import { SpokenChat } from '../chat.ts';
-import { BarMotion, Meter, barState, transitionMs, DRIFT, STATES, EVENTS, BREATH_MS, ERROR_MS, PAUSE_PULSE_MS, STORY, STORY_MS, storyAt, liveFacts, HEARD_HOLD_MS } from '../motion.ts';
+import { BarMotion, Meter, barState, transitionMs, DRIFT, STATES, EVENTS, BREATH_MS, ERROR_MS, PAUSE_PULSE_MS, STORY, STORY_MS, storyAt, liveFacts, HEARD_HOLD_MS, hostStrip } from '../motion.ts';
 import { startLive, voiced, settle } from './helpers.mjs';
 
 const facts = (over = {}) => ({ connection: 'open', paused: false, busy: false, speaking: false, hearing: false, ...over });
@@ -433,4 +433,17 @@ test('a pitch tracker jumping octaves changes the density gradually', () => {
   const low = meter.cycles;
   meter.set(0.8, 3000, 1 / 30, 1000);
   assert.ok(meter.cycles - low <= 1.3, `${(meter.cycles - low).toFixed(2)} cycles in one frame`);
+});
+
+test("host strip: the bar's state in words for hosts that draw Pi's chat", () => {
+  const state = { connected: false, ready: false, muted: false, live: 'idle', talking: false, paused: false, waiting: 0 };
+  assert.equal(hostStrip(state), undefined, 'no trace once voice is off');
+  assert.deepEqual(hostStrip({ ...state, connected: true, ready: false }), ['voice: connecting']);
+  assert.deepEqual(hostStrip({ ...state, connected: true, ready: true }), ['voice: listening']);
+  assert.deepEqual(hostStrip({ ...state, connected: true, ready: true, live: 'speaking' }), ['voice: speaking']);
+  assert.deepEqual(hostStrip({ ...state, connected: true, ready: true, live: 'thinking', waiting: 2 }), ['voice: working; 2 results to say']);
+  assert.deepEqual(hostStrip({ ...state, connected: true, ready: true, muted: true, live: 'speaking' }), ['voice: muted']);
+  assert.deepEqual(hostStrip({ ...state, talking: true }), ['voice: paused; /talk start to speak sooner']);
+  assert.deepEqual(hostStrip({ ...state, paused: true }), ['voice: paused while I work; comes back with the result']);
+  assert.deepEqual(hostStrip({ ...state, waiting: 1 }), ['voice: off; 1 result to say']);
 });

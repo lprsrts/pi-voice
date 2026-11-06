@@ -8,11 +8,11 @@ import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, chatgptLoginHint, resolveApiKey, type LoginProbe } from "./keys.ts";
 import { SPOKEN_ENTRY, SPOKEN_READOUT, SPOKEN_TURN, isSpoken, spokenPart, VOICE_PROMPT, type SpokenEntry, type SpokenReadout, type SpokenTurn } from "./pi-bridge.ts";
 import { answerBlocks, speakable, SpokenChat, spokenLines } from "./chat.ts";
-import { describePause, pauseAfterFromSettings, TalkSession } from "./talk.ts";
+import { describePause, formatDuration, pauseAfterFromSettings, TalkSession } from "./talk.ts";
 import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
 import { PROVIDER } from "./providers.ts";
 import type { VoiceState } from "./protocol.ts";
-import { BarMotion, HEARD_LEVEL, liveFacts, Meter, storyAt, syntheticVoice, type BarFacts } from "./motion.ts";
+import { BarMotion, HEARD_LEVEL, hostStrip, liveFacts, Meter, storyAt, syntheticVoice, type BarFacts } from "./motion.ts";
 import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, voiceRunsIn, type ShortcutAction, type TalkCommand } from "./commands.ts";
 
 // The voice bar draws motion.ts's beam. What it shows follows from facts (the
@@ -185,6 +185,14 @@ export default function voicePreview(pi: ExtensionAPI) {
   function refreshStatus() {
     const state = talk?.connected ? (muted ? "voice muted" : "voice on") : talking ? "voice paused" : talk?.waiting ? "voice off" : undefined;
     statusOwner?.ui.setStatus("pi-voice", state && (talk?.waiting ? `${state} · ${talk.waiting} to say` : state));
+    refreshStrip();
+  }
+
+  /** Hosts that draw Pi's chat themselves (mode "rpc") get the bar as a one-line text widget instead. */
+  function refreshStrip() {
+    const owner = statusOwner;
+    if (owner?.mode !== "rpc") return;
+    owner.ui.setWidget("pi-voice", hostStrip({ connected: !!talk?.connected, ready: !!talk?.isReady, muted, live: liveState, talking, paused: !!talk?.isPaused, waiting: talk?.waiting ?? 0 }));
   }
 
   function stopVoice(ctx: ExtensionContext) {
@@ -192,8 +200,9 @@ export default function voicePreview(pi: ExtensionAPI) {
     // Pi keeps working; a result that arrives before the next /talk start is said then.
     talk?.close(); talking = false;
     inputSamples = []; outputSamples = [];
+    const connected = talk && talk.connectedMs > 0 ? ` Connected ${formatDuration(talk.connectedMs)}.` : "";
     stop(); refreshStatus();
-    ctx.ui.notify(ctx.isIdle() ? "Voice stopped." : "Voice stopped. I keep working; /talk start to hear the result.", "info");
+    ctx.ui.notify(`${ctx.isIdle() ? "Voice stopped." : "Voice stopped. I keep working; /talk start to hear the result."}${connected}`, "info");
   }
 
   async function startVoice(ctx: ExtensionContext) {
@@ -316,6 +325,7 @@ export default function voicePreview(pi: ExtensionAPI) {
     save: readout => { try { pi.appendEntry<SpokenReadout>(SPOKEN_READOUT, readout); } catch {} },
     speaking: () => !!talk?.connected,
     still: () => currentSettings().values.reducedMotion,
+    shown: () => statusOwner?.mode === "rpc",
   });
   pi.registerEntryRenderer<SpokenTurn>(SPOKEN_TURN, (entry, options, theme) => chat.component(entry.data?.id, theme, options.expanded));
   pi.on("session_start", (_event, ctx) => { chat.load(ctx.sessionManager.getEntries()); });
@@ -383,7 +393,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       getKey: async signal => { helper = await nativeHelper(ctx, signal); return resolveApiKey(PROVIDER.key, signal, { hint: loginHint(ctx) }); },
       notify: (message, level) => ctx.ui.notify(message, level),
       view: {
-        state: state => { liveState = state; if (state === "error") motion.event("error", Date.now()); },
+        state: state => { liveState = state; if (state === "error") motion.event("error", Date.now()); refreshStrip(); },
         event: event => {
           const now = Date.now();
           motion.event(event, now);
@@ -436,5 +446,5 @@ export default function voicePreview(pi: ExtensionAPI) {
     const answer = blocks ? chat.answer(blocks, !event.aborted) : undefined;
     talk?.bridge.settled(event.aborted, event.aborted ? undefined : answer);
   });
-  pi.on("session_shutdown", () => { talk?.end(); talk = undefined; talking = false; consented = false; stop(); statusOwner?.ui.setStatus("pi-voice", undefined); statusOwner = undefined; });
+  pi.on("session_shutdown", () => { talk?.end(); talk = undefined; talking = false; consented = false; stop(); statusOwner?.ui.setStatus("pi-voice", undefined); statusOwner?.ui.setWidget("pi-voice", undefined); statusOwner = undefined; });
 }
