@@ -13,7 +13,7 @@ import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings
 import { PROVIDER } from "./providers.ts";
 import type { VoiceState } from "./protocol.ts";
 import { BarMotion, HEARD_LEVEL, liveFacts, Meter, storyAt, syntheticVoice, type BarFacts } from "./motion.ts";
-import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, type ShortcutAction, type TalkCommand } from "./commands.ts";
+import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, voiceRunsIn, type ShortcutAction, type TalkCommand } from "./commands.ts";
 
 // The voice bar draws motion.ts's beam. What it shows follows from facts (the
 // connection, who is talking, Pi's work); events add impulses; it redraws only
@@ -200,7 +200,7 @@ export default function voicePreview(pi: ExtensionAPI) {
     if (talk?.connected) { ctx.ui.notify("Voice is already running or connecting.", "info"); return; }
     if (!consented) {
       const provider = PROVIDER;
-      const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (the echoCancellation setting): use headphones, or the agent may hear itself and loop."} Voice is billed while connected; it pauses by itself after ${describePause()}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
+      const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts ${ctx.mode === "tui" ? "here in the terminal" : "in the host's chat"}. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (the echoCancellation setting): use headphones, or the agent may hear itself and loop."} Voice is billed while connected; it pauses by itself after ${describePause()}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
       if (!consent || talk?.connected) return;
       consented = true;
     }
@@ -301,6 +301,7 @@ export default function voicePreview(pi: ExtensionAPI) {
       case "mic-test": return micTest(ctx, command.seconds);
       case "preview":
         if (talk?.connected) { ctx.ui.notify("Stop voice before previewing the bar: /talk stop", "warning"); return; }
+        if (ctx.mode !== "tui") { ctx.ui.notify("The voice bar preview needs the terminal UI.", "warning"); return; }
         show(ctx, command.state);
         return;
     }
@@ -343,7 +344,7 @@ export default function voicePreview(pi: ExtensionAPI) {
     description: "Realtime voice for Pi: no argument starts or stops it; /talk help lists the rest",
     getArgumentCompletions: talkCompletions,
     handler: async (args, ctx) => {
-      if (ctx.mode !== "tui") return;
+      if (!voiceRunsIn(ctx.mode)) return;
       await run(parseTalk(args), ctx);
     },
   });

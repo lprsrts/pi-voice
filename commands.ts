@@ -5,6 +5,11 @@ import { agentDir } from "./config.ts";
 // The /talk command surface: parsing, argument completion, help, and the
 // keyboard shortcuts read from Pi's keybindings.json. index.ts runs the commands.
 
+/** Run modes where /talk acts: the terminal UI, and hosts that embed Pi and bridge its dialogs over the extension UI (ThinkRail runs its sessions with mode "rpc"). Print and JSON modes have no one to answer the consent dialog, so /talk stays inert there. */
+export function voiceRunsIn(mode: string): boolean {
+  return mode === "tui" || mode === "rpc";
+}
+
 export const PREVIEW_STATES = ["story", "cycle", "connecting", "listening", "hearing", "working", "speaking", "muted", "error", "paused", "off"] as const;
 export type PreviewState = (typeof PREVIEW_STATES)[number];
 

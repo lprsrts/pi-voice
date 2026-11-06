@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseTalk, talkCompletions, talkHelp, TALK_COMMANDS, resolveShortcuts, loadShortcuts, keybindingsPath, DEFAULT_SHORTCUTS } from '../commands.ts';
+import { parseTalk, talkCompletions, talkHelp, TALK_COMMANDS, resolveShortcuts, loadShortcuts, keybindingsPath, DEFAULT_SHORTCUTS, voiceRunsIn } from '../commands.ts';
 import './helpers.mjs';
 
 test('/talk parses subcommands strictly and toggles with no argument', () => {
@@ -49,4 +49,11 @@ test('shortcuts come from pi-voice actions in Pi\'s keybindings.json', async () 
     assert.deepEqual(loadShortcuts(join(dir, 'broken.json')), DEFAULT_SHORTCUTS);
     assert.match(talkHelp(DEFAULT_SHORTCUTS), /alt\+v: start or stop voice \(pi-voice\.toggle\)/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('/talk acts in the terminal UI and in hosts that bridge its dialogs', () => {
+  assert.equal(voiceRunsIn('tui'), true);
+  assert.equal(voiceRunsIn('rpc'), true); // ThinkRail runs its Pi sessions with mode "rpc"
+  assert.equal(voiceRunsIn('print'), false);
+  assert.equal(voiceRunsIn('json'), false);
 });
