@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseTalk, talkCompletions, talkHelp, TALK_COMMANDS, resolveShortcuts, loadShortcuts, keybindingsPath, DEFAULT_SHORTCUTS, voiceRunsIn } from '../commands.ts';
+import { parseTalk, talkCompletions, talkHelp, TALK_COMMANDS, resolveShortcuts, loadShortcuts, keybindingsPath, DEFAULT_SHORTCUTS, voiceRunsIn, noticeText, consentBody } from '../commands.ts';
+import { PROVIDER } from '../providers.ts';
 import './helpers.mjs';
 
 test('/talk parses subcommands strictly and toggles with no argument', () => {
@@ -56,4 +57,67 @@ test('/talk acts in the terminal UI and in hosts that bridge its dialogs', () =>
   assert.equal(voiceRunsIn('rpc'), true); // ThinkRail runs its Pi sessions with mode "rpc"
   assert.equal(voiceRunsIn('print'), false);
   assert.equal(voiceRunsIn('json'), false);
+});
+
+// ThinkRail renders one notify as a single paragraph: newlines collapse into an
+// unreadable run-on (/talk check arrived as one blob there).
+test('a host notice joins its lines into one paragraph; the terminal keeps them', () => {
+  const lines = [
+    'echo cancellation: on',
+    'WebSocket: OK',
+    'settings ("pi-voice" in Pi\'s settings.json; env variables override):',
+    '  autoPause: 15 s of silence while I work (default)',
+    '  idlePause: 60 s of silence when nothing runs (default)',
+    '  ignored invalid value: "pi-voice".autoPause: "x"',
+    'session: off',
+  ];
+  assert.equal(noticeText(lines, false), lines.join('\n'));
+  assert.equal(noticeText(lines, true),
+    'echo cancellation: on · WebSocket: OK · '
+    + 'settings ("pi-voice" in Pi\'s settings.json; env variables override): '
+    + 'autoPause: 15 s of silence while I work (default), '
+    + 'idlePause: 60 s of silence when nothing runs (default), '
+    + 'ignored invalid value: "pi-voice".autoPause: "x" · session: off');
+});
+
+test('a host notice runs only its indented list behind the header, and a non-header item resets that', () => {
+  // Items after the first run on with ", ", and a header whose line does not end
+  // in ":" gets its own clause instead.
+  const lines = ['devices:', '  input: Mic', '  output: Speakers', 'platform: darwin', '  extra: trimmed', 'next:'];
+  assert.equal(noticeText(lines, true),
+    'devices: input: Mic, output: Speakers · platform: darwin · extra: trimmed · next:');
+  // An indented first line still lands at the start without its indent.
+  assert.equal(noticeText(['  bare item', 'plain'], true), 'bare item · plain');
+});
+
+test('/talk help keeps the shortcuts in the terminal and leaves them out for hosts', () => {
+  assert.match(talkHelp(DEFAULT_SHORTCUTS), /alt\+v: start or stop voice/);
+  const help = talkHelp(DEFAULT_SHORTCUTS, true);
+  assert.doesNotMatch(help, /keybindings|alt\+v/);
+  assert.doesNotMatch(help, /\n/);
+  assert.match(help, /\/talk mute \[on\|off\]\s+Stop or resume the microphone/);
+});
+
+// ThinkRail's dialog card cut the consent text mid-sentence ("…overridden by").
+test('the consent dialog is said in full in the terminal and keeps only what is agreed to for hosts', () => {
+  const model = 'openai/gpt-6-sol';
+  const full = consentBody(PROVIDER, { tui: true, model, aec: true });
+  // The full wording keeps everything: the provider config paths, the terminal
+  // prompts, and where the key comes from.
+  assert.match(full, /Your microphone audio will be sent to OpenAI GPT-Live \(model, voice, and instructions/);
+  assert.match(full, /providers\/openai-live\/ in this package/);
+  assert.match(full, /here in the terminal/);
+  assert.match(full, /login keychain \(openai-api-key\)/);
+  assert.match(full, /pauses by itself after 15 s of silence while I work or 60 s of silence when nothing runs/);
+  const short = consentBody(PROVIDER, { tui: false, model, aec: true });
+  assert.match(short, /Your microphone audio will be sent to OpenAI GPT-Live\./);
+  assert.match(short, /in the host's chat/);
+  assert.match(short, /pauses by itself after 15 s of silence while I work or 60 s of silence when nothing runs/);
+  assert.doesNotMatch(short, /keychain|providers\/|Audio uses the macOS/);
+  assert.ok(short.length < full.length * 0.6, `short consent stays short: ${short.length} vs ${full.length}`);
+  // The echo-cancellation warning survives either way: speakers without it loop.
+  assert.doesNotMatch(short, /headphones/);
+  assert.match(consentBody(PROVIDER, { tui: false, model, aec: false }), /use headphones, or the agent may hear itself and loop/);
+  assert.match(full, /speakers work/);
+  assert.match(consentBody(PROVIDER, { tui: true, model, aec: false }), /use headphones, or the agent may hear itself and loop/);
 });

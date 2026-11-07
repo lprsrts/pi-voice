@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentDir } from "./config.ts";
+import { agentDir, userConfigDir } from "./config.ts";
+import { describePause } from "./talk.ts";
 
 // The /talk command surface: parsing, argument completion, help, and the
 // keyboard shortcuts read from Pi's keybindings.json. index.ts runs the commands.
@@ -8,6 +9,43 @@ import { agentDir } from "./config.ts";
 /** Run modes where /talk acts: the terminal UI, and hosts that embed Pi and bridge its dialogs over the extension UI (ThinkRail runs its sessions with mode "rpc"). Print and JSON modes have no one to answer the consent dialog, so /talk stays inert there. */
 export function voiceRunsIn(mode: string): boolean {
   return mode === "tui" || mode === "rpc";
+}
+
+/**
+ * A multi-line notice the way its audience renders it. Pi's terminal draws each
+ * line; a host that draws Pi's chat (mode "rpc", ThinkRail) renders one notify as
+ * a single paragraph and drops the line breaks, so the lines join with " · "
+ * there, and an indented item under a header that ends in ":" runs on behind it,
+ * comma-separated.
+ */
+export function noticeText(lines: string[], host: boolean): string {
+  let text = "", listHeader = false, inList = false;
+  for (const line of lines) {
+    const item = line.startsWith("  ") ? line.trim() : undefined;
+    if (!text) { text = item ?? line; listHeader = item === undefined && line.endsWith(":"); continue; }
+    if (item !== undefined && listHeader) { text += `${inList ? ", " : " "}${item}`; inList = true; continue; }
+    text += ` · ${item ?? line}`;
+    listHeader = line.endsWith(":");
+    inList = false;
+  }
+  return host ? text : lines.join("\n");
+}
+
+/**
+ * The consent dialog for /talk start. In the terminal it is said in full.
+ * Hosts draw it as a card in their chat, a scroll region where long text sits
+ * below the fold — so the wording there keeps only what the user is being
+ * asked to agree to.
+ */
+export function consentBody(provider: { label: string; name: string; key: { env: string; service: string } }, options: { tui: boolean; model: string; aec: boolean }): string {
+  const pause = describePause();
+  const aec = options.aec
+    ? "Echo cancellation is on, so speakers work."
+    : "Echo cancellation is off (the echoCancellation setting): use headphones, or the agent may hear itself and loop.";
+  if (!options.tui) {
+    return `Your microphone audio will be sent to ${provider.label}. This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${options.model}), tools, and permission prompts in the host's chat. ${aec} Voice is billed while connected; it pauses by itself after ${pause}, and comes back to say results. /talk stop ends the session; Pi keeps any running task.`;
+  }
+  return `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${options.model}), tools, and permission prompts here in the terminal. Audio uses the macOS default input/output and follows device switches. ${aec} Voice is billed while connected; it pauses by itself after ${pause}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`;
 }
 
 export const PREVIEW_STATES = ["story", "cycle", "connecting", "listening", "hearing", "working", "speaking", "muted", "error", "paused", "off"] as const;
@@ -20,7 +58,7 @@ export const TALK_COMMANDS: readonly Spec[] = [
   { name: "stop", usage: "stop", description: "End the voice connection; a running Pi task keeps going" },
   { name: "mute", usage: "mute [on|off]", description: "Stop or resume the microphone (no argument toggles)", values: ["on", "off"] },
   { name: "unmute", usage: "unmute", description: "Resume the microphone" },
-  { name: "check", usage: "check", description: "Setup status, settings, and shortcuts; no network or microphone" },
+  { name: "check", usage: "check", description: "Setup status and settings; no network or microphone" },
   { name: "devices", usage: "devices", description: "The macOS input and output in use" },
   { name: "tone", usage: "tone [20-20000]", description: "Play a test tone (440 Hz by default)", values: ["220", "440", "1000"] },
   { name: "mic-test", usage: "mic-test [1-10]", description: "Record a few seconds, report the level, play it back", values: ["3", "5", "10"] },
@@ -135,12 +173,13 @@ export function shortcutLines(shortcuts: Record<ShortcutAction, string[]>): stri
     `  ${shortcuts[action].join(", ") || "none"}: ${SHORTCUT_LABELS[action]} (${SHORTCUT_IDS[action]})`);
 }
 
-export function talkHelp(shortcuts: Record<ShortcutAction, string[]>): string {
+export function talkHelp(shortcuts: Record<ShortcutAction, string[]>, host = false): string {
   const width = Math.max(...TALK_COMMANDS.map(command => command.usage.length));
-  return [
+  const lines = [
     "/talk: start voice, or stop it if it is running",
     ...TALK_COMMANDS.map(command => `/talk ${command.usage.padEnd(width)}  ${command.description}`),
-    `shortcuts (set in ${keybindingsPath()}, then /reload):`,
-    ...shortcutLines(shortcuts),
-  ].join("\n");
+  ];
+  // The shortcuts are terminal-only; a host has no place to press them.
+  if (!host) lines.push(`shortcuts (set in ${keybindingsPath()}, then /reload):`, ...shortcutLines(shortcuts));
+  return noticeText(lines, host);
 }

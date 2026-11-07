@@ -1,19 +1,18 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { mixColors, truncateToWidth, type KeyId } from "@earendil-works/pi-tui";
-import { join } from "node:path";
 import { userConfigDir } from "./config.ts";
 import { AudioPipes, currentRoute, playPcm, playTone, recordBurst } from "./audio.ts";
 import { aecEnabled, ensureHelper, helperBuilt } from "./native.ts";
 import { apiKeyStatus, chatgptLoginHint, resolveApiKey, type LoginProbe } from "./keys.ts";
 import { SPOKEN_ENTRY, SPOKEN_READOUT, SPOKEN_TURN, isSpoken, spokenPart, VOICE_PROMPT, type SpokenEntry, type SpokenReadout, type SpokenTurn } from "./pi-bridge.ts";
 import { answerBlocks, speakable, SpokenChat, spokenLines } from "./chat.ts";
-import { describePause, formatDuration, pauseAfterFromSettings, TalkSession } from "./talk.ts";
+import { formatDuration, pauseAfterFromSettings, TalkSession } from "./talk.ts";
 import { currentSettings, envName, SETTINGS_KEY, useSettings, type VoiceSettings } from "./settings.ts";
 import { PROVIDER } from "./providers.ts";
 import type { VoiceState } from "./protocol.ts";
 import { BarMotion, HEARD_LEVEL, hostStrip, liveFacts, Meter, storyAt, syntheticVoice, type BarFacts } from "./motion.ts";
-import { keybindingsPath, loadShortcuts, parseTalk, shortcutLines, talkCompletions, talkHelp, voiceRunsIn, type ShortcutAction, type TalkCommand } from "./commands.ts";
+import { keybindingsPath, loadShortcuts, noticeText, consentBody, parseTalk, shortcutLines, talkCompletions, talkHelp, voiceRunsIn, type ShortcutAction, type TalkCommand } from "./commands.ts";
 
 // The voice bar draws motion.ts's beam. What it shows follows from facts (the
 // connection, who is talking, Pi's work); events add impulses; it redraws only
@@ -209,7 +208,7 @@ export default function voicePreview(pi: ExtensionAPI) {
     if (talk?.connected) { ctx.ui.notify("Voice is already running or connecting.", "info"); return; }
     if (!consented) {
       const provider = PROVIDER;
-      const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, `Your microphone audio will be sent to ${provider.label} (model, voice, and instructions from providers/${provider.name}/ in this package, overridden by ${join(userConfigDir(), provider.name)}/ if present). This Pi session is the backend: what you ask goes to Pi as a message, and Pi works with its current model (${modelName(ctx)}), tools, and permission prompts ${ctx.mode === "tui" ? "here in the terminal" : "in the host's chat"}. Audio uses the macOS default input/output and follows device switches. ${aecEnabled() ? "Echo cancellation is on, so speakers work." : "Echo cancellation is off (the echoCancellation setting): use headphones, or the agent may hear itself and loop."} Voice is billed while connected; it pauses by itself after ${describePause()}, and comes back to say results. The API key comes from ${provider.key.env} or your login keychain (${provider.key.service}). /talk stop ends the session; Pi keeps any running task.`);
+      const consent = await ctx.ui.confirm(`Start ${provider.label} voice?`, consentBody(provider, { tui: ctx.mode === "tui", model: modelName(ctx), aec: aecEnabled() }));
       if (!consent || talk?.connected) return;
       consented = true;
     }
@@ -218,6 +217,10 @@ export default function voicePreview(pi: ExtensionAPI) {
   }
 
   async function check(ctx: ExtensionContext) {
+    // A host renders one notify as a single paragraph (the line breaks would
+    // collapse unreadable), so its check joins with " · " and drops what only
+    // the terminal has: the model command and the keyboard shortcuts.
+    const host = ctx.mode !== "tui";
     const lines = [aecLine(), `native helper: ${helperBuilt() ? "built" : "builds on first use"}`];
     try { const r = await pi.exec("swiftc", ["-version"], { timeout: 5000 }); lines.push(`swiftc: ${r.code === 0 ? "OK" : "failed"}`); }
     catch { lines.push("swiftc: unavailable (xcode-select --install)"); }
@@ -226,31 +229,29 @@ export default function voicePreview(pi: ExtensionAPI) {
       catch { lines.push("devices: query failed"); }
     }
     const session = talk?.connected ? (muted ? "on, microphone muted" : "on") : talk?.isPaused ? "paused (comes back with the result)" : talking ? "paused" : "off";
-    ctx.ui.notify([
+    ctx.ui.notify(noticeText([
       ...lines,
       `WebSocket: ${typeof WebSocket === "function" ? "OK" : "unavailable"}`,
       `voice: ${PROVIDER.label}`,
-      `backend: this Pi session (${modelName(ctx)}; change it with /model)`,
+      `backend: this Pi session (${modelName(ctx)}${host ? "" : "; change it with /model"})`,
       `${PROVIDER.name} api key: ${await apiKeyStatus(PROVIDER.key, { hint: loginHint(ctx) })}`,
       ...settingsLines(),
-      `shortcuts (${keybindingsPath()}):`,
-      ...shortcutLines(shortcuts),
+      ...(host ? [] : [`shortcuts (${keybindingsPath()}):`, ...shortcutLines(shortcuts)]),
       `config overrides: ${userConfigDir()}`,
       `platform: ${process.platform}`,
       `session: ${session}${talk?.waiting ? `; ${talk.waiting} result(s) to say` : ""}`,
-    ].join("\n"), "info");
+    ], host), "info");
   }
 
   async function devices(ctx: ExtensionContext) {
     try {
       const route = await currentRoute(await nativeHelper(ctx));
-      ctx.ui.notify([
+      ctx.ui.notify(noticeText([
         `Input:  ${route.input}`,
         `Output: ${route.output}`,
-        "These are the macOS defaults; change them in Sound settings or the menu-bar Sound control.",
-        "A running session follows the switch automatically.",
+        "These are the macOS defaults; change them in Sound settings or the menu-bar Sound control. A running session follows the switch automatically.",
         aecLine(),
-      ].join("\n"), "info");
+      ], ctx.mode !== "tui"), "info");
     } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : "Device query failed.", "error"); }
   }
 
@@ -290,7 +291,7 @@ export default function voicePreview(pi: ExtensionAPI) {
   async function run(command: TalkCommand, ctx: ExtensionContext) {
     switch (command.name) {
       case "error": ctx.ui.notify(command.message, "warning"); return;
-      case "help": ctx.ui.notify(talkHelp(shortcuts), "info"); return;
+      case "help": ctx.ui.notify(talkHelp(shortcuts, ctx.mode !== "tui"), "info"); return;
       case "toggle": return talk?.connected ? stopVoice(ctx) : startVoice(ctx);
       case "start": return startVoice(ctx);
       case "stop": return stopVoice(ctx);
